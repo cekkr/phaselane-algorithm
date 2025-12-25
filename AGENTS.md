@@ -2,6 +2,7 @@ Project summary:
 - Prime-Compound Phase-Lane Token Protocol (PCPL) design and validation docs.
 - Main spec and pseudocode live in `papers/phase-shift-tokens.md`.
 - Broader background notes in `papers/symmetric-tokenizer-circuit-concept.md`.
+- Paper-style writeup with LaTeX and Mermaid in `papers/scientific-paper.md`.
 
 Code and tooling:
 - `demo/pcpl_cycle_test.py`: cycle-by-cycle PCPL simulation and validation.
