@@ -1,250 +1,291 @@
 # Prime-Compound Phase-Lane Token Protocol (PCPL) for Symmetric Continuous Tokenizer Devices
 
 ## Abstract
-We present the Prime-Compound Phase-Lane Token Protocol (PCPL), a no-handshake
-token system where a device emits one token per cycle and exactly one provider
-can validate it. PCPL combines (1) a public phase clock derived from coprime
-residues, (2) hidden prime-compound bouquets per provider, and (3) device-only
-state evolution that chains all lanes. We also introduce the symmetric continuous
-tokenizer device model, motivated by FPGA-based dynamic hash circuits and twin
-circuits for peer validation. A step-by-step algorithm description, correctness
-properties, and a deterministic simulation trace are provided.
+We present the Prime-Compound Phase-Lane Token Protocol (PCPL), a no-handshake token system where a device emits one token per cycle and exactly one provider can validate it. PCPL combines (1) a public phase clock derived from coprime residues, (2) hidden prime-compound bouquets per provider, and (3) device-only state evolution that chains all lanes. We also introduce the symmetric continuous tokenizer device model, motivated by FPGA-based dynamic hash circuits and twin circuits for peer validation. A step-by-step algorithm description, correctness properties, and a deterministic simulation trace are provided.
 
-## 1. Symmetric continuous tokenizer devices (concept and motivation)
-The broader platform for PCPL is a "symmetric continuous tokenizer" device
-designed for consumer computing. The device is envisioned as a reconfigurable
-hardware unit (for example, an FPGA-based key) that can:
+## 1. Symmetric continuous tokenizer devices
+PCPL runs on a “symmetric continuous tokenizer” device designed for consumer computing. The device is envisioned as a reconfigurable hardware unit (for example, an FPGA-based key) that can:
+
 - Acquire unique, device-specific hashing circuits or internal start variables.
 - Continuously generate short-lived tokens or keys.
-- Be validated only by its twin circuit(s), which share the same circuit family
-  or seed lineage.
+- Be validated only by its twin circuit(s), which share the same circuit family or seed lineage.
 
-The symmetry comes from pairing: two devices can load the same dynamic hash
-circuit and evolve internal state in the same way, enabling mutual validation
-without exposing the evolving secrets.
+The symmetry comes from pairing: two devices can load the same dynamic hash circuit and evolve internal state in the same way, enabling mutual validation without exposing the evolving secrets.
 
 ### 1.1 Forks by variable alternation
-Beyond PCPL, the same circuit can be "forked" by alternating variable sets over
-time windows. Let a device maintain a base circuit `C` and a family of variables
-`V_k` selected by time window `W_k`. Each fork evolves as:
+Beyond PCPL, the same circuit can be “forked” by alternating variable sets over time windows. Let a device maintain a base circuit $C$ and a family of variables $V_k$ selected by time window $W_k$. Each fork evolves as:
 
 $$
-S_{t+1}^{(k)} = H(C, S_t^{(k)}, V_k, t), \quad t \in W_k
+\begin{aligned}
+S_{t+1}^{(k)} &= H\!\left(C,\, S_t^{(k)},\, V_k,\, t\right), \\
+&\quad t \in W_k.
+\end{aligned}
 $$
 
-This creates multiple parallel token streams sharing the same circuit but with
-distinct, time-delimited variable schedules. Such forks can be used for
-provider lanes (as in PCPL) or for isolated peer-to-peer sessions that are
-difficult to parallelize or replay.
+This creates multiple parallel token streams sharing the same circuit but with distinct, time-delimited variable schedules. Such forks can be used for provider lanes (as in PCPL) or for isolated peer-to-peer sessions that are difficult to parallelize or replay.
 
 ### 1.2 Peer-to-peer continuity
-The device model also targets in-loco connections among peers. Two devices that
-share a circuit family and seed lineage can establish an isolated encryption
-context by evolving state in lockstep without querying a central provider.
+The device model also targets in-loco connections among peers. Two devices that share a circuit family and seed lineage can establish an isolated encryption context by evolving state in lockstep without querying a central provider.
 
 ```mermaid
+%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
 flowchart LR
-  DeviceA[Device A: dynamic hash circuit] -- continuous tokens --> DeviceB[Device B: twin circuit]
-  DeviceA -- lane token --> Provider1[Provider 1]
-  DeviceA -- lane token --> Provider2[Provider 2]
-  DeviceA -- lane token --> Provider3[Provider 3]
+  subgraph Device["Tokenizer device"]
+    A["Device A<br/>dynamic hash circuit"]
+  end
+
+  subgraph Endpoints["Endpoints"]
+    B["Device B<br/>twin circuit"]
+    P1["Provider 1"]
+    P2["Provider 2"]
+    P3["Provider 3"]
+  end
+
+  A -- "continuous tokens" --> B
+  A -- "lane token" --> P1
+  A -- "lane token" --> P2
+  A -- "lane token" --> P3
 ```
 
 ## 2. System model and goals
 PCPL is designed for:
+
 - No runtime challenge/response or synchronization negotiation.
-- One token per cycle, routed to exactly one provider out of `x`.
+- One token per cycle, routed to exactly one provider out of $x$.
 - Provider-side validation by local recomputation.
 
 Threat model (minimal):
+
 - A provider should not compute tokens for other providers.
 - Observing accepted tokens should not reveal other lanes.
 - Public time/phase information should not enable cross-lane forgery.
 
 ## 3. Notation and public parameters
 Let:
-- `x` be the number of providers.
-- `P, Q, R` be pairwise coprime primes (also coprime with `x`).
-- `M` be a prime modulus for multiplicative group arithmetic.
-- `H()` be a cryptographic hash (or dynamic hash circuit).
-- `Trunc_k()` truncate to `k` bits.
-- `t` be the cycle counter.
 
-Each provider `i` has three secret bouquets:
-`BouquetA_i, BouquetB_i, BouquetC_i`, each a list of prime compounds.
+- $x$ be the number of providers (lanes).
+- $P, Q, R$ be pairwise coprime primes (also coprime with $x$).
+- $M$ be a prime modulus for multiplicative-group arithmetic.
+- $H(\cdot)$ be a cryptographic hash (or a dynamic hash circuit).
+- $\mathrm{Trunc}_k(\cdot)$ be truncation to $k$ bits.
+- $t$ be the cycle counter.
+- $\|$ denote byte/bit-string concatenation.
+
+Each provider $i$ has three secret bouquets: $\mathrm{BouquetA}_i, \mathrm{BouquetB}_i, \mathrm{BouquetC}_i$, each a list of prime compounds.
 
 ## 4. PCPL protocol overview
 The protocol uses:
-1) A public phase clock (CRT residues and coupled products).
-2) A per-block permutation schedule to enforce "returns every x".
-3) Hidden bouquets to derive lane-specific tokens.
-4) Device-only seed evolution that chains all lanes.
+
+1. A public phase clock (CRT residues and coupled products).
+2. A per-block permutation schedule to enforce “returns every $x$”.
+3. Hidden bouquets to derive lane-specific tokens.
+4. Device-only seed evolution that chains all lanes.
 
 ```mermaid
+%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
 flowchart TD
-  A[Cycle t] --> B[Phase clock: a_t,b_t,c_t,u1,u2,u3]
-  B --> C[Permutation for block B]
-  C --> D[Select lane idx_t]
-  D --> E[Compute T_idx_t(t)]
-  E --> F[Send token to provider idx_t]
-  E --> G[Evolve device seed S using all W lanes]
+  A["Cycle t"] --> B["Phase clock: a_t, b_t, c_t, u_1, u_2, u_3"]
+  B --> C["Permutation for block B"]
+  C --> D["Select lane index idx_t"]
+  D --> E["Compute token T_{idx_t}(t)"]
+  E --> F["Send token to provider idx_t"]
+  E --> G["Evolve device seed S using all W lanes"]
 ```
 
 ## 5. Step-by-step algorithm
 
 ### 5.1 Phase clock
-For cycle `t`:
+For cycle $t$:
 
 $$
-a_t = (a_0 + t) \bmod P,\quad
-b_t = (b_0 + t) \bmod Q,\quad
-c_t = (c_0 + t) \bmod R
+\begin{aligned}
+a_t &= (a_0 + t) \bmod P, \\
+b_t &= (b_0 + t) \bmod Q, \\
+c_t &= (c_0 + t) \bmod R.
+\end{aligned}
 $$
 
 Coupled products:
 
 $$
-u_1 = (a_t b_t) \bmod M,\quad
-u_2 = (b_t c_t) \bmod M,\quad
-u_3 = (c_t a_t) \bmod M
+\begin{aligned}
+u_1 &= (a_t\, b_t) \bmod M, \\
+u_2 &= (b_t\, c_t) \bmod M, \\
+u_3 &= (c_t\, a_t) \bmod M.
+\end{aligned}
 $$
 
 Phase digest:
 
 $$
-\Phi_t = H(a_t \| b_t \| c_t \| u_1 \| u_2 \| u_3 \| \text{"PHASE"})
+\Phi_t = H\!\left(a_t \| b_t \| c_t \| u_1 \| u_2 \| u_3 \| \text{"PHASE"}\right).
 $$
 
-### 5.2 Permutation schedule ("returns every x")
+### 5.2 Permutation schedule (“returns every x”)
 Let:
 
 $$
-B = \lfloor t/x \rfloor,\quad s = t \bmod x
+B = \left\lfloor \frac{t}{x} \right\rfloor, \quad s = t \bmod x.
 $$
 
-Compute a permutation `pi_B` of `{0..x-1}` using a hash-driven shuffle seeded
-by a block-level phase digest (computed at `t = B * x`) so the schedule is
-stable within each block.
-Then:
+Compute a permutation $\pi_B$ of $\{0,\ldots,x-1\}$ using a hash-driven shuffle seeded by a block-level phase digest (computed at $t = B\cdot x$) so the schedule is stable within each block. Then:
 
 $$
-idx_t = \pi_B[s]
+\mathrm{idx}_t = \pi_B[s].
 $$
 
 This guarantees each provider appears exactly once per block.
 
 ### 5.3 Bouquet evaluation
-Each bouquet is a list of compounds `C_j`, each a product of primes. For a
-residue `xres` and coupling `u`, define:
+Each bouquet is a list of compounds $C_j$, each a product of primes. For a residue $x_{\mathrm{res}}$ and coupling $u$, define:
 
 $$
-e_j = H(xres \| u \| j \| \text{"EXP"}) \bmod (M-1)
+e_j = H\!\left(x_{\mathrm{res}} \| u \| j \| \text{"EXP"}\right) \bmod (M-1).
 $$
 
 $$
-Eval(Bouquet, xres, u) = \prod_j C_j^{e_j} \bmod M
+\mathrm{Eval}(\mathrm{Bouquet}, x_{\mathrm{res}}, u) = \prod_j C_j^{e_j} \bmod M.
 $$
 
-For provider `i`:
+For provider $i$:
 
 $$
-EA_i(t) = Eval(BouquetA_i, a_t, u_1)
-$$
-$$
-EB_i(t) = Eval(BouquetB_i, b_t, u_2)
-$$
-$$
-EC_i(t) = Eval(BouquetC_i, c_t, u_3)
+\begin{aligned}
+EA_i(t) &= \mathrm{Eval}(\mathrm{BouquetA}_i, a_t, u_1), \\
+EB_i(t) &= \mathrm{Eval}(\mathrm{BouquetB}_i, b_t, u_2), \\
+EC_i(t) &= \mathrm{Eval}(\mathrm{BouquetC}_i, c_t, u_3).
+\end{aligned}
 $$
 
 ### 5.4 Token derivation
 Key derivation:
 
 $$
-K_i(t) = H(EA_i \| EB_i \| EC_i \| \Phi_t \| \text{"KDF"})
+K_i(t) = H\!\left(EA_i \| EB_i \| EC_i \| \Phi_t \| \text{"KDF"}\right).
 $$
 
 Token:
 
 $$
-T_i(t) = Trunc_k(H(K_i \| t \| \Phi_t \| \text{"TOK"}))
+T_i(t) = \mathrm{Trunc}_k\!\left(H\!\left(K_i \| t \| \Phi_t \| \text{"TOK"}\right)\right).
 $$
 
 ### 5.5 Device emission and state evolution
-The device computes only `T_{idx_t}(t)` and updates internal state:
-- `W[i]` stores the last token for lane `i`.
-- The seed `S` evolves using all lanes and adjacent products.
+The device computes only $T_{\mathrm{idx}_t}(t)$ and updates internal state:
 
-For `x` lanes, define:
+- $W[i]$ stores the last token for lane $i$.
+- The seed $S$ evolves using all lanes and adjacent products.
 
-$$
-m_\ell = (W_\ell \cdot W_{\ell+1}) \bmod M,\quad \ell = 0..x-2
-$$
+For $x$ lanes, define (non-cyclic adjacency):
 
 $$
-S_{t+1} = H(S_t \| W_0 \| \cdots \| W_{x-1} \| m_0 \| \cdots \| m_{x-2}
-          \| \Phi_t \| \text{"EVOLVE"})
+m_\ell = (W_\ell \cdot W_{\ell+1}) \bmod M, \quad \ell = 0,\ldots,x-2.
+$$
+
+$$
+S_{t+1} = H\!\left(
+S_t \| W_0 \| \cdots \| W_{x-1} \| m_0 \| \cdots \| m_{x-2} \| \Phi_t \| \text{"EVOLVE"}
+\right).
 $$
 
 ### 5.6 Provider verification
-Provider `i` recomputes `T_i(t)` and accepts the token iff it matches.
+Provider $i$ recomputes $T_i(t)$ and accepts the token iff it matches.
 
 ## 6. Correctness and periodicity
+
 ### 6.1 Exact 1-of-x matching
-Within each block of length `x`, `pi_B` is a permutation. Therefore each
-provider index appears exactly once per block, and exactly one provider matches
-per cycle.
+Within each block of length $x$, $\pi_B$ is a permutation. Therefore each provider index appears exactly once per block, and exactly one provider matches per cycle.
 
 ### 6.2 Phase periodicity
-If `P, Q, R` are coprime, the tuple `(a_t, b_t, c_t)` repeats after `PQR`.
-If `P, Q, R` are also coprime with `x`, the deterministic schedule repeats
-after `PQRx`.
+If $P, Q, R$ are coprime, the tuple $(a_t, b_t, c_t)$ repeats after $PQR$. If $P, Q, R$ are also coprime with $x$, the deterministic schedule repeats after $PQRx$.
 
 ### 6.3 Modular exponent correctness
-With `M` prime, the group `F_M^*` has order `M-1`. Reducing exponents modulo
-`M-1` makes `C_j^{e_j} mod M` well-defined for any base `C_j` not divisible by
-`M`.
+With $M$ prime, the multiplicative group $\mathbb{F}_M^\*$ has order $M-1$. Reducing exponents modulo $M-1$ makes $C_j^{e_j} \bmod M$ well-defined for any base $C_j$ not divisible by $M$.
 
 ## 7. Security intuition (informal)
-- Lane isolation: each provider uses distinct secret bouquets, so observing one
-  lane does not reveal others.
-- Phase coupling: public residues are mixed and hashed, preventing linear
-  predictability from the CRT clock alone.
-- Device chaining: even stale lanes influence future state, reinforcing the
-  requirement that "every token matters".
+- **Lane isolation:** each provider uses distinct secret bouquets, so observing one lane does not reveal others.
+- **Phase coupling:** public residues are mixed and hashed, preventing linear predictability from the CRT clock alone.
+- **Device chaining:** even stale lanes influence future state, reinforcing the requirement that “every token matters”.
 
 ## 8. Experimental validation (deterministic simulation)
-We implemented a cycle-by-cycle simulator to validate correctness. The demo
-verifies:
+We implemented a cycle-by-cycle simulator to validate correctness. The demo verifies:
+
 - Each block yields a valid permutation.
 - Exactly one provider matches each cycle.
 - Each provider appears once per block.
 
 ### 8.1 Sample token trace (x=4, seed=1337)
-The following trace shows two full blocks. The device emits one token per cycle
-and exactly one server token matches.
+For PDF export, the original wide table was replaced with an A4-friendly summary table and a sequence diagram (tokens truncated for readability; the matched provider’s recomputed token equals the device token by construction).
 
-| t | block | slot | device idx | device token | server 0 token | server 1 token | server 2 token | server 3 token |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0 | 0 | 0 | 3 | `0xaa81443db40b5b1c43097327166e0e02` | `0xeeafece1251ccf687691135f062cb4d7` | `0xed74cbe26554bf9a270f1d1d90dcb25d` | `0xf84da16f0a9d23ca92b9598c2cccc4fb` | `0xaa81443db40b5b1c43097327166e0e02` |
-| 1 | 0 | 1 | 0 | `0x21faa3d7dacdd0e36103bdf69b2dbe77` | `0x21faa3d7dacdd0e36103bdf69b2dbe77` | `0xfcb1104a0c0ba7f9fa257abb65f4484f` | `0xb7f7f5fb372075bde5349158efa5fca9` | `0xcb440e82f41dd12c05d861a210208faa` |
-| 2 | 0 | 2 | 2 | `0x888b21379781bc887f5d778c7b903179` | `0x88ad5efb2c5761de52f141d23bc88540` | `0x673bce6b3a80330a1421b1bcf7102326` | `0x888b21379781bc887f5d778c7b903179` | `0x39001496e37a7d61dcd0b67485376618` |
-| 3 | 0 | 3 | 1 | `0xa591e8bf0845bb6a46322befc003b4b4` | `0x816f62b524482e9f535a2554d1b201a4` | `0xa591e8bf0845bb6a46322befc003b4b4` | `0x8593eef83487f09b5b30612843e00397` | `0xc204fbda03f97faa7bcf2a6b737960b3` |
-| 4 | 1 | 0 | 2 | `0x5da9a61cd51d3ff367ba3113eb1d52ff` | `0xfbcc12ba1996112e91f04f5e5752007b` | `0xdfb35020bcc5eda2736a65a8660cd188` | `0x5da9a61cd51d3ff367ba3113eb1d52ff` | `0x0984a1b59d2493b60a85a6b186402bf0` |
-| 5 | 1 | 1 | 0 | `0x8abe0866002f7ce535808b65879d17b6` | `0x8abe0866002f7ce535808b65879d17b6` | `0xc64b06a0c2b808e627c3fe2910f0536d` | `0x1715f8e9f51c0129907481780e0d03bc` | `0x7a42a0eae1727b8d0b41996c692ad5e3` |
-| 6 | 1 | 2 | 1 | `0x39d33ef184e9b1ddde964a83f06fd92e` | `0xaf724603668afe9e530ec505758015fd` | `0x39d33ef184e9b1ddde964a83f06fd92e` | `0x9dd506512423c063f94c259c4517aff2` | `0xa2a9e6284b90f8fa643db155f801e918` |
-| 7 | 1 | 3 | 3 | `0xe25bb134f354591bc4575918a9064674` | `0x69e26d5ca4b56e5ea99891eaaf15792c` | `0x5c0d14d5cabd38ca17d323d54d8f0bcf` | `0xffa8817c6c4d6b3806705a3446de34ba` | `0xe25bb134f354591bc4575918a9064674` |
+| t | block | slot | idx_t | device token (truncated) | matched provider |
+|---:|---:|---:|---:|---|---:|
+| 0 | 0 | 0 | 3 | `0xaa81443d…6e0e02` | 3 |
+| 1 | 0 | 1 | 0 | `0x21faa3d7…2dbe77` | 0 |
+| 2 | 0 | 2 | 2 | `0x888b2137…903179` | 2 |
+| 3 | 0 | 3 | 1 | `0xa591e8bf…03b4b4` | 1 |
+| 4 | 1 | 0 | 2 | `0x5da9a61c…1d52ff` | 2 |
+| 5 | 1 | 1 | 0 | `0x8abe0866…9d17b6` | 0 |
+| 6 | 1 | 2 | 1 | `0x39d33ef1…6fd92e` | 1 |
+| 7 | 1 | 3 | 3 | `0xe25bb134…064674` | 3 |
+
+```mermaid
+%%{init: {"theme":"neutral"} }%%
+sequenceDiagram
+  participant D as Device
+  participant P0 as Provider 0
+  participant P1 as Provider 1
+  participant P2 as Provider 2
+  participant P3 as Provider 3
+
+  D->>P3: t=0  0xaa81443d…6e0e02
+  D->>P0: t=1  0x21faa3d7…2dbe77
+  D->>P2: t=2  0x888b2137…903179
+  D->>P1: t=3  0xa591e8bf…03b4b4
+  D->>P2: t=4  0x5da9a61c…1d52ff
+  D->>P0: t=5  0x8abe0866…9d17b6
+  D->>P1: t=6  0x39d33ef1…6fd92e
+  D->>P3: t=7  0xe25bb134…064674
+```
+
+### 8.2 Full token trace (verbatim values)
+If you need the full per-provider recomputation values, here they are in a line-wrapping-friendly format (one cycle per block of text):
+
+- **t=0** (block=0, slot=0, idx=3)  
+  device: `0xaa81443db40b5b1c43097327166e0e02`  
+  P0: `0xeeafece1251ccf687691135f062cb4d7`, P1: `0xed74cbe26554bf9a270f1d1d90dcb25d`, P2: `0xf84da16f0a9d23ca92b9598c2cccc4fb`, **P3: `0xaa81443db40b5b1c43097327166e0e02`**
+
+- **t=1** (block=0, slot=1, idx=0)  
+  device: `0x21faa3d7dacdd0e36103bdf69b2dbe77`  
+  **P0: `0x21faa3d7dacdd0e36103bdf69b2dbe77`**, P1: `0xfcb1104a0c0ba7f9fa257abb65f4484f`, P2: `0xb7f7f5fb372075bde5349158efa5fca9`, P3: `0xcb440e82f41dd12c05d861a210208faa`
+
+- **t=2** (block=0, slot=2, idx=2)  
+  device: `0x888b21379781bc887f5d778c7b903179`  
+  P0: `0x88ad5efb2c5761de52f141d23bc88540`, P1: `0x673bce6b3a80330a1421b1bcf7102326`, **P2: `0x888b21379781bc887f5d778c7b903179`**, P3: `0x39001496e37a7d61dcd0b67485376618`
+
+- **t=3** (block=0, slot=3, idx=1)  
+  device: `0xa591e8bf0845bb6a46322befc003b4b4`  
+  P0: `0x816f62b524482e9f535a2554d1b201a4`, **P1: `0xa591e8bf0845bb6a46322befc003b4b4`**, P2: `0x8593eef83487f09b5b30612843e00397`, P3: `0xc204fbda03f97faa7bcf2a6b737960b3`
+
+- **t=4** (block=1, slot=0, idx=2)  
+  device: `0x5da9a61cd51d3ff367ba3113eb1d52ff`  
+  P0: `0xfbcc12ba1996112e91f04f5e5752007b`, P1: `0xdfb35020bcc5eda2736a65a8660cd188`, **P2: `0x5da9a61cd51d3ff367ba3113eb1d52ff`**, P3: `0x0984a1b59d2493b60a85a6b186402bf0`
+
+- **t=5** (block=1, slot=1, idx=0)  
+  device: `0x8abe0866002f7ce535808b65879d17b6`  
+  **P0: `0x8abe0866002f7ce535808b65879d17b6`**, P1: `0xc64b06a0c2b808e627c3fe2910f0536d`, P2: `0x1715f8e9f51c0129907481780e0d03bc`, P3: `0x7a42a0eae1727b8d0b41996c692ad5e3`
+
+- **t=6** (block=1, slot=2, idx=1)  
+  device: `0x39d33ef184e9b1ddde964a83f06fd92e`  
+  P0: `0xaf724603668afe9e530ec505758015fd`, **P1: `0x39d33ef184e9b1ddde964a83f06fd92e`**, P2: `0x9dd506512423c063f94c259c4517aff2`, P3: `0xa2a9e6284b90f8fa643db155f801e918`
+
+- **t=7** (block=1, slot=3, idx=3)  
+  device: `0xe25bb134f354591bc4575918a9064674`  
+  P0: `0x69e26d5ca4b56e5ea99891eaaf15792c`, P1: `0x5c0d14d5cabd38ca17d323d54d8f0bcf`, P2: `0xffa8817c6c4d6b3806705a3446de34ba`, **P3: `0xe25bb134f354591bc4575918a9064674`**
 
 ## 9. Discussion and limitations
-- Parameter choice matters; `P, Q, R, M` must be prime and pairwise coprime.
-- The permutation schedule is device-only; leakage of `perm_key` can reveal
-  lane order, but not lane tokens.
-- The security of the scheme relies on the strength of `H()` and the secrecy
-  of bouquets, not on the hardness of factoring revealed integers.
+- Parameter choice matters; $P, Q, R, M$ must be prime and pairwise coprime.
+- The permutation schedule is device-only; leakage of the permutation key can reveal lane order, but not lane tokens.
+- The security of the scheme relies on the strength of $H(\cdot)$ and the secrecy of bouquets, not on the hardness of factoring revealed integers.
 
 ## 10. Conclusion
-PCPL provides a deterministic, no-handshake token protocol with exact 1-of-x
-matching and a device-only chaining mechanism. Combined with symmetric continuous
-tokenizer devices, it supports both provider validation and peer-to-peer
-isolation with dynamic, evolving secrets. The included simulation and trace
-demonstrate the protocol's effective behavior cycle by cycle.
+PCPL provides a deterministic, no-handshake token protocol with exact 1-of-$x$ matching and a device-only chaining mechanism. Combined with symmetric continuous tokenizer devices, it supports both provider validation and peer-to-peer isolation with dynamic, evolving secrets. The included simulation and trace demonstrate the protocol’s behavior cycle by cycle.
