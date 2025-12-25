@@ -93,6 +93,31 @@ Notes:
   concatenation.
 - Tokens are truncated to the requested bit length; defaults are for validation.
 
+## Validation results (sample runs)
+Exact outputs from sample validation runs:
+
+| Command | Output |
+| --- | --- |
+| `python3 demo/pcpl_cycle_test.py --cycles 2000` | `OK: cycles=2000 providers=4 blocks=500 token_bits=128` |
+| `python3 demo/pcpl_cycle_test.py --x 6 --cycles 1200` | `OK: cycles=1200 providers=6 blocks=200 token_bits=128` |
+| `python3 demo/pcpl_cycle_test.py --x 8 --cycles 1600 --seed 2024` | `OK: cycles=1600 providers=8 blocks=200 token_bits=128` |
+
+## Token trace (device vs server, x=4)
+Example trace showing the effective matching behavior. Parameters: `x=4`,
+`token_bits=128`, seed `1337`. For each cycle, the device emits one token and
+exactly one server token matches.
+
+| t | block | slot | device idx | device token | server 0 token | server 1 token | server 2 token | server 3 token |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 0 | 0 | 3 | `0xaa81443db40b5b1c43097327166e0e02` | `0xeeafece1251ccf687691135f062cb4d7` | `0xed74cbe26554bf9a270f1d1d90dcb25d` | `0xf84da16f0a9d23ca92b9598c2cccc4fb` | `0xaa81443db40b5b1c43097327166e0e02` |
+| 1 | 0 | 1 | 0 | `0x21faa3d7dacdd0e36103bdf69b2dbe77` | `0x21faa3d7dacdd0e36103bdf69b2dbe77` | `0xfcb1104a0c0ba7f9fa257abb65f4484f` | `0xb7f7f5fb372075bde5349158efa5fca9` | `0xcb440e82f41dd12c05d861a210208faa` |
+| 2 | 0 | 2 | 2 | `0x888b21379781bc887f5d778c7b903179` | `0x88ad5efb2c5761de52f141d23bc88540` | `0x673bce6b3a80330a1421b1bcf7102326` | `0x888b21379781bc887f5d778c7b903179` | `0x39001496e37a7d61dcd0b67485376618` |
+| 3 | 0 | 3 | 1 | `0xa591e8bf0845bb6a46322befc003b4b4` | `0x816f62b524482e9f535a2554d1b201a4` | `0xa591e8bf0845bb6a46322befc003b4b4` | `0x8593eef83487f09b5b30612843e00397` | `0xc204fbda03f97faa7bcf2a6b737960b3` |
+| 4 | 1 | 0 | 2 | `0x5da9a61cd51d3ff367ba3113eb1d52ff` | `0xfbcc12ba1996112e91f04f5e5752007b` | `0xdfb35020bcc5eda2736a65a8660cd188` | `0x5da9a61cd51d3ff367ba3113eb1d52ff` | `0x0984a1b59d2493b60a85a6b186402bf0` |
+| 5 | 1 | 1 | 0 | `0x8abe0866002f7ce535808b65879d17b6` | `0x8abe0866002f7ce535808b65879d17b6` | `0xc64b06a0c2b808e627c3fe2910f0536d` | `0x1715f8e9f51c0129907481780e0d03bc` | `0x7a42a0eae1727b8d0b41996c692ad5e3` |
+| 6 | 1 | 2 | 1 | `0x39d33ef184e9b1ddde964a83f06fd92e` | `0xaf724603668afe9e530ec505758015fd` | `0x39d33ef184e9b1ddde964a83f06fd92e` | `0x9dd506512423c063f94c259c4517aff2` | `0xa2a9e6284b90f8fa643db155f801e918` |
+| 7 | 1 | 3 | 3 | `0xe25bb134f354591bc4575918a9064674` | `0x69e26d5ca4b56e5ea99891eaaf15792c` | `0x5c0d14d5cabd38ca17d323d54d8f0bcf` | `0xffa8817c6c4d6b3806705a3446de34ba` | `0xe25bb134f354591bc4575918a9064674` |
+
 ## Repository layout
 - `README.md`: human-readable overview (this file).
 - `papers/phase-shift-tokens.md`: spec and pseudocode.
