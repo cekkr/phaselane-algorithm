@@ -10,10 +10,13 @@ Code and tooling:
   - Default params: x=4, P/Q/R are small primes near 1e6, M=2^61-1.
   - Secret bouquets are generated deterministically from small primes.
   - Validates: permutation is a true per-block schedule, exactly 1-of-x match per cycle, and each provider once per full block; optional chaining divergence check.
+- `demo/export_token_trace.py`: exports deterministic token trace tables to Markdown.
+  - Default output: `papers/token-trace.md` (A4-friendly, per-lane tables).
 
 How to run:
 - `python3 demo/pcpl_cycle_test.py --cycles 200`
 - Options: `--x`, `--token-bits`, `--seed`, `--verbose`, `--no-chaining-check`.
+- `python3 demo/export_token_trace.py --blocks 4 --out papers/token-trace.md`
 
 Next steps:
 - Add more property checks (replay window, adversarial cross-lane attempts, larger x).
