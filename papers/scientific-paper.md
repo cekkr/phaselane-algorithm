@@ -248,39 +248,84 @@ sequenceDiagram
 ```
 
 ### 8.2 Full token trace (verbatim values)
-If you need the full per-provider recomputation values, here they are in a line-wrapping-friendly format (one cycle per block of text):
 
-- **t=0** (block=0, slot=0, idx=3)  
-  device: `0xaa81443db40b5b1c43097327166e0e02`  
-  P0: `0xeeafece1251ccf687691135f062cb4d7`, P1: `0xed74cbe26554bf9a270f1d1d90dcb25d`, P2: `0xf84da16f0a9d23ca92b9598c2cccc4fb`, **P3: `0xaa81443db40b5b1c43097327166e0e02`**
+This section is laid out to make the *lane-by-lane flow* easy to inspect by eye, without forcing a wide, A4-breaking table.
 
-- **t=1** (block=0, slot=1, idx=0)  
-  device: `0x21faa3d7dacdd0e36103bdf69b2dbe77`  
-  **P0: `0x21faa3d7dacdd0e36103bdf69b2dbe77`**, P1: `0xfcb1104a0c0ba7f9fa257abb65f4484f`, P2: `0xb7f7f5fb372075bde5349158efa5fca9`, P3: `0xcb440e82f41dd12c05d861a210208faa`
+**Schedule (which lane is selected each cycle)**
 
-- **t=2** (block=0, slot=2, idx=2)  
-  device: `0x888b21379781bc887f5d778c7b903179`  
-  P0: `0x88ad5efb2c5761de52f141d23bc88540`, P1: `0x673bce6b3a80330a1421b1bcf7102326`, **P2: `0x888b21379781bc887f5d778c7b903179`**, P3: `0x39001496e37a7d61dcd0b67485376618`
+| t | block | slot | idx (device routes to) |
+| --- | --- | --- | --- |
+| 0 | 0 | 0 | 3 |
+| 1 | 0 | 1 | 0 |
+| 2 | 0 | 2 | 2 |
+| 3 | 0 | 3 | 1 |
+| 4 | 1 | 0 | 2 |
+| 5 | 1 | 1 | 0 |
+| 6 | 1 | 2 | 1 |
+| 7 | 1 | 3 | 3 |
 
-- **t=3** (block=0, slot=3, idx=1)  
-  device: `0xa591e8bf0845bb6a46322befc003b4b4`  
-  P0: `0x816f62b524482e9f535a2554d1b201a4`, **P1: `0xa591e8bf0845bb6a46322befc003b4b4`**, P2: `0x8593eef83487f09b5b30612843e00397`, P3: `0xc204fbda03f97faa7bcf2a6b737960b3`
+**Lane traces (verbatim 128-bit tokens)**  
+A checkmark means “this lane matches the device token for that cycle” (and therefore is the chosen lane).
 
-- **t=4** (block=1, slot=0, idx=2)  
-  device: `0x5da9a61cd51d3ff367ba3113eb1d52ff`  
-  P0: `0xfbcc12ba1996112e91f04f5e5752007b`, P1: `0xdfb35020bcc5eda2736a65a8660cd188`, **P2: `0x5da9a61cd51d3ff367ba3113eb1d52ff`**, P3: `0x0984a1b59d2493b60a85a6b186402bf0`
+#### DEVICE (emitted token)
+| t | DEVICE token (128-bit) | match? |
+| --- | --- | --- |
+| 0 | `0xaa81443db40b5b1c43097327166e0e02` | ✅ |
+| 1 | `0x21faa3d7dacdd0e36103bdf69b2dbe77` | ✅ |
+| 2 | `0x888b21379781bc887f5d778c7b903179` | ✅ |
+| 3 | `0xa591e8bf0845bb6a46322befc003b4b4` | ✅ |
+| 4 | `0x5da9a61cd51d3ff367ba3113eb1d52ff` | ✅ |
+| 5 | `0x8abe0866002f7ce535808b65879d17b6` | ✅ |
+| 6 | `0x39d33ef184e9b1ddde964a83f06fd92e` | ✅ |
+| 7 | `0xe25bb134f354591bc4575918a9064674` | ✅ |
 
-- **t=5** (block=1, slot=1, idx=0)  
-  device: `0x8abe0866002f7ce535808b65879d17b6`  
-  **P0: `0x8abe0866002f7ce535808b65879d17b6`**, P1: `0xc64b06a0c2b808e627c3fe2910f0536d`, P2: `0x1715f8e9f51c0129907481780e0d03bc`, P3: `0x7a42a0eae1727b8d0b41996c692ad5e3`
+#### Provider lane P0
+| t | P0 token (128-bit) | match? |
+| --- | --- | --- |
+| 0 | `0xeeafece1251ccf687691135f062cb4d7` |  |
+| 1 | `0x21faa3d7dacdd0e36103bdf69b2dbe77` | ✅ |
+| 2 | `0x88ad5efb2c5761de52f141d23bc88540` |  |
+| 3 | `0x816f62b524482e9f535a2554d1b201a4` |  |
+| 4 | `0xfbcc12ba1996112e91f04f5e5752007b` |  |
+| 5 | `0x8abe0866002f7ce535808b65879d17b6` | ✅ |
+| 6 | `0xaf724603668afe9e530ec505758015fd` |  |
+| 7 | `0x69e26d5ca4b56e5ea99891eaaf15792c` |  |
 
-- **t=6** (block=1, slot=2, idx=1)  
-  device: `0x39d33ef184e9b1ddde964a83f06fd92e`  
-  P0: `0xaf724603668afe9e530ec505758015fd`, **P1: `0x39d33ef184e9b1ddde964a83f06fd92e`**, P2: `0x9dd506512423c063f94c259c4517aff2`, P3: `0xa2a9e6284b90f8fa643db155f801e918`
+#### Provider lane P1
+| t | P1 token (128-bit) | match? |
+| --- | --- | --- |
+| 0 | `0xed74cbe26554bf9a270f1d1d90dcb25d` |  |
+| 1 | `0xfcb1104a0c0ba7f9fa257abb65f4484f` |  |
+| 2 | `0x673bce6b3a80330a1421b1bcf7102326` |  |
+| 3 | `0xa591e8bf0845bb6a46322befc003b4b4` | ✅ |
+| 4 | `0xdfb35020bcc5eda2736a65a8660cd188` |  |
+| 5 | `0xc64b06a0c2b808e627c3fe2910f0536d` |  |
+| 6 | `0x39d33ef184e9b1ddde964a83f06fd92e` | ✅ |
+| 7 | `0x5c0d14d5cabd38ca17d323d54d8f0bcf` |  |
 
-- **t=7** (block=1, slot=3, idx=3)  
-  device: `0xe25bb134f354591bc4575918a9064674`  
-  P0: `0x69e26d5ca4b56e5ea99891eaaf15792c`, P1: `0x5c0d14d5cabd38ca17d323d54d8f0bcf`, P2: `0xffa8817c6c4d6b3806705a3446de34ba`, **P3: `0xe25bb134f354591bc4575918a9064674`**
+#### Provider lane P2
+| t | P2 token (128-bit) | match? |
+| --- | --- | --- |
+| 0 | `0xf84da16f0a9d23ca92b9598c2cccc4fb` |  |
+| 1 | `0xb7f7f5fb372075bde5349158efa5fca9` |  |
+| 2 | `0x888b21379781bc887f5d778c7b903179` | ✅ |
+| 3 | `0x8593eef83487f09b5b30612843e00397` |  |
+| 4 | `0x5da9a61cd51d3ff367ba3113eb1d52ff` | ✅ |
+| 5 | `0x1715f8e9f51c0129907481780e0d03bc` |  |
+| 6 | `0x9dd506512423c063f94c259c4517aff2` |  |
+| 7 | `0xffa8817c6c4d6b3806705a3446de34ba` |  |
+
+#### Provider lane P3
+| t | P3 token (128-bit) | match? |
+| --- | --- | --- |
+| 0 | `0xaa81443db40b5b1c43097327166e0e02` | ✅ |
+| 1 | `0xcb440e82f41dd12c05d861a210208faa` |  |
+| 2 | `0x39001496e37a7d61dcd0b67485376618` |  |
+| 3 | `0xc204fbda03f97faa7bcf2a6b737960b3` |  |
+| 4 | `0x0984a1b59d2493b60a85a6b186402bf0` |  |
+| 5 | `0x7a42a0eae1727b8d0b41996c692ad5e3` |  |
+| 6 | `0xa2a9e6284b90f8fa643db155f801e918` |  |
+| 7 | `0xe25bb134f354591bc4575918a9064674` | ✅ |
 
 ## 9. Discussion and limitations
 - Parameter choice matters; $P, Q, R, M$ must be prime and pairwise coprime.
