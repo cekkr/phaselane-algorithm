@@ -1,3 +1,4 @@
+
 <style>
 table, tr {
 	width:100%; 
@@ -69,6 +70,8 @@ Threat model (minimal):
 - A provider should not compute tokens for other providers.
 - Observing accepted tokens should not reveal other lanes.
 - Public time/phase information should not enable cross-lane forgery.
+
+The "primes" approach as basilar differentiate hashing algorithm should be considered the simplest one. Even with certain vulnerabilities depending on choosen parameters, it's good for working with integer-only circuits.
 
 ## 3. Notation and public parameters
 Let:
