@@ -82,6 +82,19 @@ Let:
 
 Each provider $i$ has three secret bouquets: $\mathrm{BouquetA}_i, \mathrm{BouquetB}_i, \mathrm{BouquetC}_i$, each a list of prime compounds.
 
+### 3.1 Seed construction and coprime extraction
+The device bootstraps a root seed $Z$ from device-local entropy and context (for example: device secret, serial, provider list, and a boot nonce). In the demo, $Z$ is produced by a deterministic RNG seeded with `--seed`, then bound to labels with $H(\cdot)$:
+
+- $\mathrm{perm\_key} = H(Z \| \text{"PERMKEY"})$
+- $S_0 = H(Z \| \text{"SEED"})$
+- $W_i = \mathrm{Trunc}_k(H(Z \| \text{"W"} \| i))$
+
+To extrapolate coprimes for $P,Q,R$ (and optionally $M$), derive candidates from a seeded stream and select the first primes that are distinct and coprime with $x$:
+
+1. $c_k \leftarrow \mathrm{next\_prime}(H(Z \| \text{"PRIME"} \| k) \bmod 2^b)$
+2. accept $c_k$ if $\gcd(c_k, x)=1$ and $c_k \notin \{P,Q,R,M\}$
+3. continue until $P,Q,R$ (and $M$ if generated) are assigned
+
 ## 4. PCPL protocol overview
 The protocol uses:
 
@@ -145,6 +158,19 @@ $$
 
 This guarantees each provider appears exactly once per block.
 
+### 5.2.1 Device-side destination selection
+The device determines the current destination provider using only public phase data and its private permutation key:
+
+$$
+\begin{aligned}
+&B = \left\lfloor \frac{t}{x} \right\rfloor,\quad s = t \bmod x \\
+&\pi_B = \mathrm{Permute}\left(\mathrm{perm\_key}, B, \Phi_{B\cdot x}\right) \\
+&\mathrm{idx}_t = \pi_B[s]
+\end{aligned}
+$$
+
+Providers do not know $\mathrm{perm\_key}$, so the schedule is blinded from them even though $t$ and $\Phi_t$ are public.
+
 ### 5.3 Bouquet evaluation
 Each bouquet is a list of compounds $C_j$, each a product of primes. For a residue $x_{\mathrm{res}}$ and coupling $u$, define:
 
@@ -165,6 +191,16 @@ EB_i(t) &= \mathrm{Eval}(\mathrm{BouquetB}_i, b_t, u_2), \\
 EC_i(t) &= \mathrm{Eval}(\mathrm{BouquetC}_i, c_t, u_3).
 \end{aligned}
 $$
+
+### 5.3.1 Prime-compound construction variants
+Compounds do not need to be prime: any base coprime with $M$ is valid. This allows richer “prime compounds” that keep continuity while increasing algebraic complexity:
+
+- **Prime powers:** $C = p^k$ (smooth but non-prime bases).
+- **Semiprimes:** $C = p q$ (harder to factor, still structured).
+- **Offset compounds:** $C = \left(\prod p_i^{e_i}\right) + \delta$ with small $\delta$ to create a quasi-continuous family.
+- **Quantized reals:** map a real parameter $\rho$ to $C = \lfloor \alpha \rho \rfloor$ for fixed scale $\alpha$, then ensure $\gcd(C, M)=1$.
+
+The demo exposes these families via compound generation modes while keeping the exponent schedule unchanged.
 
 ### 5.4 Token derivation
 Key derivation:
@@ -198,7 +234,37 @@ S_t \| W_0 \| \cdots \| W_{x-1} \| m_0 \| \cdots \| m_{x-2} \| \Phi_t \| \text{"
 $$
 
 ### 5.6 Provider verification
-Provider $i$ recomputes $T_i(t)$ and accepts the token  it matches.
+Provider $i$ recomputes $T_i(t)$ and accepts the token if it matches.
+
+### 5.7 Device-side vs provider-side variables
+The protocol deliberately separates what the device computes from what providers can infer:
+
+- **Public inputs:** $t$, $x$, $P,Q,R,M$, and the permutation algorithm (but not the key).
+- **Device-only state:** $\mathrm{perm\_key}$, $S_t$, all lane secrets, and the last tokens $W[0..x-1]$.
+- **Provider $i$ secrets:** $\mathrm{BouquetA}_i, \mathrm{BouquetB}_i, \mathrm{BouquetC}_i$.
+- **Ignored by providers:** $\mathrm{perm\_key}$, $S_t$, other providers’ bouquets, and the full $W$ vector.
+
+The device computes only $T_{\mathrm{idx}_t}(t)$ for the current lane; the provider computes only its own lane token and does not need the device seed.
+
+```mermaid
+%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
+flowchart LR
+  Public["Public clock<br/>t, P,Q,R, x"] --> Phase["Phase residues<br/>a_t,b_t,c_t,u_1,u_2,u_3"]
+  Device["Device-only<br/>perm_key, S_t, all bouquets"] --> Select["idx_t = pi_B[s]"]
+  Phase --> Select
+  Select --> Token["Token T_idx_t(t)"]
+  Token --> Provider["Provider i<br/>Bouquet_i only"]
+  Phase --> Provider
+
+  subgraph Repeat["Predictable repeats / exposure"]
+    R1["Phase period = lcm(P,Q,R,x)"]
+    R2["Permutation repeats per block"]
+    R3["Provider sees 1/x duty cycle"]
+  end
+
+  Phase -.-> Repeat
+  Select -.-> Repeat
+```
 
 ## 6. Correctness and periodicity
 
@@ -211,10 +277,22 @@ If $P, Q, R$ are coprime, the tuple $(a_t, b_t, c_t)$ repeats after $PQR$. If $P
 ### 6.3 Modular exponent correctness
 With $M$ prime, the multiplicative group $\mathbb{F}_M^{\ast}$ has order $M-1$. Reducing exponents modulo $M-1$ makes $C_j^{e_j} \bmod M$ well-defined for any base $C_j$ not divisible by $M$.
 
+### 6.4 Peer-count variations (x=2,3,4 and prime powers)
+Changing $x$ changes the block size, the number of permutations, and the chain width:
+
+| x | block length | permutations | chain products | note |
+|---:|---:|---:|---:|---|
+| 2 | 2 | 2 | 1 | twin pairing (2 lanes) |
+| 3 | 3 | 6 | 2 | prime lane count |
+| 4 | 4 | 24 | 3 | $2^2$ prime power |
+
+In general: block length $= x$, permutation space $= x!$, chain width $= x-1$, and schedule period $= \mathrm{lcm}(P,Q,R,x)$. For $x=p^k$, choose $P,Q,R$ coprime with $p$ to avoid shrinking the period.
+
 ## 7. Security intuition (informal)
 - **Lane isolation:** each provider uses distinct secret bouquets, so observing one lane does not reveal others.
 - **Phase coupling:** public residues are mixed and hashed, preventing linear predictability from the CRT clock alone.
 - **Device chaining:** even stale lanes influence future state, reinforcing the requirement that “every token matters”.
+- **Quantum period-finding:** QFT can reveal the public period $\mathrm{lcm}(P,Q,R,x)$ but not the hidden bouquets or $\mathrm{perm\_key}$; use large coprimes and device-only chaining to avoid exploitable structure.
 
 ## 8. Experimental validation (deterministic simulation)
 A simulator was implemented a cycle-by-cycle to validate correctness. The demo verifies:
@@ -222,6 +300,8 @@ A simulator was implemented a cycle-by-cycle to validate correctness. The demo v
 - Each block yields a valid permutation.
 - Exactly one provider matches each cycle.
 - Each provider appears once per block.
+- Optional pre-hash difficulty metrics and QFT-visible period reports.
+- Optional prime/compound generation modes for non-arbitrary parameter testing.
 
 ### 8.1 Sample token trace (x=4, seed=1337)
 For PDF export, the original wide table was replaced with an A4-friendly summary table and a sequence diagram (tokens truncated for readability; the matched provider’s recomputed token equals the device token by construction).
@@ -263,10 +343,20 @@ The full deterministic trace (block permutations, schedule, device tokens, and p
 Regenerate with:
 `python3 demo/export_token_trace.py --blocks 4 --out papers/token-trace.md`
 
+### 8.3 Pre-hash difficulty and period reporting
+The demo can emit a linear pre-hash difficulty report (rank of exponent vectors modulo 2 and 65537) and the QFT-visible public period:
+
+- `python3 demo/pcpl_cycle_test.py --linear-report --analysis-window 64`
+- `python3 demo/pcpl_cycle_test.py --qft-report`
+- `python3 demo/pcpl_cycle_test.py --compare-x 2,3,4,8,9`
+- `python3 demo/pcpl_cycle_test.py --prime-mode generated --prime-bits 31 --compound-mode blend --compound-prime-bits 12`
+
 ## 9. Discussion and limitations
 - Parameter choice matters; $P, Q, R, M$ must be prime and pairwise coprime.
 - The permutation schedule is device-only; leakage of the permutation key can reveal lane order, but not lane tokens.
 - The security of the scheme relies on the strength of $H(\cdot)$ and the secrecy of bouquets, not on the hardness of factoring revealed integers.
+- The public period $\mathrm{lcm}(P,Q,R,x)$ is visible (and QFT-recoverable), so period size should be chosen large enough for the deployment horizon.
+- For testing, primes and compound bases can be generated from a seeded stream to avoid arbitrary constants.
 - This paper was developed and formatted with an heavy OpenAI models' help.
 
 ## 10. Conclusion

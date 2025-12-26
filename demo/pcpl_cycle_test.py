@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Cycle-by-cycle PCPL simulation from papers/phase-shift-tokens.md.
-Validates the 1-of-x lane property and the per-block permutation schedule.
+Validates the 1-of-x lane property and the per-block permutation schedule, with
+optional dynamic prime generation and difficulty reporting.
 """
 
 from __future__ import annotations
@@ -13,13 +14,14 @@ import itertools
 import math
 import random
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Set, Tuple
 
 
 PRIME_POOL = [
     3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67
 ]
 PERM_TABLE_24 = [tuple(p) for p in itertools.permutations(range(4))]
+MR_BASES_64 = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,17 @@ class ProviderSecrets:
     bouquetA: List[int]
     bouquetB: List[int]
     bouquetC: List[int]
+
+
+@dataclass(frozen=True)
+class CompoundConfig:
+    num_compounds: int
+    primes_per_compound: int
+    mode: str
+    offset_max: int
+    exponent_min: int
+    exponent_max: int
+    prime_pool: Sequence[int]
 
 
 @dataclass
@@ -103,6 +116,10 @@ def h_bytes(*parts: object, out_len: int = 32) -> bytes:
     return hasher.digest()
 
 
+def derive_seed(seed: int, label: str) -> int:
+    return int.from_bytes(h_bytes(seed, label, out_len=8), "big")
+
+
 def is_prime_small(n: int) -> bool:
     if n < 2:
         return False
@@ -115,6 +132,85 @@ def is_prime_small(n: int) -> bool:
     return True
 
 
+def is_probable_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    small_primes = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+    for p in small_primes:
+        if n % p == 0:
+            return n == p
+
+    d = n - 1
+    s = 0
+    while d % 2 == 0:
+        d //= 2
+        s += 1
+
+    for a in MR_BASES_64:
+        if a % n == 0:
+            continue
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(s - 1):
+            x = pow(x, 2, n)
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def generate_prime(
+    rng: random.Random,
+    bits: int,
+    avoid_gcd: int,
+    avoid_set: Optional[Set[int]] = None,
+) -> int:
+    if bits < 2:
+        raise ValueError("bits must be >= 2")
+    if avoid_set is None:
+        avoid_set = set()
+    while True:
+        candidate = rng.getrandbits(bits)
+        candidate |= (1 << (bits - 1)) | 1
+        if math.gcd(candidate, avoid_gcd) != 1:
+            continue
+        if candidate in avoid_set:
+            continue
+        if is_probable_prime(candidate):
+            return candidate
+
+
+def generate_prime_pool(
+    rng: random.Random,
+    pool_size: int,
+    bits: int,
+    avoid_set: Optional[Set[int]] = None,
+) -> List[int]:
+    if pool_size <= 0:
+        raise ValueError("pool_size must be positive")
+    if avoid_set is None:
+        avoid_set = set()
+    pool: List[int] = []
+    while len(pool) < pool_size:
+        prime = generate_prime(rng, bits, avoid_gcd=1, avoid_set=avoid_set | set(pool))
+        pool.append(prime)
+    return pool
+
+
+def generate_coprime_primes(
+    rng: random.Random,
+    x: int,
+    bits: int,
+) -> Tuple[int, int, int]:
+    primes = []
+    while len(primes) < 3:
+        prime = generate_prime(rng, bits, avoid_gcd=x, avoid_set=set(primes))
+        primes.append(prime)
+    return primes[0], primes[1], primes[2]
+
+
 def next_prime_avoiding(start: int, avoid: int) -> int:
     candidate = start
     while True:
@@ -123,7 +219,15 @@ def next_prime_avoiding(start: int, avoid: int) -> int:
         candidate += 1
 
 
-def build_params(x: int, token_bits: int, seed_bytes: int = 32) -> Params:
+def build_params(
+    x: int,
+    token_bits: int,
+    seed_bytes: int = 32,
+    prime_mode: str = "fixed",
+    prime_bits: int = 20,
+    modulus_bits: int = 61,
+    rng: Optional[random.Random] = None,
+) -> Params:
     if x < 2:
         raise ValueError("x must be at least 2")
     if token_bits <= 0:
@@ -132,10 +236,22 @@ def build_params(x: int, token_bits: int, seed_bytes: int = 32) -> Params:
     if token_bytes > 64:
         raise ValueError("token_bits too large for blake2b truncation")
 
-    P = next_prime_avoiding(1_000_003, x)
-    Q = next_prime_avoiding(1_000_033, x)
-    R = next_prime_avoiding(1_000_037, x)
-    M = (1 << 61) - 1  # 2^61 - 1, known prime
+    if prime_mode == "fixed":
+        P = next_prime_avoiding(1_000_003, x)
+        Q = next_prime_avoiding(1_000_033, x)
+        R = next_prime_avoiding(1_000_037, x)
+        M = (1 << 61) - 1  # 2^61 - 1, known prime
+    elif prime_mode == "generated":
+        if rng is None:
+            raise ValueError("rng is required when prime_mode='generated'")
+        if prime_bits < 8:
+            raise ValueError("prime_bits too small for generated primes")
+        if modulus_bits < 16:
+            raise ValueError("modulus_bits too small for generated modulus")
+        P, Q, R = generate_coprime_primes(rng, x, prime_bits)
+        M = generate_prime(rng, modulus_bits, avoid_gcd=x, avoid_set={P, Q, R})
+    else:
+        raise ValueError("prime_mode must be 'fixed' or 'generated'")
     mod_bytes = (M.bit_length() + 7) // 8
 
     if len({P, Q, R}) != 3:
@@ -185,6 +301,14 @@ def permutation_for_block(B: int, params: Params, perm_key: bytes, phi_block: by
     return perm
 
 
+def device_destination_provider(t: int, params: Params, perm_key: bytes) -> int:
+    block = t // params.x
+    slot = t % params.x
+    phase_block = phase_clock(block * params.x, params)
+    perm = permutation_for_block(block, params, perm_key, phase_block.phi)
+    return perm[slot]
+
+
 def eval_bouquet(bouquet: Sequence[int], xres: int, u: int, params: Params) -> int:
     acc = 1 % params.M
     for j, compound in enumerate(bouquet):
@@ -194,6 +318,84 @@ def eval_bouquet(bouquet: Sequence[int], xres: int, u: int, params: Params) -> i
         exponent = int.from_bytes(h_bytes(xres, u, j, "EXP", out_len=32), "big") % (params.M - 1)
         acc = (acc * pow(base, exponent, params.M)) % params.M
     return acc
+
+
+def exponent_vector(num_compounds: int, xres: int, u: int, params: Params) -> List[int]:
+    return [
+        int.from_bytes(h_bytes(xres, u, j, "EXP", out_len=32), "big") % (params.M - 1)
+        for j in range(num_compounds)
+    ]
+
+
+def modinv(value: int, mod: int) -> int:
+    if mod == 2:
+        return 1
+    return pow(value, mod - 2, mod)
+
+
+def rank_mod(matrix: List[List[int]], mod: int) -> int:
+    if not matrix:
+        return 0
+    rows = [row[:] for row in matrix]
+    row_count = len(rows)
+    col_count = len(rows[0])
+    rank = 0
+    for col in range(col_count):
+        pivot = None
+        for r in range(rank, row_count):
+            if rows[r][col] % mod != 0:
+                pivot = r
+                break
+        if pivot is None:
+            continue
+        rows[rank], rows[pivot] = rows[pivot], rows[rank]
+        inv = modinv(rows[rank][col] % mod, mod)
+        for c in range(col, col_count):
+            rows[rank][c] = (rows[rank][c] * inv) % mod
+        for r in range(row_count):
+            if r == rank or rows[r][col] % mod == 0:
+                continue
+            factor = rows[r][col] % mod
+            for c in range(col, col_count):
+                rows[r][c] = (rows[r][c] - factor * rows[rank][c]) % mod
+        rank += 1
+        if rank == col_count:
+            break
+    return rank
+
+
+def linear_difficulty_report(params: Params, num_compounds: int, window: int) -> None:
+    window = max(1, window)
+    matrices = {"A": [], "B": [], "C": []}
+    for t in range(window):
+        phase = phase_clock(t, params)
+        matrices["A"].append(exponent_vector(num_compounds, phase.a, phase.u1, params))
+        matrices["B"].append(exponent_vector(num_compounds, phase.b, phase.u2, params))
+        matrices["C"].append(exponent_vector(num_compounds, phase.c, phase.u3, params))
+
+    for label in ("A", "B", "C"):
+        rows = matrices[label]
+        unique_rows = len({tuple(row) for row in rows})
+        rank_mod2 = rank_mod(rows, 2)
+        rank_modp = rank_mod(rows, 65537)
+        print(
+            f"linear-{label}: unique={unique_rows}/{window} "
+            f"rank_mod2={rank_mod2}/{num_compounds} "
+            f"rank_mod65537={rank_modp}/{num_compounds}"
+        )
+
+
+def lcm(a: int, b: int) -> int:
+    return a // math.gcd(a, b) * b
+
+
+def schedule_period(params: Params) -> int:
+    return lcm(lcm(lcm(params.P, params.Q), params.R), params.x)
+
+
+def qft_report(params: Params) -> None:
+    period = schedule_period(params)
+    print(f"qft-period: {period} (~{period.bit_length()} bits)")
 
 
 def lane_token(_index: int, t: int, phase: Phase, params: Params, secrets: ProviderSecrets) -> int:
@@ -209,11 +411,7 @@ def lane_token(_index: int, t: int, phase: Phase, params: Params, secrets: Provi
 def device_cycle(t: int, params: Params, state: DeviceState) -> Tuple[int, int]:
     phase = phase_clock(t, params)
 
-    block = t // params.x
-    slot = t % params.x
-    phase_block = phase_clock(block * params.x, params)
-    perm = permutation_for_block(block, params, state.perm_key, phase_block.phi)
-    idx = perm[slot]
+    idx = device_destination_provider(t, params, state.perm_key)
 
     state.W[idx] = lane_token(idx, t, phase, params, state.secrets[idx])
 
@@ -232,27 +430,67 @@ def device_cycle(t: int, params: Params, state: DeviceState) -> Tuple[int, int]:
     return idx, state.W[idx]
 
 
-def generate_provider_secrets(rng: random.Random, num_compounds: int, primes_per_compound: int) -> ProviderSecrets:
-    def make_compound() -> int:
+def generate_provider_secrets(rng: random.Random, compound_cfg: CompoundConfig) -> ProviderSecrets:
+    def classic_compound() -> int:
         value = 1
-        for _ in range(primes_per_compound):
-            prime = rng.choice(PRIME_POOL)
-            exponent = rng.randint(1, 3)
-            value *= prime ** exponent
+        for _ in range(compound_cfg.primes_per_compound):
+            prime = rng.choice(compound_cfg.prime_pool)
+            exponent = rng.randint(compound_cfg.exponent_min, compound_cfg.exponent_max)
+            value *= prime**exponent
         return value
 
+    def prime_power_compound() -> int:
+        prime = rng.choice(compound_cfg.prime_pool)
+        exponent = rng.randint(max(2, compound_cfg.exponent_min), compound_cfg.exponent_max)
+        return prime**exponent
+
+    def semiprime_compound() -> int:
+        prime_a = rng.choice(compound_cfg.prime_pool)
+        prime_b = rng.choice(compound_cfg.prime_pool)
+        return prime_a * prime_b
+
+    def offset_compound() -> int:
+        base = classic_compound()
+        if compound_cfg.offset_max > 0:
+            base += rng.randint(1, compound_cfg.offset_max)
+        return base
+
+    def make_compound() -> int:
+        mode = compound_cfg.mode
+        if mode == "classic":
+            return classic_compound()
+        if mode == "prime-power":
+            return prime_power_compound()
+        if mode == "semiprime":
+            return semiprime_compound()
+        if mode == "offset":
+            return offset_compound()
+        if mode == "blend":
+            roll = rng.random()
+            if roll < 0.5:
+                return classic_compound()
+            if roll < 0.7:
+                return prime_power_compound()
+            if roll < 0.85:
+                return semiprime_compound()
+            return offset_compound()
+        raise ValueError(f"Unknown compound mode: {mode}")
+
     return ProviderSecrets(
-        bouquetA=[make_compound() for _ in range(num_compounds)],
-        bouquetB=[make_compound() for _ in range(num_compounds)],
-        bouquetC=[make_compound() for _ in range(num_compounds)],
+        bouquetA=[make_compound() for _ in range(compound_cfg.num_compounds)],
+        bouquetB=[make_compound() for _ in range(compound_cfg.num_compounds)],
+        bouquetC=[make_compound() for _ in range(compound_cfg.num_compounds)],
     )
 
 
-def build_fixture(params: Params, seed: int) -> Tuple[List[ProviderSecrets], DeviceState]:
+def build_fixture(
+    params: Params,
+    seed: int,
+    compound_cfg: CompoundConfig,
+) -> Tuple[List[ProviderSecrets], DeviceState]:
     rng = random.Random(seed)
     secrets = [
-        generate_provider_secrets(rng, num_compounds=4, primes_per_compound=3)
-        for _ in range(params.x)
+        generate_provider_secrets(rng, compound_cfg) for _ in range(params.x)
     ]
 
     seed_material = rng.getrandbits(256).to_bytes(32, "big")
@@ -311,9 +549,9 @@ def validate_cycles(
             raise AssertionError(f"Block {block} counts invalid: {counts}")
 
 
-def validate_chaining(params: Params, seed: int) -> None:
-    _, state_a = build_fixture(params, seed)
-    _, state_b = build_fixture(params, seed)
+def validate_chaining(params: Params, seed: int, compound_cfg: CompoundConfig) -> None:
+    _, state_a = build_fixture(params, seed, compound_cfg)
+    _, state_b = build_fixture(params, seed, compound_cfg)
 
     phase_block = phase_clock(0, params)
     perm = permutation_for_block(0, params, state_a.perm_key, phase_block.phi)
@@ -326,12 +564,148 @@ def validate_chaining(params: Params, seed: int) -> None:
         raise AssertionError("Chaining check failed: seed did not diverge after mutation")
 
 
+def build_compound_config(
+    seed: int,
+    params: Params,
+    num_compounds: int,
+    primes_per_compound: int,
+    compound_mode: str,
+    compound_offset: int,
+    compound_prime_bits: int,
+    compound_pool_size: int,
+    pool_label: str,
+) -> CompoundConfig:
+    if compound_prime_bits > 0:
+        rng_pool = random.Random(derive_seed(seed, pool_label))
+        prime_pool = generate_prime_pool(
+            rng_pool,
+            compound_pool_size,
+            compound_prime_bits,
+            avoid_set={params.M},
+        )
+    else:
+        prime_pool = PRIME_POOL
+    if not prime_pool:
+        raise ValueError("Prime pool cannot be empty")
+    return CompoundConfig(
+        num_compounds=num_compounds,
+        primes_per_compound=primes_per_compound,
+        mode=compound_mode,
+        offset_max=max(0, compound_offset),
+        exponent_min=1,
+        exponent_max=3,
+        prime_pool=prime_pool,
+    )
+
+
+def parse_x_list(values: str) -> List[int]:
+    parts = [part.strip() for part in values.split(",") if part.strip()]
+    if not parts:
+        raise ValueError("compare-x list is empty")
+    parsed = []
+    for part in parts:
+        value = int(part)
+        if value < 2:
+            raise ValueError("x values must be at least 2")
+        parsed.append(value)
+    return parsed
+
+
+def compare_x_modes(args: argparse.Namespace) -> None:
+    x_values = parse_x_list(args.compare_x)
+    print("compare-x: x | period_bits | chain_edges | perm0 | P,Q,R")
+    for x in x_values:
+        param_rng = None
+        if args.prime_mode == "generated":
+            param_rng = random.Random(derive_seed(args.seed, f"PARAMS:{x}"))
+        params = build_params(
+            x,
+            args.token_bits,
+            prime_mode=args.prime_mode,
+            prime_bits=args.prime_bits,
+            modulus_bits=args.modulus_bits,
+            rng=param_rng,
+        )
+        compound_cfg = build_compound_config(
+            args.seed,
+            params,
+            args.compound_count,
+            args.compound_primes,
+            args.compound_mode,
+            args.compound_offset,
+            args.compound_prime_bits,
+            args.compound_pool_size,
+            pool_label=f"COMPOUND_POOL:{x}",
+        )
+        _, state = build_fixture(params, args.seed, compound_cfg)
+        phase_block = phase_clock(0, params)
+        perm = permutation_for_block(0, params, state.perm_key, phase_block.phi)
+        period_bits = schedule_period(params).bit_length()
+        print(
+            f"compare-x: {x} | {period_bits} | {x - 1} | {perm} | "
+            f"{params.P},{params.Q},{params.R}"
+        )
+        if args.linear_report:
+            linear_difficulty_report(params, compound_cfg.num_compounds, args.analysis_window)
+        if args.qft_report:
+            qft_report(params)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PCPL cycle-by-cycle demo test.")
     parser.add_argument("--cycles", type=int, default=200, help="Number of cycles to simulate.")
     parser.add_argument("--x", type=int, default=4, help="Number of providers.")
     parser.add_argument("--seed", type=int, default=1337, help="Deterministic RNG seed.")
     parser.add_argument("--token-bits", type=int, default=128, help="Token size in bits.")
+    parser.add_argument(
+        "--prime-mode",
+        choices=("fixed", "generated"),
+        default="fixed",
+        help="Prime selection mode for P/Q/R (and M when generated).",
+    )
+    parser.add_argument("--prime-bits", type=int, default=20, help="Bit size for generated P/Q/R.")
+    parser.add_argument("--modulus-bits", type=int, default=61, help="Bit size for generated modulus M.")
+    parser.add_argument(
+        "--compound-mode",
+        choices=("classic", "prime-power", "semiprime", "offset", "blend"),
+        default="classic",
+        help="Compound generation mode for bouquets.",
+    )
+    parser.add_argument("--compound-count", type=int, default=4, help="Compounds per bouquet.")
+    parser.add_argument("--compound-primes", type=int, default=3, help="Primes per compound.")
+    parser.add_argument(
+        "--compound-offset",
+        type=int,
+        default=0,
+        help="Offset added to compounds for offset/blend modes.",
+    )
+    parser.add_argument(
+        "--compound-prime-bits",
+        type=int,
+        default=0,
+        help="Bit size for generated prime pool (0 uses built-in pool).",
+    )
+    parser.add_argument(
+        "--compound-pool-size",
+        type=int,
+        default=len(PRIME_POOL),
+        help="Prime pool size when generating compound primes.",
+    )
+    parser.add_argument(
+        "--analysis-window",
+        type=int,
+        default=64,
+        help="Cycles to sample for linear difficulty report.",
+    )
+    parser.add_argument("--linear-report", action="store_true", help="Print pre-hash linear metrics.")
+    parser.add_argument("--qft-report", action="store_true", help="Print QFT-visible period metrics.")
+    parser.add_argument(
+        "--compare-x",
+        type=str,
+        default="",
+        help="Comma-separated x values to compare and exit.",
+    )
+    parser.add_argument("--show-params", action="store_true", help="Print P, Q, R, M values.")
     parser.add_argument("--verbose", action="store_true", help="Print first few cycles.")
     parser.add_argument("--no-chaining-check", action="store_true", help="Skip chaining divergence check.")
     return parser.parse_args()
@@ -339,13 +713,49 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    params = build_params(args.x, args.token_bits)
-    secrets, state = build_fixture(params, args.seed)
+    if args.compare_x:
+        compare_x_modes(args)
+        return
+
+    param_rng = None
+    if args.prime_mode == "generated":
+        param_rng = random.Random(derive_seed(args.seed, "PARAMS"))
+    params = build_params(
+        args.x,
+        args.token_bits,
+        prime_mode=args.prime_mode,
+        prime_bits=args.prime_bits,
+        modulus_bits=args.modulus_bits,
+        rng=param_rng,
+    )
+    compound_cfg = build_compound_config(
+        args.seed,
+        params,
+        args.compound_count,
+        args.compound_primes,
+        args.compound_mode,
+        args.compound_offset,
+        args.compound_prime_bits,
+        args.compound_pool_size,
+        pool_label="COMPOUND_POOL",
+    )
+    secrets, state = build_fixture(params, args.seed, compound_cfg)
 
     validate_permutation(params, state.perm_key, blocks=max(1, args.cycles // params.x))
     validate_cycles(params, secrets, state, args.cycles, verbose=args.verbose)
     if not args.no_chaining_check:
-        validate_chaining(params, args.seed)
+        validate_chaining(params, args.seed, compound_cfg)
+
+    if args.show_params:
+        print(f"params: P={params.P} Q={params.Q} R={params.R} M={params.M}")
+    if args.linear_report:
+        linear_difficulty_report(
+            params,
+            compound_cfg.num_compounds,
+            min(args.analysis_window, args.cycles),
+        )
+    if args.qft_report:
+        qft_report(params)
 
     blocks = args.cycles // params.x
     print(

@@ -128,7 +128,7 @@ exactly one server token matches.
 Currently published on ResearchGate as method: [https://www.researchgate.net/publication/399075707_Prime-Compound_Phase-Lane_Token_Protocol_PCPL_for_Symmetric_Continuous_Tokenizer_Devices_Symmetric_continuous_encryption](https://www.researchgate.net/publication/399075707_Prime-Compound_Phase-Lane_Token_Protocol_PCPL_for_Symmetric_Continuous_Tokenizer_Devices_Symmetric_continuous_encryption).
 
 Current version (v1) it's representative for the method but incomplete in possible approaches and explanations. Currently, even this repo has methodology limitations:
-- Not implemented the algorithm device-side for determining exact current destination provider
+- Not implemented the algorithm device-side in python script for determining exact current destination provider
 - Not implemented real time complex primes management to test it without arbitrary values
 - Lack of imagination about possible "prime compounds" (aka real numbers)
 - It still doesn't handle quantum fourier transform difficulty

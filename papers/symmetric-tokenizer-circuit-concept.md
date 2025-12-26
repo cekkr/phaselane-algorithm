@@ -485,6 +485,27 @@ Defense mechanisms:
 Success probability: < 2^-128 for practical attacks
 ```
 
+#### 5.1.4 Quantum period-finding (QFT) considerations
+```
+When a phase-lane overlay (PCPL) is used:
+- Public period = lcm(P,Q,R,x) is QFT-visible
+- Hidden bouquets and permutation key remain secret
+
+Mitigation:
+- Choose large, coprime parameters
+- Mix residues through hashing and device-only chaining
+- Avoid shared factors between x and P/Q/R
+```
+
+#### 5.1.5 Pre-hash linear difficulty (PCPL overlay)
+```
+Objective:
+- Detect low mixing before the final hash/KDF step
+
+Example metric:
+- Rank of exponent vectors (mod 2 and mod 65537) across a window of cycles
+```
+
 ### 5.2 Validation Security Properties
 
 #### 5.2.1 Preventing Malicious Circuit Injection
@@ -617,6 +638,23 @@ struct CircuitLibraryPolicy {
 }
 ```
 
+### 7.4 Seed construction and coprime extraction (PCPL overlay)
+```
+Seed root (device-only):
+Z = H(device_secret || serial || provider_list || boot_nonce)
+
+Derived values:
+perm_key = H(Z || "PERMKEY")
+S0       = H(Z || "SEED")
+Wi       = Trunc(H(Z || "W" || i))
+
+Prime/coprime selection (deterministic stream):
+for k in 0..:
+    candidate = next_prime(H(Z || "PRIME" || k) mod 2^b)
+    accept if gcd(candidate, x) == 1
+    stop after P,Q,R (and M if generated)
+```
+
 ## 8. Protocol Extensions for Dynamic Hashing
 
 ### 8.1 Hash Negotiation Protocol
@@ -675,6 +713,50 @@ function emergency_recovery():
         
         // Verify recovery
         return verify_recovery()
+```
+
+### 8.3 Prime-Compound Phase-Lane overlay (PCPL)
+The symmetric tokenizer circuit can host PCPL as a lane-scheduled overlay. The device computes the lane destination and emits only the active lane token; each provider recomputes only its lane token.
+
+Device-side (private):
+- perm_key, device seed S, all lane bouquets, last tokens W[0..x-1]
+- idx_t = permutation(block, perm_key, phase_block)
+- emit T_idx_t(t), evolve S with all lanes
+
+Provider-side (blinded):
+- public phase (t, P,Q,R), own bouquet only
+- recompute T_i(t) and accept if it matches
+- ignore perm_key, device seed, other lanes
+
+Prime-compound variants:
+- Prime powers and semiprimes are valid bases as long as gcd(base, M) = 1
+- Offset compounds (base + delta) provide continuity across parameter windows
+- Quantized reals map a real parameter into an integer base via scaling
+
+Peer-count variations:
+| x | block length | permutations | chain width |
+|---:|---:|---:|---:|
+| 2 | 2 | 2 | 1 |
+| 3 | 3 | 6 | 2 |
+| 4 | 4 | 24 | 3 |
+
+```mermaid
+%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
+flowchart LR
+  Public["Public clock t, P,Q,R,x"] --> Phase["Phase residues"]
+  Device["Device-only perm_key, S, bouquets"] --> Select["idx_t"]
+  Phase --> Select
+  Select --> Token["Token T_idx_t(t)"]
+  Token --> Provider["Provider i"]
+  Phase --> Provider
+
+  subgraph Exposure["Predictable repeats"]
+    R1["Period lcm(P,Q,R,x)"]
+    R2["Permutation repeats per block"]
+  end
+
+  Phase -.-> Exposure
+  Select -.-> Exposure
 ```
 
 ## 9. Compliance and Standardization
