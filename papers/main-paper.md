@@ -134,6 +134,35 @@ flowchart TD
   Bouquets --> Provision["Provision provider i and device with derived secrets"]
 ```
 
+### 3.2.1 Seeded example flows (real values)
+The demo can be run with small bit sizes so prime-factor detail fits on the page. The examples below use `prime_mode=generated`, `prime_bits=12`, `modulus_bits=16`, `compound_mode=classic`, `compound_primes=3`, `compound_count=4`, and the built-in prime pool; the compound example uses provider 0's BouquetA[0..1]. Each node shows the integer value and its prime-power factorization.
+
+```mermaid
+%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
+flowchart LR
+  Seed1337["seed = 1337<br/>= 7^1 * 191^1"] --> Rng1337["param RNG = derive_seed(seed, 'PARAMS')"]
+  Rng1337 --> P1337["P = 3251<br/>= 3251^1"]
+  Rng1337 --> Q1337["Q = 3169<br/>= 3169^1"]
+  Rng1337 --> R1337["R = 2251<br/>= 2251^1"]
+  Rng1337 --> M1337["M = 41659<br/>= 41659^1"]
+  X1337["x = 4<br/>= 2^2"] --> Period1337["period = lcm(P,Q,R,x) = 92762980676<br/>= 2^2 * 2251^1 * 3169^1 * 3251^1"]
+  P1337 --> Period1337
+  Q1337 --> Period1337
+  R1337 --> Period1337
+```
+
+```mermaid
+%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
+flowchart TD
+  Seed2024["seed = 2024<br/>= 2^3 * 11^1 * 23^1"] --> Rng2024["compound RNG = Random(seed)"]
+  Rng2024 --> Cfg2024["compound_mode=classic<br/>primes_per_compound=3"]
+  Cfg2024 --> Pool2024["prime pool: 3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67"]
+  Pool2024 --> PicksA0["BouquetA[0] picks: 31^1, 47^3, 59^1"]
+  PicksA0 --> C0["C0 = 189892267<br/>= 31^1 * 47^3 * 59^1"]
+  Pool2024 --> PicksA1["BouquetA[1] picks: 23^3, 29^3, 59^2"]
+  PicksA1 --> C1["C1 = 1032955292203<br/>= 23^3 * 29^3 * 59^2"]
+```
+
 ## 4. PCPL protocol overview
 The protocol uses:
 
