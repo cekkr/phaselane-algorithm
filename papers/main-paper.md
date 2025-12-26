@@ -1,4 +1,5 @@
 
+
 <style>
 table, tr {
 	width:100%; 
@@ -461,6 +462,7 @@ flowchart TD
   Tok --> Report["Reports: linear rank, QFT period, compare-x"]
 ```
 
+Providers' blind circuit:
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
 flowchart TD
