@@ -83,6 +83,18 @@ Let:
 
 Each provider $i$ has three secret bouquets: $\mathrm{BouquetA}_i, \mathrm{BouquetB}_i, \mathrm{BouquetC}_i$, each a list of prime compounds.
 
+### 3.0 Symbol and label glossary
+To keep domain separation explicit, hash inputs include fixed ASCII labels:
+
+- **CRT:** Chinese Remainder Theorem clock formed by residues mod $P,Q,R$.
+- **QFT:** Quantum Fourier Transform (period-finding on public schedule).
+- **"PHASE":** label used in $\Phi_t = H(\cdot \| \text{"PHASE"})$.
+- **"EXP":** label used in exponent derivation $e_j = H(\cdot \| \text{"EXP"})$.
+- **"KDF":** key-derivation label for $K_i(t)$.
+- **"TOK":** token-derivation label for $T_i(t)$.
+- **"EVOLVE":** seed-evolution label for $S_{t+1}$.
+- **"PERM"/"PERMSEED":** permutation-schedule labels (hash-shuffle seed).
+
 ### 3.1 Seed construction and coprime extraction
 The device bootstraps a root seed $Z$ from device-local entropy and context (for example: device secret, serial, provider list, and a boot nonce). In the demo, $Z$ is produced by a deterministic RNG seeded with `--seed`, then bound to labels with $H(\cdot)$:
 
