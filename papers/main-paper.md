@@ -9,6 +9,8 @@ table, tr {
 
 # Prime-Compound Phase-Lane Token Protocol (PCPL) for Symmetric Continuous Tokenizer Devices
 
+Version 1.1 - 26 December 2025
+
 ## Abstract
 I present the Prime-Compound Phase-Lane Token Protocol (PCPL), a no-handshake token system where a device emits one token per cycle and exactly one provider can validate it. PCPL combines (1) a public phase clock derived from coprime residues, (2) hidden prime-compound bouquets per provider, and (3) device-only state evolution that chains all lanes. I also introduce the symmetric continuous tokenizer device model, motivated by FPGA-based dynamic hash circuits and twin circuits for peer validation. A step-by-step algorithm description, correctness properties, and a deterministic simulation trace are provided.
 
@@ -95,6 +97,29 @@ To extrapolate coprimes for $P,Q,R$ (and optionally $M$), derive candidates from
 2. accept $c_k$ if $\gcd(c_k, x)=1$ and $c_k \notin \{P,Q,R,M\}$
 3. continue until $P,Q,R$ (and $M$ if generated) are assigned
 
+### 3.2 Best-practice coprimes, compounds, and key selection
+Parameter and key selection should scale with the peer count and keep strict domain separation between device-only and provider-only secrets.
+
+```mermaid
+%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
+flowchart TD
+  Start["Choose peer count x"] --> Scale["Set security horizon and target period size"]
+  Scale --> Adjust["If x grows: raise prime bits, bouquet size, primes per compound"]
+  Adjust --> Bits["Select bit sizes for P/Q/R (and M if generated)"]
+  Bits --> Gen["Generate candidates from seeded stream"]
+  Gen --> Coprime["Accept only if gcd(candidate, x)=1 and pairwise coprime"]
+  Coprime --> Assign["Assign P, Q, R (and M)"]
+  Assign --> Pool["Build prime pool for compounds"]
+  Pool --> Mode["Choose compound mode per provider"]
+  Mode --> Comp["Compound = product of >= 2 primes (or prime-power/offset)"]
+  Comp --> Check["Reject bases divisible by M"]
+  Check --> Bouquets["Generate BouquetA/B/C per provider i"]
+  SeedRoot["Root seed Z from device secret + nonce + provider list"] --> Keys["perm_key, S0, W[i] (device-only)"]
+  SeedRoot --> ProvSeed["Provider seed = H(Z || provider_id || 'PROVIDER')"]
+  ProvSeed --> Bouquets
+  Bouquets --> Provision["Provision provider i and device with derived secrets"]
+```
+
 ## 4. PCPL protocol overview
 The protocol uses:
 
@@ -105,13 +130,29 @@ The protocol uses:
 
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
-flowchart TD
-  A["Cycle t"] --> B["Phase clock: a_t, b_t, c_t, u_1, u_2, u_3"]
-  B --> C["Permutation for block B"]
-  C --> D["Select lane index idx_t"]
-  D --> E["Compute token T_{idx_t}(t)"]
-  E --> F["Send token to provider idx_t"]
-  E --> G["Evolve device seed S using all W lanes"]
+flowchart LR
+  Public["Public clock t, P,Q,R,M, x"] --> Phase["Phase residues + Phi_t"]
+
+  subgraph Device["User device circuit"]
+    D0["perm_key + all bouquets + S_t + W[ ]"]
+    D1["Block B and permutation pi_B"]
+    D2["idx_t = pi_B[s]"]
+    D3["Compute token T_idx_t(t)"]
+    D4["Update W[idx_t] and evolve S_{t+1}"]
+  end
+
+  subgraph Provider["Blind provider circuit"]
+    P0["Provider i bouquet only"]
+    P1["Recompute T_i(t)"]
+    P2["Accept if match"]
+  end
+
+  Phase --> D1
+  D0 --> D1
+  D1 --> D2 --> D3 --> D4
+  D3 -- "send token" --> P1
+  Phase --> P1
+  P0 --> P1 --> P2
 ```
 
 ## 5. Step-by-step algorithm
