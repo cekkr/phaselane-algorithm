@@ -136,14 +136,19 @@ active lane per cycle and emits exactly one token.
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
 flowchart TD
+  Cfg["Config: x, seed, prime/compound modes"] --> Primes["Derive P/Q/R (and M if generated)"]
+  Primes --> Bouquets["Generate provider bouquets"]
+  Bouquets --> Init["Init device state: perm_key, S0, W[ ]"]
+  Init --> Loop["Device cycle t"]
   Public["Public clock t, P,Q,R,M, x"] --> Phase["Phase residues + Phi_t"]
-  Secrets["Device-only: perm_key, S_t, all bouquets, W[ ]"] --> Perm["Permutation pi_B for block B"]
-  Phase --> Perm
+  Loop --> Phase
+  Phase --> Perm["Permutation pi_B for block B"]
   Perm --> Pick["idx_t = pi_B[s]"]
   Pick --> Tok["Compute token T_idx_t(t)"]
   Tok --> Send["Send token to provider idx_t"]
   Tok --> Evolve["Update W[idx_t], evolve S_{t+1}"]
-  Evolve --> Next["Advance to t+1"]
+  Evolve --> Loop
+  Tok --> Report["Reports: linear rank, QFT period, compare-x"]
 ```
 
 ### 4.2 Blind provider circuit (validator)
@@ -446,32 +451,6 @@ Generated primes (x=4, 64 cycles, 12-bit compound primes):
 | 2024 | semiprime | 1423693267 | 1141001293 | 1348017509 | 2083707438551447381 | 93 | 8759071917926854366514362316 |
 
 Full multi-configuration outputs (additional compound modes and seeds) are in `papers/pcpl-results.md`.
-
-```mermaid
-%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
-flowchart TD
-  Cfg["Config: x, seed, prime/compound modes"] --> Primes["Derive P/Q/R (and M if generated)"]
-  Primes --> Bouquets["Generate provider bouquets"]
-  Bouquets --> Init["Init device state: perm_key, S0, W[ ]"]
-  Init --> Loop["Device cycle t"]
-  Loop --> Phase["Phase clock: a_t,b_t,c_t,u1,u2,u3"]
-  Phase --> Dest["idx_t from pi_B[s]"]
-  Dest --> Tok["Emit T_idx_t(t)"]
-  Tok --> Evolve["Update W[idx_t], evolve S_{t+1}"]
-  Evolve --> Loop
-  Tok --> Report["Reports: linear rank, QFT period, compare-x"]
-```
-
-Providers' blind circuit:
-```mermaid
-%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
-flowchart TD
-  Public["Public clock t, P,Q,R,M, x"] --> Phase["Phase clock: a_t,b_t,c_t,u1,u2,u3"]
-  Phase --> ProvTok["Provider i recompute T_i(t)"]
-  Bouquet["Provider i bouquets only"] --> ProvTok
-  ProvTok --> Accept["Accept if token matches"]
-  Accept --> Window["Window checks / replay rules (if used)"]
-```
 
 ## 9. Discussion and limitations
 - Parameter choice matters; $P, Q, R, M$ must be prime and pairwise coprime.
