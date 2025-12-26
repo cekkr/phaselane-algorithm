@@ -198,7 +198,7 @@ S_t \| W_0 \| \cdots \| W_{x-1} \| m_0 \| \cdots \| m_{x-2} \| \Phi_t \| \text{"
 $$
 
 ### 5.6 Provider verification
-Provider $i$ recomputes $T_i(t)$ and accepts the token iff it matches.
+Provider $i$ recomputes $T_i(t)$ and accepts the token  it matches.
 
 ## 6. Correctness and periodicity
 
@@ -217,7 +217,7 @@ With $M$ prime, the multiplicative group $\mathbb{F}_M^{\ast}$ has order $M-1$. 
 - **Device chaining:** even stale lanes influence future state, reinforcing the requirement that “every token matters”.
 
 ## 8. Experimental validation (deterministic simulation)
-We implemented a cycle-by-cycle simulator to validate correctness. The demo verifies:
+A simulator was implemented a cycle-by-cycle to validate correctness. The demo verifies:
 
 - Each block yields a valid permutation.
 - Exactly one provider matches each cycle.
