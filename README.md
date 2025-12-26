@@ -9,6 +9,8 @@ cycle-by-cycle demo implementation to validate correctness.
 ## Documents
 - `papers/phase-shift-tokens.md`: complete PCPL spec and pseudocode.
 - `papers/symmetric-tokenizer-circuit-concept.md`: broader concept notes.
+- `papers/main-paper.md`: paper-style writeup with Mermaid figures.
+- `papers/pcpl-results.md`: multi-configuration validation results.
 
 ## Goals and threat model (short)
 PCPL targets a minimal, low-interaction setting:
@@ -92,6 +94,30 @@ Notes:
 - The demo uses blake2b with length-prefixed encoding to avoid ambiguous
   concatenation.
 - Tokens are truncated to the requested bit length; defaults are for validation.
+
+## Peer-count snapshot (x=2..5)
+Fixed primes (near 1e6) with a 64-cycle linear window:
+
+| x | chain width (x-1) | QFT period bits |
+|---:|---:|---:|
+| 2 | 1 | 61 |
+| 3 | 2 | 62 |
+| 4 | 3 | 62 |
+| 5 | 4 | 63 |
+
+Full tables and generated-prime/compound-mode runs are in `papers/pcpl-results.md`.
+
+```mermaid
+%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
+flowchart LR
+  Cfg["Config: x, seed, prime/compound modes"] --> Primes["Derive P/Q/R (coprime)"]
+  Primes --> Phase["Phase clock"]
+  Phase --> Perm["Permutation schedule"]
+  Perm --> Emit["Emit T_idx(t)"]
+  Emit --> Verify["Provider i recompute"]
+  Verify --> Evolve["Device seed evolves"]
+  Verify --> Metrics["Reports: 1-of-x, linear rank, QFT period"]
+```
 
 ## Validation results (sample runs)
 Exact outputs from sample validation runs:

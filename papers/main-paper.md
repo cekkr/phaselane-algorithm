@@ -348,7 +348,7 @@ The demo can emit a linear pre-hash difficulty report (rank of exponent vectors 
 
 - `python3 demo/pcpl_cycle_test.py --linear-report --analysis-window 64`
 - `python3 demo/pcpl_cycle_test.py --qft-report`
-- `python3 demo/pcpl_cycle_test.py --compare-x 2,3,4,5,7,8,9,11,16`
+- `python3 demo/pcpl_cycle_test.py --compare-x 2,3,4,5`
 - `python3 demo/pcpl_cycle_test.py --prime-mode generated --prime-bits 31 --compound-mode blend --compound-prime-bits 12`
 
 ### 8.4 Multi-configuration results snapshot
@@ -362,22 +362,17 @@ Fixed primes (P/Q/R near 1e6, seed=1337) with compare-x and 64-cycle linear wind
 | 3 | 2 | 62 | 3000219004293010989 |
 | 4 | 3 | 62 | 4000292005724014652 |
 | 5 | 4 | 63 | 5000365007155018315 |
-| 7 | 6 | 63 | 7000511010017025641 |
-| 8 | 7 | 63 | 8000584011448029304 |
-| 9 | 8 | 63 | 9000657012879032967 |
-| 11 | 10 | 64 | 11000803015741040293 |
-| 16 | 15 | 64 | 16001168022896058608 |
 
 Across all x above, the pre-hash exponent vectors reached full rank (4/4) modulo 2 and 65537, with 64/64 unique rows for A/B/C over the sample window.
 
-Generated primes (x=4, 64 cycles, compound mode blend, 12-bit compound primes):
+Generated primes (x=4, 64 cycles, 12-bit compound primes):
 
-| seed | P | Q | R | M | QFT period bits | QFT period (decimal) |
-|---:|---:|---:|---:|---:|---:|---|
-| 1337 | 2096669299 | 1747608157 | 1866608729 | 1273159183829412833 | 95 | 27358185054648849675767961788 |
-| 2024 | 1423693267 | 1141001293 | 1348017509 | 2083707438551447381 | 93 | 8759071917926854366514362316 |
-| 4242 | 1492027703 | 1497078911 | 1415283803 | 1408207852224782437 | 94 | 12645182665728960170139598796 |
-| 9001 | 1472641301 | 1773408209 | 1301135711 | 1671108227926378139 | 94 | 13592153759865553508995561196 |
+| seed | compound mode | P | Q | R | M | QFT period bits | QFT period (decimal) |
+|---:|---|---:|---:|---:|---:|---:|---|
+| 1337 | blend | 2096669299 | 1747608157 | 1866608729 | 1273159183829412833 | 95 | 27358185054648849675767961788 |
+| 2024 | semiprime | 1423693267 | 1141001293 | 1348017509 | 2083707438551447381 | 93 | 8759071917926854366514362316 |
+
+Full multi-configuration outputs (additional compound modes and seeds) are in `papers/pcpl-results.md`.
 
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%

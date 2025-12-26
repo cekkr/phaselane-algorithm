@@ -2,7 +2,7 @@ Project summary:
 - Prime-Compound Phase-Lane Token Protocol (PCPL) design and validation docs.
 - Main spec and pseudocode live in `papers/phase-shift-tokens.md`.
 - Broader background notes in `papers/symmetric-tokenizer-circuit-concept.md`.
-- Paper-style writeup with LaTeX and Mermaid in `papers/scientific-paper.md`.
+- Paper-style writeup with Mermaid in `papers/main-paper.md`.
 
 Code and tooling:
 - `demo/pcpl_cycle_test.py`: cycle-by-cycle PCPL simulation and validation.
@@ -12,6 +12,7 @@ Code and tooling:
   - Validates: permutation is a true per-block schedule, exactly 1-of-x match per cycle, and each provider once per full block; optional chaining divergence check.
 - `demo/export_token_trace.py`: exports deterministic token trace tables to Markdown.
   - Default output: `papers/token-trace.md` (A4-friendly, per-lane tables).
+  - Multi-configuration results: `papers/pcpl-results.md`.
 
 How to run:
 - `python3 demo/pcpl_cycle_test.py --cycles 200`
