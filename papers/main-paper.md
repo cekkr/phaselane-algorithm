@@ -1,6 +1,3 @@
-
-
-
 <style>
 table, tr {
 	width:100%; 
