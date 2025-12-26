@@ -132,6 +132,7 @@ Current version (v1) it's representative for the method but incomplete in possib
 - Not implemented real time complex primes management to test it without arbitrary values
 - Lack of imagination about possible "prime compounds" (aka real numbers)
 - It still doesn't handle quantum fourier transform difficulty
+- Well, honestly current test env lacks totally of linear difficulty evaluation (pre-hash)
 
 ## Next steps (suggested)
 - Add property tests for larger x and longer runs.
