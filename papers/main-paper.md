@@ -150,6 +150,27 @@ Each provider only knows its own bouquets. It recomputes $T_i(t)$ every cycle,
 but the received token matches only once per block of $x$ cycles. The other
 $x-1$ cycles are expected mismatches because the device emitted a different lane.
 
+**Why only 1-of-$x$ is correct:** the provider computes the *same* lane token
+formula as the device, but with a fixed lane index $i$. The device emits
+$T_{\mathrm{idx}_t}(t)$ where $\mathrm{idx}_t = \pi_B[s]$ is hidden by
+$\mathrm{perm\_key}$. Therefore the provider is correct iff $i = \mathrm{idx}_t$.
+Because $\pi_B$ is a permutation, this happens exactly once per block of $x$
+cycles. The device is “always right” because it emits the scheduled lane token;
+the provider is “blind” because it does not know $\mathrm{perm\_key}$ and cannot
+predict which cycle is its match.
+
+Provider-side token generation (every cycle):
+
+$$
+\begin{aligned}
+EA_i(t) &= \mathrm{Eval}(\mathrm{BouquetA}_i, a_t, u_1), \\
+EB_i(t) &= \mathrm{Eval}(\mathrm{BouquetB}_i, b_t, u_2), \\
+EC_i(t) &= \mathrm{Eval}(\mathrm{BouquetC}_i, c_t, u_3), \\
+K_i(t) &= H(EA_i \| EB_i \| EC_i \| \Phi_t \| \text{"KDF"}), \\
+T_i(t) &= \mathrm{Trunc}_k\!\left(H(K_i \| t \| \Phi_t \| \text{"TOK"})\right).
+\end{aligned}
+$$
+
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
 flowchart TD
