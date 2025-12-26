@@ -1,5 +1,6 @@
 
 
+
 <style>
 table, tr {
 	width:100%; 
@@ -445,10 +446,17 @@ Across all x above, the pre-hash exponent vectors reached full rank (4/4) modulo
 
 Generated primes (x=4, 64 cycles, 12-bit compound primes):
 
-| seed | compound mode | P | Q | R | M | QFT period bits | QFT period (decimal) |
-|---:|---|---:|---:|---:|---:|---:|---|
-| 1337 | blend | 2096669299 | 1747608157 | 1866608729 | 1273159183829412833 | 95 | 27358185054648849675767961788 |
-| 2024 | semiprime | 1423693267 | 1141001293 | 1348017509 | 2083707438551447381 | 93 | 8759071917926854366514362316 |
+```mermaid
+flowchart TB
+  classDef root fill:#f5f5f5,stroke:#333,stroke-width:1px,font-weight:bold,rx:8,ry:8;
+  classDef row  fill:#ffffff,stroke:#666,stroke-width:1px,rx:10,ry:10;
+
+  T["QFT period table"]:::root
+
+  T --> A["seed: 1337<br/>compound mode: blend<br/>P: 2096669299<br/>Q: 1747608157<br/>R: 1866608729<br/>M: 1273159183829412833<br/>QFT period bits: 95<br/>QFT period (decimal):<br/>27358185054648849675767961788"]:::row
+
+  T --> B["seed: 2024<br/>compound mode: semiprime<br/>P: 1423693267<br/>Q: 1141001293<br/>R: 1348017509<br/>M: 2083707438551447381<br/>QFT period bits: 93<br/>QFT period (decimal):<br/>8759071917926854366514362316"]:::row
+```
 
 Full multi-configuration outputs (additional compound modes and seeds) are in `papers/pcpl-results.md`.
 
