@@ -471,7 +471,7 @@ Fixed primes (P/Q/R near 1e6, seed=1337) with compare-x and 64-cycle linear wind
 
 Across all x above, the pre-hash exponent vectors reached full rank (4/4) modulo 2 and 65537, with 64/64 unique rows for A/B/C over the sample window.
 
-For $x=6$ (composite $2 \\cdot 3$), the schedule still yields exactly one match
+For $x=6$ (composite $2 \cdot 3$), the schedule still yields exactly one match
 per cycle, but the duty cycle per provider is $1/6$ and the permutation space
 grows to $6! = 720$. Ensure $P,Q,R$ are coprime with both 2 and 3 to keep the
 public period large.
