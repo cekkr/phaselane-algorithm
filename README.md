@@ -133,6 +133,7 @@ Current version (v1) it's representative for the method but incomplete in possib
 - Lack of imagination about possible "prime compounds" (aka real numbers)
 - It still doesn't handle quantum fourier transform difficulty
 - Well, honestly current test env lacks totally of linear difficulty evaluation (pre-hash)
+- Demonstrate clearly how algorithm (approach) changes with different number of peers (even prime^exponent ones)
 
 ## Next steps (suggested)
 - Add property tests for larger x and longer runs.
