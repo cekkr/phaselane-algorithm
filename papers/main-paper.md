@@ -418,18 +418,26 @@ Full multi-configuration outputs (additional compound modes and seeds) are in `p
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
 flowchart TD
-  Cfg["Config: x, seed, prime mode, compound mode"] --> Primes["Derive P/Q/R (and M if generated)"]
+  Cfg["Config: x, seed, prime/compound modes"] --> Primes["Derive P/Q/R (and M if generated)"]
   Primes --> Bouquets["Generate provider bouquets"]
   Bouquets --> Init["Init device state: perm_key, S0, W[ ]"]
-  Init --> Loop["For each cycle t"]
+  Init --> Loop["Device cycle t"]
   Loop --> Phase["Phase clock: a_t,b_t,c_t,u1,u2,u3"]
-  Phase --> Dest["Device destination idx_t"]
-  Dest --> Tok["Compute T_idx_t(t)"]
-  Tok --> Prov["Provider i recompute T_i(t)"]
-  Prov --> Checks["Check: permutation + 1-of-x + chaining"]
-  Checks --> Evolve["Evolve S with W and products"]
+  Phase --> Dest["idx_t from pi_B[s]"]
+  Dest --> Tok["Emit T_idx_t(t)"]
+  Tok --> Evolve["Update W[idx_t], evolve S_{t+1}"]
   Evolve --> Loop
-  Checks --> Report["Reports: linear rank, QFT period, compare-x"]
+  Tok --> Report["Reports: linear rank, QFT period, compare-x"]
+```
+
+```mermaid
+%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
+flowchart TD
+  Public["Public clock t, P,Q,R,M, x"] --> Phase["Phase clock: a_t,b_t,c_t,u1,u2,u3"]
+  Phase --> ProvTok["Provider i recompute T_i(t)"]
+  Bouquet["Provider i bouquets only"] --> ProvTok
+  ProvTok --> Accept["Accept if token matches"]
+  Accept --> Window["Window checks / replay rules (if used)"]
 ```
 
 ## 9. Discussion and limitations
