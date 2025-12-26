@@ -128,31 +128,41 @@ The protocol uses:
 3. Hidden bouquets to derive lane-specific tokens.
 4. Device-only seed evolution that chains all lanes.
 
+### 4.1 User device circuit (emitter)
+The device knows the full schedule and all lane secrets, so it computes only the
+active lane per cycle and emits exactly one token.
+
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
-flowchart LR
+flowchart TD
   Public["Public clock t, P,Q,R,M, x"] --> Phase["Phase residues + Phi_t"]
+  Secrets["Device-only: perm_key, S_t, all bouquets, W[ ]"] --> Perm["Permutation pi_B for block B"]
+  Phase --> Perm
+  Perm --> Pick["idx_t = pi_B[s]"]
+  Pick --> Tok["Compute token T_idx_t(t)"]
+  Tok --> Send["Send token to provider idx_t"]
+  Tok --> Evolve["Update W[idx_t], evolve S_{t+1}"]
+  Evolve --> Next["Advance to t+1"]
+```
 
-  subgraph Device["User device circuit"]
-    D0["perm_key + all bouquets + S_t + W[ ]"]
-    D1["Block B and permutation pi_B"]
-    D2["idx_t = pi_B[s]"]
-    D3["Compute token T_idx_t(t)"]
-    D4["Update W[idx_t] and evolve S_{t+1}"]
-  end
+### 4.2 Blind provider circuit (validator)
+Each provider only knows its own bouquets. It recomputes $T_i(t)$ every cycle,
+but the received token matches only once per block of $x$ cycles. The other
+$x-1$ cycles are expected mismatches because the device emitted a different lane.
 
-  subgraph Provider["Blind provider circuit"]
-    P0["Provider i bouquet only"]
-    P1["Recompute T_i(t)"]
-    P2["Accept if match"]
-  end
-
-  Phase --> D1
-  D0 --> D1
-  D1 --> D2 --> D3 --> D4
-  D3 -- "send token" --> P1
-  Phase --> P1
-  P0 --> P1 --> P2
+```mermaid
+%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
+flowchart TD
+  Public["Public clock t, P,Q,R,M, x"] --> Phase["Phase residues + Phi_t"]
+  Bouquets["Provider i bouquets only"] --> Expect["Compute expected T_i(t)"]
+  Phase --> Expect
+  Rx["Received token from device (or none)"] --> Compare["Compare expected vs received"]
+  Expect --> Compare
+  Compare --> Match{"Match?"}
+  Match -->|yes| Accept["Accept token (1 per block)"]
+  Match -->|no| Reject["Reject / ignore (x-1 cycles)"]
+  Accept --> Next["Advance to t+1"]
+  Reject --> Next
 ```
 
 ## 5. Step-by-step algorithm
