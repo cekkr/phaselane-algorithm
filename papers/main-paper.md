@@ -387,10 +387,10 @@ Changing $x$ changes the block size, the number of permutations, and the chain w
 | 2 | 2 | 2 | 1 | twin pairing (2 lanes) |
 | 3 | 3 | 6 | 2 | prime lane count |
 | 4 | 4 | 24 | 3 | $2^2$ prime power |
-| 6 | 6 | 720 | 5 | composite ($2 \\cdot 3$) |
+| 6 | 6 | 720 | 5 | composite ($2 \cdot 3$) |
 
 In general: block length $= x$, permutation space $= x!$, chain width $= x-1$,
-and schedule period $= \mathrm{lcm}(P,Q,R,x)$. For composite $x$ (e.g., $6=2\\cdot 3$),
+and schedule period $= \mathrm{lcm}(P,Q,R,x)$. For composite $x$ (e.g., $6=2\cdot 3$),
 choose $P,Q,R$ coprime with all prime factors of $x$ to avoid shrinking the period.
 
 ## 7. Security intuition (informal)
