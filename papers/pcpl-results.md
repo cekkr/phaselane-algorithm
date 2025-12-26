@@ -7,7 +7,7 @@ across multiple configurations. It is meant to be a compact companion to
 ## Peer-count sweep (fixed primes, seed=1337)
 
 Command:
-`python3 demo/pcpl_cycle_test.py --compare-x 2,3,4,5 --linear-report --analysis-window 64 --qft-report`
+`python3 demo/pcpl_cycle_test.py --compare-x 2,3,4,5,6 --linear-report --analysis-window 64 --qft-report`
 
 | x | chain width (x-1) | QFT period bits | QFT period (decimal) |
 |---:|---:|---:|---|
@@ -15,6 +15,7 @@ Command:
 | 3 | 2 | 62 | 3000219004293010989 |
 | 4 | 3 | 62 | 4000292005724014652 |
 | 5 | 4 | 63 | 5000365007155018315 |
+| 6 | 5 | 63 | 6000438008586021978 |
 
 Linear pre-hash metrics (all x above, 64-cycle window):
 - A/B/C: unique=64/64, rank_mod2=4/4, rank_mod65537=4/4

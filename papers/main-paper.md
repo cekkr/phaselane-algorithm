@@ -272,14 +272,20 @@ EC_i(t) &= \mathrm{Eval}(\mathrm{BouquetC}_i, c_t, u_3).
 $$
 
 ### 5.3.1 Prime-compound construction variants
-Compounds do not need to be prime: any base coprime with $M$ is valid. This allows richer “prime compounds” that keep continuity while increasing algebraic complexity:
+Compounds do not need to be prime: any base coprime with $M$ is valid. Here,
+“prime compound” means a composite base built from two or more primes (a
+compound prime). This expands the base space and lets you tune complexity by
+increasing the number of factors and exponents, while preserving continuity.
+The only hard requirement is $\gcd(C, M)=1$ (no factor of $M$).
 
+- **Multi-prime compounds:** $C = \prod_{i=1}^{r} p_i^{e_i}$ with $r \ge 2$ (the general case).
 - **Prime powers:** $C = p^k$ (smooth but non-prime bases).
-- **Semiprimes:** $C = p q$ (harder to factor, still structured).
+- **Semiprimes:** $C = p q$ (a 2-prime special case).
 - **Offset compounds:** $C = \left(\prod p_i^{e_i}\right) + \delta$ with small $\delta$ to create a quasi-continuous family.
 - **Quantized reals:** map a real parameter $\rho$ to $C = \lfloor \alpha \rho \rfloor$ for fixed scale $\alpha$, then ensure $\gcd(C, M)=1$.
 
-The demo exposes these families via compound generation modes while keeping the exponent schedule unchanged.
+The demo exposes these families via compound generation modes while keeping the
+exponent schedule unchanged.
 
 ### 5.4 Token derivation
 Key derivation:
@@ -356,7 +362,7 @@ If $P, Q, R$ are coprime, the tuple $(a_t, b_t, c_t)$ repeats after $PQR$. If $P
 ### 6.3 Modular exponent correctness
 With $M$ prime, the multiplicative group $\mathbb{F}_M^{\ast}$ has order $M-1$. Reducing exponents modulo $M-1$ makes $C_j^{e_j} \bmod M$ well-defined for any base $C_j$ not divisible by $M$.
 
-### 6.4 Peer-count variations (x=2,3,4 and prime powers)
+### 6.4 Peer-count variations (x=2,3,4 and composite counts)
 Changing $x$ changes the block size, the number of permutations, and the chain width:
 
 | x | block length | permutations | chain products | note |
@@ -364,8 +370,11 @@ Changing $x$ changes the block size, the number of permutations, and the chain w
 | 2 | 2 | 2 | 1 | twin pairing (2 lanes) |
 | 3 | 3 | 6 | 2 | prime lane count |
 | 4 | 4 | 24 | 3 | $2^2$ prime power |
+| 6 | 6 | 720 | 5 | composite ($2 \\cdot 3$) |
 
-In general: block length $= x$, permutation space $= x!$, chain width $= x-1$, and schedule period $= \mathrm{lcm}(P,Q,R,x)$. For $x=p^k$, choose $P,Q,R$ coprime with $p$ to avoid shrinking the period.
+In general: block length $= x$, permutation space $= x!$, chain width $= x-1$,
+and schedule period $= \mathrm{lcm}(P,Q,R,x)$. For composite $x$ (e.g., $6=2\\cdot 3$),
+choose $P,Q,R$ coprime with all prime factors of $x$ to avoid shrinking the period.
 
 ## 7. Security intuition (informal)
 - **Lane isolation:** each provider uses distinct secret bouquets, so observing one lane does not reveal others.
@@ -427,7 +436,7 @@ The demo can emit a linear pre-hash difficulty report (rank of exponent vectors 
 
 - `python3 demo/pcpl_cycle_test.py --linear-report --analysis-window 64`
 - `python3 demo/pcpl_cycle_test.py --qft-report`
-- `python3 demo/pcpl_cycle_test.py --compare-x 2,3,4,5`
+- `python3 demo/pcpl_cycle_test.py --compare-x 2,3,4,5,6`
 - `python3 demo/pcpl_cycle_test.py --prime-mode generated --prime-bits 31 --compound-mode blend --compound-prime-bits 12`
 
 ### 8.4 Multi-configuration results snapshot
@@ -441,8 +450,14 @@ Fixed primes (P/Q/R near 1e6, seed=1337) with compare-x and 64-cycle linear wind
 | 3 | 2 | 62 | 3000219004293010989 |
 | 4 | 3 | 62 | 4000292005724014652 |
 | 5 | 4 | 63 | 5000365007155018315 |
+| 6 | 5 | 63 | 6000438008586021978 |
 
 Across all x above, the pre-hash exponent vectors reached full rank (4/4) modulo 2 and 65537, with 64/64 unique rows for A/B/C over the sample window.
+
+For $x=6$ (composite $2 \\cdot 3$), the schedule still yields exactly one match
+per cycle, but the duty cycle per provider is $1/6$ and the permutation space
+grows to $6! = 720$. Ensure $P,Q,R$ are coprime with both 2 and 3 to keep the
+public period large.
 
 Generated primes (x=4, 64 cycles, 12-bit compound primes):
 
