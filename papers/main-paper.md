@@ -348,8 +348,53 @@ The demo can emit a linear pre-hash difficulty report (rank of exponent vectors 
 
 - `python3 demo/pcpl_cycle_test.py --linear-report --analysis-window 64`
 - `python3 demo/pcpl_cycle_test.py --qft-report`
-- `python3 demo/pcpl_cycle_test.py --compare-x 2,3,4,8,9`
+- `python3 demo/pcpl_cycle_test.py --compare-x 2,3,4,5,7,8,9,11,16`
 - `python3 demo/pcpl_cycle_test.py --prime-mode generated --prime-bits 31 --compound-mode blend --compound-prime-bits 12`
+
+### 8.4 Multi-configuration results snapshot
+All runs below completed the full correctness checks (permutation, 1-of-x matching, chaining).
+
+Fixed primes (P/Q/R near 1e6, seed=1337) with compare-x and 64-cycle linear window:
+
+| x | chain width (x-1) | QFT period bits | QFT period (decimal) |
+|---:|---:|---:|---|
+| 2 | 1 | 61 | 2000146002862007326 |
+| 3 | 2 | 62 | 3000219004293010989 |
+| 4 | 3 | 62 | 4000292005724014652 |
+| 5 | 4 | 63 | 5000365007155018315 |
+| 7 | 6 | 63 | 7000511010017025641 |
+| 8 | 7 | 63 | 8000584011448029304 |
+| 9 | 8 | 63 | 9000657012879032967 |
+| 11 | 10 | 64 | 11000803015741040293 |
+| 16 | 15 | 64 | 16001168022896058608 |
+
+Across all x above, the pre-hash exponent vectors reached full rank (4/4) modulo 2 and 65537, with 64/64 unique rows for A/B/C over the sample window.
+
+Generated primes (x=4, 64 cycles, compound mode blend, 12-bit compound primes):
+
+| seed | P | Q | R | M | QFT period bits | QFT period (decimal) |
+|---:|---:|---:|---:|---:|---:|---|
+| 1337 | 2096669299 | 1747608157 | 1866608729 | 1273159183829412833 | 95 | 27358185054648849675767961788 |
+| 2024 | 1423693267 | 1141001293 | 1348017509 | 2083707438551447381 | 93 | 8759071917926854366514362316 |
+| 4242 | 1492027703 | 1497078911 | 1415283803 | 1408207852224782437 | 94 | 12645182665728960170139598796 |
+| 9001 | 1472641301 | 1773408209 | 1301135711 | 1671108227926378139 | 94 | 13592153759865553508995561196 |
+
+```mermaid
+%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
+flowchart TD
+  Cfg["Config: x, seed, prime mode, compound mode"] --> Primes["Derive P/Q/R (and M if generated)"]
+  Primes --> Bouquets["Generate provider bouquets"]
+  Bouquets --> Init["Init device state: perm_key, S0, W[ ]"]
+  Init --> Loop["For each cycle t"]
+  Loop --> Phase["Phase clock: a_t,b_t,c_t,u1,u2,u3"]
+  Phase --> Dest["Device destination idx_t"]
+  Dest --> Tok["Compute T_idx_t(t)"]
+  Tok --> Prov["Provider i recompute T_i(t)"]
+  Prov --> Checks["Check: permutation + 1-of-x + chaining"]
+  Checks --> Evolve["Evolve S with W and products"]
+  Evolve --> Loop
+  Checks --> Report["Reports: linear rank, QFT period, compare-x"]
+```
 
 ## 9. Discussion and limitations
 - Parameter choice matters; $P, Q, R, M$ must be prime and pairwise coprime.
