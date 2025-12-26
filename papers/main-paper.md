@@ -273,7 +273,10 @@ Compounds do not need to be prime: any base coprime with $M$ is valid. Here,
 “prime compound” means a composite base built from two or more primes (a
 compound prime). This expands the base space and lets you tune complexity by
 increasing the number of factors and exponents, while preserving continuity.
-The only hard requirement is $\gcd(C, M)=1$ (no factor of $M$).
+The only hard requirement is $\gcd(C, M)=1$ (no factor of $M$). This coprimality
+is **with respect to the modulus $M$**, not with respect to $P,Q,R$ or $x$:
+compounds may share factors with each other, but they must not share factors
+with $M$ to stay in $\mathbb{F}_M^{\ast}$.
 
 - **Multi-prime compounds:** $C = \prod_{i=1}^{r} p_i^{e_i}$ with $r \ge 2$ (the general case).
 - **Prime powers:** $C = p^k$ (smooth but non-prime bases).
@@ -282,7 +285,8 @@ The only hard requirement is $\gcd(C, M)=1$ (no factor of $M$).
 - **Quantized reals:** map a real parameter $\rho$ to $C = \lfloor \alpha \rho \rfloor$ for fixed scale $\alpha$, then ensure $\gcd(C, M)=1$.
 
 The demo exposes these families via compound generation modes while keeping the
-exponent schedule unchanged.
+exponent schedule unchanged; the “blend” mode just mixes these families and does
+not change the phase periodicity, which is driven solely by $P,Q,R$ and $x$.
 
 ### 5.4 Token derivation
 Key derivation:
@@ -354,10 +358,26 @@ flowchart LR
 Within each block of length $x$, $\pi_B$ is a permutation. Therefore each provider index appears exactly once per block, and exactly one provider matches per cycle.
 
 ### 6.2 Phase periodicity
-If $P, Q, R$ are coprime, the tuple $(a_t, b_t, c_t)$ repeats after $PQR$. If $P, Q, R$ are also coprime with $x$, the deterministic schedule repeats after $PQRx$.
+The phase clock is three modular counters: $a_t = (a_0 + t) \bmod P$ and likewise
+for $b_t$ and $c_t$. The joint state repeats after the least common multiple of
+their moduli, so the period is $\mathrm{lcm}(P,Q,R)$. When $P,Q,R$ are pairwise
+coprime (i.e., $\gcd(P,Q)=\gcd(P,R)=\gcd(Q,R)=1$), the lcm is $PQR$.
+
+The *schedule* also depends on the block index $B=\lfloor t/x \rfloor$ and the
+slot $s = t \bmod x$, so the combined public schedule repeats after
+$\mathrm{lcm}(P,Q,R,x)$. If $x$ is coprime to each of $P,Q,R$ (i.e.,
+$\gcd(P,x)=\gcd(Q,x)=\gcd(R,x)=1$), then the schedule period is exactly $PQRx$.
+If $x$ shares a factor with any of $P,Q,R$, the combined period is smaller. This
+periodicity is purely about the public clock; the choice of compound bases (even
+“blend” composites) does not change it, as long as those bases remain coprime
+with $M$.
 
 ### 6.3 Modular exponent correctness
-With $M$ prime, the multiplicative group $\mathbb{F}_M^{\ast}$ has order $M-1$. Reducing exponents modulo $M-1$ makes $C_j^{e_j} \bmod M$ well-defined for any base $C_j$ not divisible by $M$.
+With $M$ prime, the multiplicative group $\mathbb{F}_M^{\ast}$ has order $M-1$.
+Reducing exponents modulo $M-1$ makes $C_j^{e_j} \bmod M$ well-defined for any
+base $C_j$ with $\gcd(C_j, M)=1$. This holds for primes and composite compounds
+alike; the only disallowed case is a base sharing a factor with $M$, which would
+collapse the product (e.g., $C_j \equiv 0 \bmod M$).
 
 ### 6.4 Peer-count variations (x=2,3,4 and composite counts)
 Changing $x$ changes the block size, the number of permutations, and the chain width:
