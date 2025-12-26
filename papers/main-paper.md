@@ -194,18 +194,10 @@ flowchart TD
 ```
 
 ### 4.2 Blind provider circuit (validator)
-Each provider only knows its own bouquets. It recomputes $T_i(t)$ every cycle,
-but the received token matches only once per block of $x$ cycles. The other
-$x-1$ cycles are expected mismatches because the device emitted a different lane.
+Each provider only knows its own bouquets. It recomputes $T_i(t)$ every cycle, but the received token matches only once per block of $x$ cycles. The other $x-1$ cycles are expected mismatches because the device emitted a different lane.
 
-**Why only 1-of-$x$ is correct:** the provider computes the *same* lane token
-formula as the device, but with a fixed lane index $i$. The device emits
-$T_{\mathrm{idx}_t}(t)$ where $\mathrm{idx}_t = \pi_B[s]$ is hidden by
-$\mathrm{perm\_key}$. Therefore the provider is correct iff $i = \mathrm{idx}_t$.
-Because $\pi_B$ is a permutation, this happens exactly once per block of $x$
-cycles. The device is “always right” because it emits the scheduled lane token;
-the provider is “blind” because it does not know $\mathrm{perm\_key}$ and cannot
-predict which cycle is its match.
+**Why only 1-of-$x$ is correct:** the provider computes the *same* lane token formula as the device, but with a fixed lane index $i$. The device emits $T_{\mathrm{idx}_t}(t)$ where $\mathrm{idx}_t = \pi_B[s]$ is hidden by $\mathrm{perm\_key}$. Therefore the provider is correct iff $i = \mathrm{idx}_t$.
+Because $\pi_B$ is a permutation, this happens exactly once per block of $x$ cycles. The device is “always right” because it emits the scheduled lane token; the provider is “blind” because it does not know $\mathrm{perm\_key}$ and cannot predict which cycle is its match.
 
 Provider-side token generation (every cycle):
 
@@ -313,14 +305,8 @@ EC_i(t) &= \mathrm{Eval}(\mathrm{BouquetC}_i, c_t, u_3).
 $$
 
 ### 5.3.1 Prime-compound construction variants
-Compounds do not need to be prime: any base coprime with $M$ is valid. Here,
-“prime compound” means a composite base built from two or more primes (a
-compound prime). This expands the base space and lets you tune complexity by
-increasing the number of factors and exponents, while preserving continuity.
-The only hard requirement is $\gcd(C, M)=1$ (no factor of $M$). This coprimality
-is **with respect to the modulus $M$**, not with respect to $P,Q,R$ or $x$:
-compounds may share factors with each other, but they must not share factors
-with $M$ to stay in $\mathbb{F}_M^{\ast}$.
+Compounds do not need to be prime: any base coprime with $M$ is valid. Here, “prime compound” means a composite base built from two or more primes (a compound prime). This expands the base space and lets you tune complexity by increasing the number of factors and exponents, while preserving continuity.
+The only hard requirement is $\gcd(C, M)=1$ (no factor of $M$). This coprimality is **with respect to the modulus $M$**, not with respect to $P,Q,R$ or $x$: compounds may share factors with each other, but they must not share factors with $M$ to stay in $\mathbb{F}_M^{\ast}$.
 
 - **Multi-prime compounds:** $C = \prod_{i=1}^{r} p_i^{e_i}$ with $r \ge 2$ (the general case).
 - **Prime powers:** $C = p^k$ (smooth but non-prime bases).
@@ -328,9 +314,7 @@ with $M$ to stay in $\mathbb{F}_M^{\ast}$.
 - **Offset compounds:** $C = \left(\prod p_i^{e_i}\right) + \delta$ with small $\delta$ to create a quasi-continuous family.
 - **Quantized reals:** map a real parameter $\rho$ to $C = \lfloor \alpha \rho \rfloor$ for fixed scale $\alpha$, then ensure $\gcd(C, M)=1$.
 
-The demo exposes these families via compound generation modes while keeping the
-exponent schedule unchanged; the “blend” mode just mixes these families and does
-not change the phase periodicity, which is driven solely by $P,Q,R$ and $x$.
+The demo exposes these families via compound generation modes while keeping the exponent schedule unchanged; the “blend” mode just mixes these families and does not change the phase periodicity, which is driven solely by $P,Q,R$ and $x$.
 
 ### 5.4 Token derivation
 Key derivation:
@@ -402,26 +386,15 @@ flowchart LR
 Within each block of length $x$, $\pi_B$ is a permutation. Therefore each provider index appears exactly once per block, and exactly one provider matches per cycle.
 
 ### 6.2 Phase periodicity
-The phase clock is three modular counters: $a_t = (a_0 + t) \bmod P$ and likewise
-for $b_t$ and $c_t$. The joint state repeats after the least common multiple of
-their moduli, so the period is $\mathrm{lcm}(P,Q,R)$. When $P,Q,R$ are pairwise
-coprime (i.e., $\gcd(P,Q)=\gcd(P,R)=\gcd(Q,R)=1$), the lcm is $PQR$.
+The phase clock is three modular counters: $a_t = (a_0 + t) \bmod P$ and likewise for $b_t$ and $c_t$. The joint state repeats after the least common multiple of their moduli, so the period is $\mathrm{lcm}(P,Q,R)$. When $P,Q,R$ are pairwise coprime (i.e., $\gcd(P,Q)=\gcd(P,R)=\gcd(Q,R)=1$), the lcm is $PQR$.
 
-The *schedule* also depends on the block index $B=\lfloor t/x \rfloor$ and the
-slot $s = t \bmod x$, so the combined public schedule repeats after
-$\mathrm{lcm}(P,Q,R,x)$. If $x$ is coprime to each of $P,Q,R$ (i.e.,
-$\gcd(P,x)=\gcd(Q,x)=\gcd(R,x)=1$), then the schedule period is exactly $PQRx$.
-If $x$ shares a factor with any of $P,Q,R$, the combined period is smaller. This
-periodicity is purely about the public clock; the choice of compound bases (even
-“blend” composites) does not change it, as long as those bases remain coprime
-with $M$.
+The *schedule* also depends on the block index $B=\lfloor t/x \rfloor$ and the slot $s = t \bmod x$, so the combined public schedule repeats after $\mathrm{lcm}(P,Q,R,x)$. If $x$ is coprime to each of $P,Q,R$ (i.e., $\gcd(P,x)=\gcd(Q,x)=\gcd(R,x)=1$), then the schedule period is exactly $PQRx$. 
+
+If $x$ shares a factor with any of $P,Q,R$, the combined period is smaller. This periodicity is purely about the public clock; the choice of compound bases (even “blend” composites) does not change it, as long as those bases remain coprime with $M$.
 
 ### 6.3 Modular exponent correctness
 With $M$ prime, the multiplicative group $\mathbb{F}_M^{\ast}$ has order $M-1$.
-Reducing exponents modulo $M-1$ makes $C_j^{e_j} \bmod M$ well-defined for any
-base $C_j$ with $\gcd(C_j, M)=1$. This holds for primes and composite compounds
-alike; the only disallowed case is a base sharing a factor with $M$, which would
-collapse the product (e.g., $C_j \equiv 0 \bmod M$).
+Reducing exponents modulo $M-1$ makes $C_j^{e_j} \bmod M$ well-defined for any base $C_j$ with $\gcd(C_j, M)=1$. This holds for primes and composite compounds alike; the only disallowed case is a base sharing a factor with $M$, which would collapse the product (e.g., $C_j \equiv 0 \bmod M$).
 
 ### 6.4 Peer-count variations (x=2,3,4 and composite counts)
 Changing $x$ changes the block size, the number of permutations, and the chain width:
