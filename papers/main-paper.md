@@ -58,7 +58,6 @@ flowchart LR
 
 ## 2. System model and goals
 PCPL is designed for:
-
 - No runtime challenge/response or synchronization negotiation.
 - One token per cycle, routed to exactly one provider out of $x$.
 - Provider-side validation by local recomputation.
@@ -87,18 +86,14 @@ Each provider $i$ has three secret bouquets: $\mathrm{BouquetA}_i, \mathrm{Bouqu
 ### 3.0 Symbols and domain tags
 
 To avoid accidental cross-use of hashes (“domain confusion”), **every hash that serves a distinct role appends a distinct domain tag**.
-These tags are **constants**. In the formulas we write them as `TAG_PHASE`, `TAG_KDF`, etc. In an implementation each `TAG_*` is a fixed byte string (e.g. `TAG_PHASE = b"PHASE"`), appended **as-is**.  
-There is no need to “ISO‑encode keywords as decimals”: they are labels, not numeric variables. If you want symbol‑free circuits, replace byte tags with fixed-width numeric tag constants (e.g. `u32`) and serialize them with the same canonical integer encoding as everything else; the only requirement is that tags are distinct.
 
 Glossary:
-
 - **CRT clock:** the public schedule formed by the three residues mod \(P,Q,R\).
 - **Lane / provider:** one of \(x\) independent validators that each own distinct secrets.
 - **Bouquet:** a per-lane list of modular bases (typically composite “prime compounds”) used in the modular product.
 - **QFT:** quantum Fourier transform (period finding) — optional analysis tool that can reveal *public* periods.
 
 Domain tags (constants) used in this paper:
-
 - `TAG_SEED` — derive the initial evolving state \(S_0\)
 - `TAG_W` — derive per-lane memory words \(W_i^{(0)}\)
 - `TAG_PRIME` — derive candidate primes for \(P,Q,R\) (and optionally \(M\))
