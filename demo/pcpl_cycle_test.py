@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
 Cycle-by-cycle PCPL simulation from papers/phase-shift-tokens.md.
+Models both roles:
+- Device emitter: selects a lane via perm_key, computes only that lane token,
+  and updates W and S.
+- Provider validators: each lane recomputes its own token every cycle; matches
+  occur 1-of-x by construction.
 Validates the 1-of-x lane property and the per-block permutation schedule, with
 optional dynamic prime generation and difficulty reporting.
 """
@@ -399,6 +404,7 @@ def qft_report(params: Params) -> None:
 
 
 def lane_token(_index: int, t: int, phase: Phase, params: Params, secrets: ProviderSecrets) -> int:
+    """Shared per-cycle token derivation used by device and provider circuits."""
     ea = eval_bouquet(secrets.bouquetA, phase.a, phase.u1, params)
     eb = eval_bouquet(secrets.bouquetB, phase.b, phase.u2, params)
     ec = eval_bouquet(secrets.bouquetC, phase.c, phase.u3, params)
@@ -406,6 +412,19 @@ def lane_token(_index: int, t: int, phase: Phase, params: Params, secrets: Provi
     kdf = h_bytes(ea, eb, ec, phase.phi, "KDF", out_len=32)
     tok_hash = h_bytes(kdf, t, phase.phi, "TOK", out_len=max(32, params.token_bytes))
     return trunc_bits(tok_hash, params.token_bits)
+
+
+def provider_cycle(
+    t: int,
+    lane_idx: int,
+    params: Params,
+    secrets: ProviderSecrets,
+    phase: Optional[Phase] = None,
+) -> int:
+    """Provider-side per-cycle recomputation of the expected lane token."""
+    if phase is None:
+        phase = phase_clock(t, params)
+    return lane_token(lane_idx, t, phase, params, secrets)
 
 
 def device_cycle(t: int, params: Params, state: DeviceState) -> Tuple[int, int]:
@@ -527,11 +546,12 @@ def validate_cycles(
     for t in range(cycles):
         idx, token = device_cycle(t, params, state)
 
+        # Providers run their per-cycle hash pipeline continuously and compare.
         phase = phase_clock(t, params)
         matches = [
             i
             for i in range(params.x)
-            if lane_token(i, t, phase, params, secrets[i]) == token
+            if provider_cycle(t, i, params, secrets[i], phase=phase) == token
         ]
         if matches != [idx]:
             raise AssertionError(f"Cycle {t} expected match {idx}, got {matches}")

@@ -8,7 +8,7 @@
 
 ### Continuous symmetric key generator using asymmetric keys
 
-Version 1.3 - 27 December 2025
+Version 1.4 - 28 December 2025
 
 ## Abstract
 I present the Prime-Compound Phase-Lane Token Protocol (PCPL), a no-handshake token system where a device emits one token per cycle and exactly one provider can validate it. PCPL combines (1) a public phase clock derived from coprime residues, (2) hidden prime-compound bouquets per provider, and (3) device-only state evolution that chains all lanes. I also introduce the symmetric continuous tokenizer device model, motivated by FPGA-based dynamic hash circuits and twin circuits for peer validation. A step-by-step algorithm description, correctness properties, and a deterministic simulation trace are provided.
@@ -268,8 +268,15 @@ flowchart TD
   Reject --> Next
 ```
 
-## 5. Step-by-step algorithm
+### 4.3 Shared vs distinct per-cycle logic
+The device and each provider run a synchronized per-cycle hash pipeline. They differ in
+which lane index is used and whether device-only state is updated.
 
+- **Shared per-cycle hash pipeline (device + provider):** for a given lane index $i$ and cycle $t$, compute $\Phi_t$, then $EA_i(t), EB_i(t), EC_i(t)$, then $K_i(t)$ and $T_i(t)$ using the canonical encoding and domain tags. This runs every cycle.
+- **Device-only additions:** compute $\mathrm{idx}_t$ from `perm_key`, evaluate only that lane, emit $T_{\mathrm{idx}_t}(t)$, update $W[\mathrm{idx}_t]$, and evolve $S_{t+1}$ from all $W$ and chain products. This makes every emitted token influence future cycles.
+- **Provider-only behavior:** for its fixed lane $i$, compute $T_i(t)$ every cycle and compare against any received token. Exactly 1-of-$x$ cycles match because the device selects each lane once per block. Providers do not know `perm_key` and do not maintain $S_t$ or $W[ ]$.
+
+## 5. Step-by-step algorithm
 
 ### 5.0 Canonical encoding and concatenation (unambiguous hash inputs)
 
