@@ -1,4 +1,5 @@
 
+
 | Author | Contact | Date |
 |---|---|---|
 | Riccardo Cecchini | rcecchini.ds[at]gmail.com | 25 December 2025 |
@@ -650,7 +651,7 @@ S_t \| W_0 \| \cdots \| W_{x-1} \| m_0 \| \cdots \| m_{x-2} \| \Phi_t \| \mathrm
 \right).
 $$
 
-Implementation note: if \(W[i]\) and \(m_\ell\) are stored as integers, serialize them with `encM(·)` (or another fixed-width encoder) before hashing.
+Implementation note: if $W[i]$ and $m_\ell$ are stored as integers, serialize them with `encM(·)` (or another fixed-width encoder) before hashing.
 
 ### 5.6 Provider verification (continuous hashing circuit)
 
