@@ -1,3 +1,4 @@
+
 | Author | Contact | Date |
 |---|---|---|
 | Riccardo Cecchini | rcecchini.ds[at]gmail.com | 25 December 2025 |
@@ -26,7 +27,7 @@ Beyond PCPL, the same circuit can be “forked” by alternating variable sets o
 $$
 \begin{aligned}
 S_{t+1}^{(k)} &= H\!\left(C,\, S_t^{(k)},\, V_k,\, t\right), \\
-&\quadT_i(t) &= \mathrm{Trunc}_k\!\left(H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)\right).in W_k.
+&\quad(T_i(t)) &= \mathrm{Trunc}_k\!\left(H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)\right).in W_k.
 \end{aligned}
 $$
 
