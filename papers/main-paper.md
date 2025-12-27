@@ -1,12 +1,6 @@
-
-
-<style>
-table, tr {
-	width:100%; 
-	border-style:none;
-}
-</style>
-<table><tr><td>Riccardo Cecchini</td><td>rcecchini.ds[at]gmail.com</td><td>25 December 2025</td></tr></table>
+| Author | Contact | Date |
+|---|---|---|
+| Riccardo Cecchini | rcecchini.ds[at]gmail.com | 25 December 2025 |
 
 # Prime-Compound Phase-Lane Token Protocol (PCPL) for Symmetric Continuous Tokenizer Devices
 
@@ -32,14 +26,14 @@ Beyond PCPL, the same circuit can be “forked” by alternating variable sets o
 $$
 \begin{aligned}
 S_{t+1}^{(k)} &= H\!\left(C,\, S_t^{(k)},\, V_k,\, t\right), \\
-&\quad t \in W_k.
+&\quadT_i(t) &= \mathrm{Trunc}_k\!\left(H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)\right).in W_k.
 \end{aligned}
 $$
 
 This creates multiple parallel token streams sharing the same circuit but with distinct, time-delimited variable schedules. Such forks can be used for provider lanes (as in PCPL) or for isolated peer-to-peer sessions that are difficult to parallelize or replay.
 
 ### 1.2 Peer-to-peer continuity
-The device model also targets in-loco connections among peers. Two devices that share a circuit family and seed lineage can establish an isolated encryption context by evolving state in lockstep without querying a central provider.
+The device model also targets in loco connections among peers. Two devices that share a circuit family and seed lineage can establish an isolated encryption context by evolving state in lockstep without querying a central provider.
 
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
@@ -74,7 +68,7 @@ Threat model (minimal):
 - Observing accepted tokens should not reveal other lanes.
 - Public time/phase information should not enable cross-lane forgery.
 
-The "primes' compounds" approach as differentiate hashing algorithm should be considered the simplest one. Even with certain vulnerabilities depending on choosen parameters, it's good for working with integer-only circuits.
+The "primes' compounds" approach as differentiate hashing algorithm should be considered the simplest one. Even with certain vulnerabilities depending on chosen parameters, it's good for working with integer-only circuits.
 
 ## 3. Notation and public parameters
 Let:
@@ -91,40 +85,67 @@ Each provider $i$ has three secret bouquets: $\mathrm{BouquetA}_i, \mathrm{Bouqu
 
 ### 3.0 Symbols and domain tags
 
-To avoid accidental cross-use of hashes (“domain confusion”), PCPL appends **domain tags** to every hash input that serves a distinct role.
-These tags are **constants**. In the formulas we write them as variables like `TAG_PHASE`, `TAG_KDF`, etc.
-In an implementation, each `TAG_*` is a fixed byte string (e.g. `TAG_PHASE = b"PHASE"`), and is appended **as-is** .
+To avoid accidental cross-use of hashes (“domain confusion”), **every hash that serves a distinct role appends a distinct domain tag**.
+These tags are **constants**. In the formulas we write them as `TAG_PHASE`, `TAG_KDF`, etc. In an implementation each `TAG_*` is a fixed byte string (e.g. `TAG_PHASE = b"PHASE"`), appended **as-is**.  
+There is no need to “ISO‑encode keywords as decimals”: they are labels, not numeric variables. If you want symbol‑free circuits, replace byte tags with fixed-width numeric tag constants (e.g. `u32`) and serialize them with the same canonical integer encoding as everything else; the only requirement is that tags are distinct.
 
-- **CRT:** Chinese Remainder Theorem clock formed by residues mod $P,Q,R$.
-- **QFT:** Quantum Fourier Transform (period-finding on public schedule), optional analysis tool.
+Glossary:
 
-Domain tags (constants):
+- **CRT clock:** the public schedule formed by the three residues mod \(P,Q,R\).
+- **Lane / provider:** one of \(x\) independent validators that each own distinct secrets.
+- **Bouquet:** a per-lane list of modular bases (typically composite “prime compounds”) used in the modular product.
+- **QFT:** quantum Fourier transform (period finding) — optional analysis tool that can reveal *public* periods.
 
-- `TAG_SEED` — derive the initial evolving state $S_0$
-- `TAG_W` — derive per-lane memory words $W_i^{(0)}$
-- `TAG_PRIME` — derive candidate primes for $P,Q,R,M$
-- `TAG_A0`, `TAG_B0`, `TAG_C0` — derive the public phase offsets $a_0,b_0,c_0$
+Domain tags (constants) used in this paper:
+
+- `TAG_SEED` — derive the initial evolving state \(S_0\)
+- `TAG_W` — derive per-lane memory words \(W_i^{(0)}\)
+- `TAG_PRIME` — derive candidate primes for \(P,Q,R\) (and optionally \(M\))
+- `TAG_A0`, `TAG_B0`, `TAG_C0` — derive **public** phase offsets \(a_0,b_0,c_0\)
 - `TAG_PERMKEY` — derive the device-only permutation key `perm_key`
-- `TAG_PERMSEED` — derive the per-block shuffle seed used by $\pi_B$
-- `TAG_PHASE` — domain tag for the phase digest $\Phi_t$
-- `TAG_EXP` — domain tag for bouquet exponent derivation $e_j$
-- `TAG_KDF` — domain tag for per-lane key material $K_i(t)$
-- `TAG_TOK` — domain tag for the final emitted token $T_i(t)$
-- `TAG_EVOLVE` — domain tag for state evolution ($S_{t+1}$ update)
-
+- `TAG_PERMSEED` — derive the per-block shuffle seed used by \(\pi_B\)
+- `TAG_PHASE` — domain tag for the phase digest \(\Phi_t\)
+- `TAG_EXP` — domain tag for bouquet exponent derivation \(e_j\)
+- `TAG_KDF` — domain tag for per-lane key material \(K_i(t)\)
+- `TAG_TOK` — domain tag for the final emitted token \(T_i(t)\)
+- `TAG_EVOLVE` — domain tag for state evolution \(S_{t+1}\)
 
 ### 3.1 Seed construction and coprime extraction
 The device bootstraps a root seed $Z$ from device-local entropy and context (for example: device secret, serial, provider list, and a boot nonce). In the demo, $Z$ is produced by a deterministic RNG seeded with `--seed`, then bound to labels with $H(\cdot)$:
 
-- $\mathrm{perm\_key} = H(Z \| \mathrm{TAG\_PERMKEY})$
-- $S_0 = H(Z \| \mathrm{TAG\_SEED})$
-- $W_i = \mathrm{Trunc}_k(H(Z \| \mathrm{TAG\_W} \| \mathrm{enc}_i(i)))$
+- $\mathrm{perm\_key} = H(Z \| \text{TAG\_PERMKEY})$
+- $S_0 = H(Z \| \text{"SEED"})$
+- $W_i = \mathrm{Trunc}_k(H(Z \| \text{"W"} \| i))$
 
 To extrapolate coprimes for $P,Q,R$ (and optionally $M$), derive candidates from a seeded stream and select the first primes that are distinct and coprime with $x$:
 
-1. $c_k \leftarrow \mathrm{next\_prime}(H(Z \| \mathrm{TAG\_PRIME} \| \mathrm{encU32}(k)) \bmod 2^b)$
+1. $c_k \leftarrow \mathrm{next\_prime}(H(Z \| \text{"PRIME"} \| k) \bmod 2^b)$
 2. accept $c_k$ if $\gcd(c_k, x)=1$ and $c_k \notin \{P,Q,R,M\}$
 3. continue until $P,Q,R$ (and $M$ if generated) are assigned
+
+
+### 3.1.1 Public phase offsets and public parameter publication
+The phase clock in §5.1 uses **public offsets** $a_0\in[0,P)$, $b_0\in[0,Q)$, $c_0\in[0,R)$. They are **not** lane secrets: every validator must be able to recompute $(a_t,b_t,c_t)$ from the same public schedule.
+
+A simple deterministic derivation (used in the demo) is:
+
+- $a_0 = H(Z \| \text{"A0"}) \bmod P$
+- $b_0 = H(Z \| \text{"B0"}) \bmod Q$
+- $c_0 = H(Z \| \text{"C0"}) \bmod R$
+
+Even if derived from the device root seed $Z$, these offsets are treated as **published configuration**, together with $x, P, Q, R$ (and $M$ if used). Equivalently, you can derive them from a separate *public* setup seed $Z_{\text{pub}}$.
+
+### 3.1.2 Provisioning contract (who knows what)
+PCPL is “no-handshake” at runtime, but it still needs a provisioning step (manufacture, enrollment, or out-of-band setup). The clean separation is:
+
+- **Public configuration (shared with everyone):** $x$, $P,Q,R$, $M$, $a_0,b_0,c_0$, the permutation algorithm description, and the canonical byte encoding rules (§5.0).
+- **Device-only secrets:** $Z$, `perm_key`, $S_t$, the full bouquet set for all providers, and the lane-memory vector $W[0..x-1]$.
+- **Provider-$i$ secrets:** $(\mathrm{BouquetA}_i, \mathrm{BouquetB}_i, \mathrm{BouquetC}_i)$ and its stable identifier $i$ (or `provider_id`).
+
+The runtime cycle counter $t$ must be common to device and providers. In practice, either:
+1) $t$ is derived from a shared epoch and fixed cycle duration, or  
+2) the device includes $t$ alongside the emitted token (recommended for robustness).
+
 
 ### 3.2 Best-practice coprimes, compounds, and key selection
 Parameter and key selection should scale with the peer count and keep strict domain separation between device-only and provider-only secrets.
@@ -155,27 +176,30 @@ The demo can be run with small bit sizes so prime-factor detail fits on the page
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
 flowchart LR
-  Seed1337["seed = 1337<br/>= 7^1 * 191^1"] --> Rng1337["param RNG = derive_seed(seed, 'PARAMS')"]
-  Rng1337 --> P1337["P = 3251<br/>= 3251^1"]
-  Rng1337 --> Q1337["Q = 3169<br/>= 3169^1"]
-  Rng1337 --> R1337["R = 2251<br/>= 2251^1"]
-  Rng1337 --> M1337["M = 41659<br/>= 41659^1"]
+  Seed1337["seed = 1337<br/>= 7^1 * 191^1"] --> ParamSeed1337["param seed = derive_seed(seed, 'PARAMS')"]
+  ParamSeed1337 --> ParamRng1337["param RNG = Random(param seed)"]
+  ParamRng1337 --> P1337["P = 3251<br/>= 3251^1"]
+  ParamRng1337 --> Q1337["Q = 3169<br/>= 3169^1"]
+  ParamRng1337 --> R1337["R = 2251<br/>= 2251^1"]
+  ParamRng1337 --> M1337["M = 41659<br/>= 41659^1"]
   X1337["x = 4<br/>= 2^2"] --> Period1337["period = lcm(P,Q,R,x) = 92762980676<br/>= 2^2 * 2251^1 * 3169^1 * 3251^1"]
   P1337 --> Period1337
   Q1337 --> Period1337
   R1337 --> Period1337
 ```
 
+**Important:** the schedule/modulus primes (**P, Q, R** and **M**) are chosen for the public clock period and modular arithmetic. They are **not** meant to appear as factors inside bouquet compounds. Bouquets are built from a separate prime pool (small in the demo, larger in production) because the protocol only uses each compound as a *base modulo* **M** in `pow(compound % M, exponent, M)`. The only required constraint is `compound % M != 0` (equivalently `gcd(compound, M)=1`).
+
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
 flowchart TD
-  Seed2024["seed = 2024<br/>= 2^3 * 11^1 * 23^1"] --> Rng2024["compound RNG = Random(seed)"]
-  Rng2024 --> Cfg2024["compound_mode=classic<br/>primes_per_compound=3"]
-  Cfg2024 --> Pool2024["prime pool: 3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67"]
-  Pool2024 --> PicksA0["BouquetA[0] picks: 31^1, 47^3, 59^1"]
-  PicksA0 --> C0["C0 = 189892267<br/>= 31^1 * 47^3 * 59^1"]
-  Pool2024 --> PicksA1["BouquetA[1] picks: 23^3, 29^3, 59^2"]
-  PicksA1 --> C1["C1 = 1032955292203<br/>= 23^3 * 29^3 * 59^2"]
+  Seed1337b["seed = 1337<br/>= 7^1 * 191^1"] --> FixRng1337["fixture RNG = Random(seed)"]
+  FixRng1337 --> Cfg1337["compound_mode=classic<br/>primes_per_compound=3<br/>exponent_range=1..3"]
+  Cfg1337 --> Pool1337["prime pool (demo): 3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67"]
+  Pool1337 --> PicksA0["BouquetA[0] factors: 17^2, 41^3, 67^3"]
+  PicksA0 --> C0["C0 = 5990648262947<br/>= 17^2 * 41^3 * 67^3"]
+  Pool1337 --> PicksA1["BouquetA[1] factors: 41^2, 43^6"]
+  PicksA1 --> C1["C1 = 10626211285369<br/>= 41^2 * 43^6"]
 ```
 
 ## 4. PCPL protocol overview
@@ -221,8 +245,12 @@ $$
 EA_i(t) &= \mathrm{Eval}(\mathrm{BouquetA}_i, a_t, u_1), \\
 EB_i(t) &= \mathrm{Eval}(\mathrm{BouquetB}_i, b_t, u_2), \\
 EC_i(t) &= \mathrm{Eval}(\mathrm{BouquetC}_i, c_t, u_3), \\
-K_i(t) &= H(EA_i \| EB_i \| EC_i \| \Phi_t \| \mathrm{TAG\_KDF}), \\
-T_i(t) &= \mathrm{Trunc}_k\!\left(H(K_i \| t \| \Phi_t \| \mathrm{TAG\_TOK})\right).
+K_i(t) &= H\!\left(
+\mathrm{enc\_i}(i)\|\mathrm{encM}(EA_i(t))\|\mathrm{encM}(EB_i(t))\|\mathrm{encM}(EC_i(t))\|\Phi_t\|\mathrm{TAG\_KDF}
+\right), \\
+T_i(t) &= \mathrm{Trunc}_k\!\left(
+H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)
+\right).
 \end{aligned}
 $$
 
@@ -243,28 +271,61 @@ flowchart TD
 
 ## 5. Step-by-step algorithm
 
+
 ### 5.0 Canonical encoding and concatenation (unambiguous hash inputs)
 
-The operator `||` / $\|$ in the formulas means **byte-string concatenation**.
-Implementations MUST use a canonical encoding so that different tuples cannot map to the same byte string.
+The operator `||` / \(\|\) in the formulas means **byte-string concatenation**. Implementations **MUST** use a canonical serialization so that different tuples cannot map to the same byte string (classic “`1|23` vs `12|3`” bug).
 
 Use fixed-length big-endian integer encoding (**I2OSP**) with lengths derived from the public moduli:
 
-- $\ell_P=\lceil\log_2(P)/8\rceil$, $\ell_Q=\lceil\log_2(Q)/8\rceil$, $\ell_R=\lceil\log_2(R)/8\rceil$, $\ell_M=\lceil\log_2(M)/8\rceil$
-- lane identifier: $\ell_i=4$ bytes (`enc_i(i) = I2OSP(i,4)`) unless you use a larger provider ID space
-- cycle counter: $\ell_t=8$ bytes (`enc_t(t) = I2OSP(t,8)`) unless you expect more than $2^{64}$ cycles
-- small indices (e.g., bouquet element index $j$, prime-candidate index $k$): `encU32(n) = I2OSP(n,4)`
+- \(\ell_P=\lceil\log_2(P)/8\rceil\), \(\ell_Q\), \(\ell_R\), \(\ell_M\) similarly
+- lane identifier: \(\ell_i=4\) bytes (`enc_i(i) = I2OSP(i,4)`) unless you need a larger ID space
+- cycle counter: \(\ell_t=8\) bytes (`enc_t(t) = I2OSP(t,8)`) unless you expect more than \(2^{64}\) cycles
+- small indices (bouquet element index \(j\), prime-candidate index \(k\), …): `encU32(n) = I2OSP(n,4)`
 
 Encoding functions:
 
 - `encP(a) = I2OSP(a, ℓP)` and similarly `encQ`, `encR`, `encM`
 - `enc_i(i) = I2OSP(i, ℓi)`, `enc_t(t) = I2OSP(t, ℓt)`
 
-Domain tags (`TAG_PHASE`, `TAG_EXP`, `TAG_KDF`, `TAG_TOK`, …) are fixed byte strings as defined in §3.0 and are appended **as-is**.
+Domain tags (`TAG_PHASE`, `TAG_EXP`, `TAG_KDF`, `TAG_TOK`, …) are fixed byte strings as defined in §3.0 and are appended **as-is**. If you prefer numeric tags, serialize the numeric constant with `I2OSP(tag, 4)` (or any fixed width) — the only requirement is uniqueness.
 
-With this convention, “concatenate then hash” is unambiguous.
+With this convention, the core digests become:
+
+\[
+\Phi_t = H\!\left(
+\mathrm{encP}(a_t)\|\mathrm{encQ}(b_t)\|\mathrm{encR}(c_t)\|
+\mathrm{encM}(u_1)\|\mathrm{encM}(u_2)\|\mathrm{encM}(u_3)\|
+\mathrm{TAG\_PHASE}
+\right).
+\]
+
+\[
+e_j = H\!\left(
+\mathrm{encRes}(x_{\mathrm{res}})\|\mathrm{encM}(u)\|\mathrm{encU32}(j)\|\mathrm{TAG\_EXP}
+\right) \bmod (M-1),
+\]
+where `encRes` is the residue encoder for \(a_t\) / \(b_t\) / \(c_t\) (use `encP`, `encQ`, or `encR` depending on which residue is in scope).
+
+\[
+K_i(t)=H\!\left(
+\mathrm{enc\_i}(i)\|\mathrm{encM}(EA_i(t))\|\mathrm{encM}(EB_i(t))\|\mathrm{encM}(EC_i(t))\|
+\Phi_t\|\mathrm{TAG\_KDF}
+\right),
+\]
+
+\[
+T_i(t)=\mathrm{Trunc}_k\!\left(
+H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)
+\right).
+\]
+
+`Trunc_k` can mean “take the first \(k\) bits” (most common), or “interpret as an integer and reduce mod \(2^k\)”. The demo uses byte truncation.
+
+**Rule of thumb:** never concatenate decimal strings, and never concatenate variable-length integers without either fixed widths or length-prefixes.
 
 ### 5.1 Phase clock
+Public offsets $a_0,b_0,c_0$ are part of the public configuration (§3.1.1).
 
 For cycle $t$:
 
@@ -300,7 +361,7 @@ $$
 Let:
 
 $$
-B = \left\lfloor \frac{t}{x} \right\rfloor, \quad s = t \bmod x.
+B = \left\lfloor \frac{t}{x} \right\rfloor, \quad s =T_i(t) &= \mathrm{Trunc}_k\!\left(H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)\right).bmod x.
 $$
 
 Compute a permutation $\pi_B$ of $\{0,\ldots,x-1\}$ using a hash-driven shuffle seeded by a block-level phase digest (computed at $t = B\cdot x$) so the schedule is stable within each block. Then:
@@ -316,7 +377,7 @@ The device determines the current destination provider using only public phase d
 
 $$
 \begin{aligned}
-&B = \left\lfloor \frac{t}{x} \right\rfloor,\quad s = t \bmod x \\
+&B = \left\lfloor \frac{t}{x} \right\rfloor,\quad s =T_i(t) &= \mathrm{Trunc}_k\!\left(H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)\right).bmod x \\
 &\pi_B = \mathrm{Permute}\left(\mathrm{perm\_key}, B, \Phi_{B\cdot x}\right) \\
 &\mathrm{idx}_t = \pi_B[s]
 \end{aligned}
@@ -325,17 +386,22 @@ $$
 Providers do not know $\mathrm{perm\_key}$, so the schedule is blinded from them even though $t$ and $\Phi_t$ are public.
 
 ### 5.3 Bouquet evaluation
-Each bouquet is a list of compounds $C_j$, each a product of primes. For a residue $x_{\mathrm{res}}$ and coupling $u$, define:
+
+Each bouquet is a list of compounds \(C_j\), each a modular base (typically a product of primes). For a residue \(x_{\mathrm{res}}\) and coupling \(u\), define the per-element exponent:
 
 $$
-e_j = H\!\left(x_{\mathrm{res}} \| u \| j \| \mathrm{TAG\_EXP}\right) \bmod (M-1).
+e_j = H\!\left(
+\mathrm{encRes}(x_{\mathrm{res}})\|\mathrm{encM}(u)\|\mathrm{encU32}(j)\|\mathrm{TAG\_EXP}
+\right) \bmod (M-1).
 $$
+
+Bouquet evaluation is the modular product:
 
 $$
 \mathrm{Eval}(\mathrm{Bouquet}, x_{\mathrm{res}}, u) = \prod_j C_j^{e_j} \bmod M.
 $$
 
-For provider $i$:
+For provider \(i\):
 
 $$
 \begin{aligned}
@@ -358,18 +424,109 @@ The only hard requirement is $\gcd(C, M)=1$ (no factor of $M$). This coprimality
 The demo exposes these families via compound generation modes while keeping the exponent schedule unchanged; the “blend” mode just mixes these families and does not change the phase periodicity, which is driven solely by $P,Q,R$ and $x$.
 
 ### 5.4 Token derivation
-Key derivation:
+
+Key derivation (domain-separated by lane identifier \(i\)):
 
 $$
-K_i(t) = H\!\left(EA_i \| EB_i \| EC_i \| \Phi_t \| \mathrm{TAG\_KDF}\right).
+K_i(t) = H\!\left(
+\mathrm{enc\_i}(i)\|\mathrm{encM}(EA_i(t))\|\mathrm{encM}(EB_i(t))\|\mathrm{encM}(EC_i(t))\|
+\Phi_t\|\mathrm{TAG\_KDF}
+\right).
 $$
 
 Token:
 
 $$
-T_i(t) = \mathrm{Trunc}_k\!\left(H\!\left(K_i \| t \| \Phi_t \| \mathrm{TAG\_TOK}\right)\right).
+T_i(t) = \mathrm{Trunc}_k\!\left(
+H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)
+\right).
 $$
 
+Implementation notes:
+- In code, \(K_i(t)\) is the **hash digest bytes** (not an integer).
+- When concatenating integers, always use the canonical fixed-length encoding (§5.0).
+- Including \(i\) inside the KDF provides explicit lane domain-separation even if two providers were accidentally provisioned with identical bouquets.
+
+### 5.4.1 Worked example with real integers (toy parameters + SHA-256)
+This example is **not** meant to be secure (the primes are tiny); it exists only to show the math and key composition end-to-end with concrete numbers.
+
+Parameters:
+
+- $x=4$
+- $P=11$, $Q=13$, $R=17$ (pairwise coprime and coprime with $x$)
+- $M=19$ (prime modulus, so $\lvert\mathbb{F}_M^{\ast}\rvert=M-1=18$)
+- public offsets: $a_0=2$, $b_0=3$, $c_0=5$
+- lane: $i=2$
+- cycle: $t=7$
+- encoding: fixed-length big-endian as in §5.0 (here every modulus fits in 1 byte)
+- hash: SHA-256, $k=64$ (token is first 64 bits of the final hash)
+
+Provider $i=2$ bouquets (each base is coprime with $M$):
+
+- $\mathrm{BouquetA}_2=[15,\,77]$ (compounds: $3\cdot 5$ and $7\cdot 11$)
+- $\mathrm{BouquetB}_2=[91,\,143]$ (compounds: $7\cdot 13$ and $11\cdot 13$)
+- $\mathrm{BouquetC}_2=[85,\,187]$ (compounds: $5\cdot 17$ and $11\cdot 17$)
+
+Computed public phase values:
+
+- $a_t=9$, $b_t=10$, $c_t=12$
+- $u_1=14$, $u_2=6$, $u_3=13$
+- $\Phi_t = \mathrm{SHA256}(\texttt{09 0a 0c 0e 06 0d} \| \text{TAG\_PHASE}) = \texttt{0x809eec62…}$
+
+Computed bouquet exponents and evaluations (all exponents reduced mod $18$):
+
+- $e^A=[2,17] \Rightarrow EA_2(t)=16$
+- $e^B=[7,5] \Rightarrow EB_2(t)=1$
+- $e^C=[0,14] \Rightarrow EC_2(t)=4$
+
+Final key and token:
+
+- $K_2(t)=\mathrm{SHA256}(i\|EA\|EB\|EC\|\Phi_t\|\text{TAG\_KDF})=\texttt{0x4ca0cd19…}$
+- $T_2(t)=\mathrm{Trunc}_{64}(\mathrm{SHA256}(K_2(t)\|t\|\Phi_t\|\text{TAG\_TOK}))=\texttt{0x548c40b9091d8ed7}$
+
+```mermaid
+%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
+flowchart LR
+  T["t=7"] --> A["a_t=(2+7) mod 11 = 9"]
+  T --> B["b_t=(3+7) mod 13 = 10"]
+  T --> C["c_t=(5+7) mod 17 = 12"]
+
+  A --> U1["u1=(9*10) mod 19 = 14"]
+  B --> U1
+  B --> U2["u2=(10*12) mod 19 = 6"]
+  C --> U2
+  C --> U3["u3=(12*9) mod 19 = 13"]
+  A --> U3
+
+  A --> PHI["Phi_t = SHA256(09 0a 0c 0e 06 0d || 'PHASE') = 0x809eec62…"]
+  U1 --> PHI
+  U2 --> PHI
+  U3 --> PHI
+```
+
+```mermaid
+%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
+flowchart TD
+  subgraph A2["Lane i=2 bouquet evals (mod M=19)"]
+    AIn["BouquetA2 = [15, 77]"] --> EAExp["eA = [2, 17] (mod 18)"]
+    EAExp --> EA["EA = 15^2 * 77^17 mod 19 = 16"]
+
+    BIn["BouquetB2 = [91, 143]"] --> EBExp["eB = [7, 5] (mod 18)"]
+    EBExp --> EB["EB = 91^7 * 143^5 mod 19 = 1"]
+
+    CIn["BouquetC2 = [85, 187]"] --> ECExp["eC = [0, 14] (mod 18)"]
+    ECExp --> EC["EC = 85^0 * 187^14 mod 19 = 4"]
+  end
+
+  PHI2["Phi_t = 0x809eec62…"] --> K2["K2 = SHA256(i||EA||EB||EC||Phi||'KDF') = 0x4ca0cd19…"]
+  EA --> K2
+  EB --> K2
+  EC --> K2
+
+  K2 --> TOK["T2 = Trunc64(SHA256(K2||t||Phi||'TOK')) = 0x548c40b9091d8ed7"]
+```
+
+This is the exact structure the providers use: even though they cannot predict **which** lane the device will emit on a given cycle, they can still recompute their own lane's expected $T_i(t)$ and accept only when it matches.
 
 ### 5.4.2 Why SHA-256 and truncation still respect the permutation rule (and enable async validation)
 
@@ -448,16 +605,19 @@ flowchart LR
 
 
 ### 5.5 Device emission and state evolution
-The device computes only $T_{\mathrm{idx}_t}(t)$ and updates internal state:
 
-- $W[i]$ stores the last token for lane $i$.
-- The seed $S$ evolves using all lanes and adjacent products.
+The device computes only \(T_{\mathrm{idx}_t}(t)\) for the scheduled lane and updates internal state:
 
-For $x$ lanes, define (non-cyclic adjacency):
+- \(W[i]\) is a per-lane **memory word**. Initialize as \(W_i^{(0)}\) (§3.1), then update only when lane \(i\) is active (e.g., store `Int(T) mod M` or store raw token bytes — choose one representation and encode it canonically in the hash below).
+- The seed \(S_t\) evolves using **all lanes** and adjacent products, so “inactive” lanes still influence the future through their last stored \(W[i]\).
+
+For \(x\) lanes, define (non-cyclic adjacency):
 
 $$
 m_\ell = (W_\ell \cdot W_{\ell+1}) \bmod M, \quad \ell = 0,\ldots,x-2.
 $$
+
+Seed evolution:
 
 $$
 S_{t+1} = H\!\left(
@@ -465,14 +625,16 @@ S_t \| W_0 \| \cdots \| W_{x-1} \| m_0 \| \cdots \| m_{x-2} \| \Phi_t \| \mathrm
 \right).
 $$
 
+Implementation note: if \(W[i]\) and \(m_\ell\) are stored as integers, serialize them with `encM(·)` (or another fixed-width encoder) before hashing.
+
 ### 5.6 Provider verification
 Provider $i$ recomputes $T_i(t)$ and accepts the token if it matches.
 
 ### 5.7 Device-side vs provider-side variables
 The protocol deliberately separates what the device computes from what providers can infer:
 
-- **Public inputs:** $t$, $x$, $P,Q,R,M$, and the permutation algorithm (but not the key).
-- **Device-only state:** $\mathrm{perm\_key}$, $S_t$, all lane secrets, and the last tokens $W[0..x-1]$.
+- **Public inputs:** $t$ (or its epoch mapping), $x$, $P,Q,R,M$, the public offsets $a_0,b_0,c_0$, the permutation algorithm (but not `perm_key`), and the canonical encoding rules.
+- **Device-only state:** $\mathrm{perm\_key}$, $S_t$, all lane secrets, and the lane-memory vector $W[0..x-1]$.
 - **Provider $i$ secrets:** $\mathrm{BouquetA}_i, \mathrm{BouquetB}_i, \mathrm{BouquetC}_i$.
 - **Ignored by providers:** $\mathrm{perm\_key}$, $S_t$, other providers’ bouquets, and the full $W$ vector.
 
@@ -498,6 +660,93 @@ flowchart LR
   Select -.-> Repeat
 ```
 
+
+### 5.8 Reference pseudocode (implementation-oriented)
+
+The following pseudocode matches the specification above (not optimized).
+
+```text
+# Public parameters (shared):
+#   x, P, Q, R, M, a0, b0, c0
+# Hash function H(·) and Trunc_k(·) agreed by all parties
+# Canonical encoders: encP, encQ, encR, encM, enc_i, enc_t, encU32
+# Domain tags: TAG_PHASE, TAG_EXP, TAG_KDF, TAG_TOK, TAG_EVOLVE, TAG_PERMSEED
+
+function Phase(t):
+    a = (a0 + t) mod P
+    b = (b0 + t) mod Q
+    c = (c0 + t) mod R
+    u1 = (a * b) mod M
+    u2 = (b * c) mod M
+    u3 = (c * a) mod M
+
+    Phi = H( encP(a) || encQ(b) || encR(c) ||
+             encM(u1) || encM(u2) || encM(u3) ||
+             TAG_PHASE )
+    return (a,b,c,u1,u2,u3,Phi)
+
+function PermuteBlock(perm_key, B, Phi_block, x):
+    # Deterministic Fisher–Yates using hash-derived bytes as a PRNG stream.
+    # Stable for the whole block B.
+    seed = H( perm_key || encU32(B) || Phi_block || TAG_PERMSEED )
+    L = [0,1,2,...,x-1]
+    stream = Expand(seed)      # e.g., seed || H(seed||0) || H(seed||1) || ...
+    for i from x-1 downto 1:
+        r = NextU32(stream)    # pull 32 bits from stream
+        j = r mod (i+1)
+        swap L[i], L[j]
+    return L   # permutation π_B
+
+function EvalBouquet(bouquet, res_encoder, x_res, u, M):
+    acc = 1 mod M
+    for j from 0 to len(bouquet)-1:
+        Cj = bouquet[j] mod M
+        ej = H( res_encoder(x_res) || encM(u) || encU32(j) || TAG_EXP ) mod (M-1)
+        acc = (acc * pow(Cj, ej, M)) mod M
+    return acc
+
+function LaneToken(i, t, bouquets_i):
+    (a,b,c,u1,u2,u3,Phi) = Phase(t)
+    EA = EvalBouquet(bouquets_i.A, encP, a, u1, M)
+    EB = EvalBouquet(bouquets_i.B, encQ, b, u2, M)
+    EC = EvalBouquet(bouquets_i.C, encR, c, u3, M)
+
+    K  = H( enc_i(i) || encM(EA) || encM(EB) || encM(EC) || Phi || TAG_KDF )
+    T  = Trunc_k( H( K || enc_t(t) || Phi || TAG_TOK ) )
+    return T
+
+# DEVICE (emitter)
+state: perm_key (secret), S, W[0..x-1] (secret per-lane memory), bouquets_all
+for each cycle t = 0,1,2,...:
+    (a,b,c,u1,u2,u3,Phi) = Phase(t)
+
+    B = floor(t / x)
+    s = t mod x
+    Phi_block = Phase(B*x).Phi
+    pi = PermuteBlock(perm_key, B, Phi_block, x)
+    idx = pi[s]
+
+    T = LaneToken(idx, t, bouquets_all[idx])
+    send (t, idx, T) to provider idx
+
+    W[idx] = Int(T) mod M   # or store raw bytes; if bytes, encode consistently in EVOLVE
+    m[ℓ] = (W[ℓ] * W[ℓ+1]) mod M for ℓ = 0..x-2
+    S = H( S || W[0] || ... || W[x-1] || m[0] || ... || m[x-2] || Phi || TAG_EVOLVE )
+
+# PROVIDER i (validator)
+state: bouquets_i (secret), i (public identifier)
+on receive (t, i, T_rx):
+    T_exp = LaneToken(i, t, bouquets_i)
+    accept iff (T_rx == T_exp)
+```
+
+Notes:
+- `Expand(seed)` is any deterministic method to obtain enough pseudorandom bytes from `seed`
+  (e.g., `H(seed||0)`, `H(seed||1)`, …). Both device and any party that needs to recompute `π_B`
+  must use the **same** expansion.
+- Providers do **not** need `perm_key` and do not need to know `π_B` to validate: they only verify when contacted.
+
+
 ## 6. Correctness and periodicity
 
 ### 6.1 Exact 1-of-x matching
@@ -506,7 +755,7 @@ Within each block of length $x$, $\pi_B$ is a permutation. Therefore each provid
 ### 6.2 Phase periodicity
 The phase clock is three modular counters: $a_t = (a_0 + t) \bmod P$ and likewise for $b_t$ and $c_t$. The joint state repeats after the least common multiple of their moduli, so the period is $\mathrm{lcm}(P,Q,R)$. When $P,Q,R$ are pairwise coprime (i.e., $\gcd(P,Q)=\gcd(P,R)=\gcd(Q,R)=1$), the lcm is $PQR$.
 
-The *schedule* also depends on the block index $B=\lfloor t/x \rfloor$ and the slot $s = t \bmod x$, so the combined public schedule repeats after $\mathrm{lcm}(P,Q,R,x)$. If $x$ is coprime to each of $P,Q,R$ (i.e., $\gcd(P,x)=\gcd(Q,x)=\gcd(R,x)=1$), then the schedule period is exactly $PQRx$. 
+The *schedule* also depends on the block index $B=\lfloor t/x \rfloor$ and the slot $s =T_i(t) &= \mathrm{Trunc}_k\!\left(H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)\right).bmod x$, so the combined public schedule repeats after $\mathrm{lcm}(P,Q,R,x)$. If $x$ is coprime to each of $P,Q,R$ (i.e., $\gcd(P,x)=\gcd(Q,x)=\gcd(R,x)=1$), then the schedule period is exactly $PQRx$. 
 
 If $x$ shares a factor with any of $P,Q,R$, the combined period is smaller. This periodicity is purely about the public clock; the choice of compound bases (even “blend” composites) does not change it, as long as those bases remain coprime with $M$.
 
@@ -535,7 +784,7 @@ choose $P,Q,R$ coprime with all prime factors of $x$ to avoid shrinking the peri
 - **Quantum period-finding:** QFT can reveal the public period $\mathrm{lcm}(P,Q,R,x)$ but not the hidden bouquets or $\mathrm{perm\_key}$; use large coprimes and device-only chaining to avoid exploitable structure.
 
 ## 8. Experimental validation (deterministic simulation)
-A simulator was implemented a cycle-by-cycle to validate correctness. The demo verifies:
+A simulator was implemented cycle-by-cycle to validate correctness. The demo verifies:
 
 - Each block yields a valid permutation.
 - Exactly one provider matches each cycle.
@@ -544,6 +793,7 @@ A simulator was implemented a cycle-by-cycle to validate correctness. The demo v
 - Optional prime/compound generation modes for non-arbitrary parameter testing.
 
 Repository: [cekkr/phaselane-algorithm@github.com](https://github.com/cekkr/phaselane-algorithm).
+
 ### 8.1 Sample token trace (x=4, seed=1337)
 For PDF export, the original wide table was replaced with an A4-friendly summary table and a sequence diagram (tokens truncated for readability; the matched provider’s recomputed token equals the device token by construction).
 
@@ -579,7 +829,7 @@ sequenceDiagram
 
 ### 8.2 Full token trace (verbatim values)
 
-The full deterministic trace (block permutations, schedule, device tokens, and per-lane tokens) is exported to a separate, auto-generated file to keep the paper A4-friendly, following the papers and script developed in repository [cekkr/phaselane-algorithm@github.com](https://github.com/cekkr/phaselane-algorithm). See `papers/token-trace.md`, generated by `demo/export_token_trace.py`.
+The full deterministic trace (block permutations, schedule, device tokens, and per-lane tokens) is exported to a separate, auto-generated file to keep the paper A4-friendly. See `papers/token-trace.md`, generated by `demo/export_token_trace.py`.
 
 Regenerate with:
 `python3 demo/export_token_trace.py --blocks 4 --out papers/token-trace.md`
@@ -634,7 +884,7 @@ Full multi-configuration outputs (additional compound modes and seeds) are in `p
 - The security of the scheme relies on the strength of $H(\cdot)$ and the secrecy of bouquets, not on the hardness of factoring revealed integers.
 - The public period $\mathrm{lcm}(P,Q,R,x)$ is visible (and QFT-recoverable), so period size should be chosen large enough for the deployment horizon.
 - For testing, primes and compound bases can be generated from a seeded stream to avoid arbitrary constants.
-- This paper was developed and formatted with an heavy OpenAI models' help.
+- This paper was developed and formatted with the help of OpenAI models.
 
 ## 10. Conclusion
 PCPL provides a deterministic, no-handshake token protocol with exact 1-of-$x$ matching and a device-only chaining mechanism. Combined with symmetric continuous tokenizer devices, it supports both provider validation and peer-to-peer isolation with dynamic, evolving secrets. The included simulation and trace demonstrate the protocol’s behavior cycle by cycle.
