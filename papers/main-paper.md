@@ -357,7 +357,10 @@ $$
 Let:
 
 $$
-B = \left\lfloor \frac{t}{x} \right\rfloor, \quad s =T_i(t) &= \mathrm{Trunc}_k\!\left(H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)\right).bmod x.
+\begin{aligned}
+B &= \left\lfloor \frac{t}{x} \right\rfloor \\
+s = T_i(t) &= \mathrm{Trunc}_k\!\left(H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)\right) \bmod x
+\end{aligned}
 $$
 
 Compute a permutation $\pi_B$ of $\{0,\ldots,x-1\}$ using a hash-driven shuffle seeded by a block-level phase digest (computed at $t = B\cdot x$) so the schedule is stable within each block. Then:
