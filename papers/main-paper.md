@@ -84,23 +84,26 @@ Let:
 Each provider $i$ has three secret bouquets: $\mathrm{BouquetA}_i, \mathrm{BouquetB}_i, \mathrm{BouquetC}_i$, each a list of prime compounds.
 
 ### 3.0 Symbol and label glossary
-To keep domain separation explicit, hash inputs include fixed ASCII labels:
+To keep domain separation explicit, hash inputs include fixed **domain-separation tags** (constants). In the math they are written as human-readable names like `"PHASE"`; in an implementation they are simply appended as constant bytes. There is no need to treat them as “ISO-encoded keywords”: either hardcode the byte sequence (ASCII/UTF‑8 are identical for `A–Z`), or use fixed numeric tag constants if you prefer symbol-free circuits.
 
 - **CRT:** Chinese Remainder Theorem clock formed by residues mod $P,Q,R$.
 - **QFT:** Quantum Fourier Transform (period-finding on public schedule).
-- **"PHASE":** label used in $\Phi_t = H(\cdot \| \text{"PHASE"})$.
-- **"EXP":** label used in exponent derivation $e_j = H(\cdot \| \text{"EXP"})$.
-- **"KDF":** key-derivation label for $K_i(t)$.
-- **"TOK":** token-derivation label for $T_i(t)$.
-- **"EVOLVE":** seed-evolution label for $S_{t+1}$.
-- **"PERMKEY":** label used to derive the device-only permutation key `perm_key`.
-- **"PERMSEED":** label used to derive the per-block shuffle seed (stable within a block).
-- **"PERM":** optional label for the permutation output itself (if you serialize it).
+
+Tags used for domain separation (same meaning, two equivalent spellings):
+- **TAG_PHASE** (a.k.a. `"PHASE"`): label used in $\Phi_t = H(\cdot \| \text{TAG\_PHASE})$.
+- **TAG_EXP** (a.k.a. `"EXP"`): label used in exponent derivation $e_j = H(\cdot \| \text{TAG\_EXP})$.
+- **TAG_KDF** (a.k.a. `"KDF"`): key-derivation label for $K_i(t)$.
+- **TAG_TOK** (a.k.a. `"TOK"`): token-derivation label for $T_i(t)$.
+- **TAG_EVOLVE** (a.k.a. `"EVOLVE"`): seed-evolution label for $S_{t+1}$.
+- **TAG_PERMKEY** (a.k.a. `"PERMKEY"`): label used to derive the device-only permutation key `perm_key`.
+- **TAG_PERMSEED** (a.k.a. `"PERMSEED"`): label used to derive the per-block shuffle seed (stable within a block).
+- **TAG_PERM** (a.k.a. `"PERM"`): optional label for the permutation output itself (only if you serialize it).
+
 
 ### 3.1 Seed construction and coprime extraction
 The device bootstraps a root seed $Z$ from device-local entropy and context (for example: device secret, serial, provider list, and a boot nonce). In the demo, $Z$ is produced by a deterministic RNG seeded with `--seed`, then bound to labels with $H(\cdot)$:
 
-- $\mathrm{perm\_key} = H(Z \| \text{"PERMKEY"})$
+- $\mathrm{perm\_key} = H(Z \| \text{TAG\_PERMKEY})$
 - $S_0 = H(Z \| \text{"SEED"})$
 - $W_i = \mathrm{Trunc}_k(H(Z \| \text{"W"} \| i))$
 
@@ -232,8 +235,8 @@ $$
 EA_i(t) &= \mathrm{Eval}(\mathrm{BouquetA}_i, a_t, u_1), \\
 EB_i(t) &= \mathrm{Eval}(\mathrm{BouquetB}_i, b_t, u_2), \\
 EC_i(t) &= \mathrm{Eval}(\mathrm{BouquetC}_i, c_t, u_3), \\
-K_i(t) &= H\!\left(i \| EA_i(t) \| EB_i(t) \| EC_i(t) \| \Phi_t \| \text{"KDF"}\right), \\
-T_i(t) &= \mathrm{Trunc}_k\!\left(H\!\left(K_i(t) \| t \| \Phi_t \| \text{"TOK"}\right)\right).
+K_i(t) &= H\!\left(i \| EA_i(t) \| EB_i(t) \| EC_i(t) \| \Phi_t \| \text{TAG\_KDF}\right), \\
+T_i(t) &= \mathrm{Trunc}_k\!\left(H\!\left(K_i(t) \| t \| \Phi_t \| \text{TAG\_TOK}\right)\right).
 \end{aligned}
 $$
 
@@ -268,7 +271,7 @@ Then encode:
 
 - `encP(a_t) = I2OSP(a_t, ℓP)` and similarly `encQ`, `encR`, `encM`
 - `enc_i(i) = I2OSP(i, ℓi)`, `enc_t(t) = I2OSP(t, ℓt)`
-- ASCII labels are included as literal bytes: `b"PHASE"`, `b"EXP"`, `b"KDF"`, `b"TOK"`, ...
+- **Domain-separation tags** are appended as *constant bytes* (e.g. `TAG_PHASE = b"PHASE"`, `TAG_EXP = b"EXP"`, `TAG_KDF = b"KDF"`, `TAG_TOK = b"TOK"`, ...). Do **not** run these tags through integer encoders: you literally append the bytes. If you want symbol-free hardware, replace the byte tags with fixed-width numeric tag constants (e.g. `u32`) and serialize with `I2OSP(tag, 4)`—the only requirement is that each tag value is distinct.
 
 With this convention, the main digests become:
 
@@ -276,20 +279,20 @@ $$
 \Phi_t = H\!\left(
 \mathrm{encP}(a_t)\|\mathrm{encQ}(b_t)\|\mathrm{encR}(c_t)\|
 \mathrm{encM}(u_1)\|\mathrm{encM}(u_2)\|\mathrm{encM}(u_3)\|
-\text{"PHASE"}
+\text{TAG\_PHASE}
 \right)
 $$
 
 $$
-e_j = H\!\left(\mathrm{encRes}(x_{\mathrm{res}})\|\mathrm{encM}(u)\|\mathrm{encU32}(j)\|\text{"EXP"}\right)\bmod (M-1)
+e_j = H\!\left(\mathrm{encRes}(x_{\mathrm{res}})\|\mathrm{encM}(u)\|\mathrm{encU32}(j)\|\text{TAG\_EXP}\right)\bmod (M-1)
 $$
 
 $$
-K_i(t)=H\!\left(\mathrm{enc_i}(i)\|\mathrm{encM}(EA_i(t))\|\mathrm{encM}(EB_i(t))\|\mathrm{encM}(EC_i(t))\|\Phi_t\|\text{"KDF"}\right)
+K_i(t)=H\!\left(\mathrm{enc_i}(i)\|\mathrm{encM}(EA_i(t))\|\mathrm{encM}(EB_i(t))\|\mathrm{encM}(EC_i(t))\|\Phi_t\|\text{TAG\_KDF}\right)
 $$
 
 $$
-T_i(t)=\mathrm{Trunc}_k\!\left(H\!\left(K_i(t)\|\mathrm{enc_t}(t)\|\Phi_t\|\text{"TOK"}\right)\right)
+T_i(t)=\mathrm{Trunc}_k\!\left(H\!\left(K_i(t)\|\mathrm{enc_t}(t)\|\Phi_t\|\text{TAG\_TOK}\right)\right)
 $$
 
 Where $\mathrm{Trunc}_k$ can mean “take the first $k$ bits” (most common), or “interpret as integer and reduce mod $2^k$”. The demo uses byte truncation.
@@ -323,7 +326,7 @@ $$
 Phase digest:
 
 $$
-\Phi_t = H\!\left(a_t \| b_t \| c_t \| u_1 \| u_2 \| u_3 \| \text{"PHASE"}\right).
+\Phi_t = H\!\left(a_t \| b_t \| c_t \| u_1 \| u_2 \| u_3 \| \text{TAG\_PHASE}\right).
 $$
 
 ### 5.2 Permutation schedule (“returns every x”)
@@ -358,7 +361,7 @@ Providers do not know $\mathrm{perm\_key}$, so the schedule is blinded from them
 Each bouquet is a list of compounds $C_j$, each a product of primes. For a residue $x_{\mathrm{res}}$ and coupling $u$, define:
 
 $$
-e_j = H\!\left(x_{\mathrm{res}} \| u \| j \| \text{"EXP"}\right) \bmod (M-1).
+e_j = H\!\left(x_{\mathrm{res}} \| u \| j \| \text{TAG\_EXP}\right) \bmod (M-1).
 $$
 
 $$
@@ -391,13 +394,13 @@ The demo exposes these families via compound generation modes while keeping the 
 Key derivation (domain-separated by lane identifier $i$):
 
 $$
-K_i(t) = H\!\left(i \| EA_i(t) \| EB_i(t) \| EC_i(t) \| \Phi_t \| \text{"KDF"}\right).
+K_i(t) = H\!\left(i \| EA_i(t) \| EB_i(t) \| EC_i(t) \| \Phi_t \| \text{TAG\_KDF}\right).
 $$
 
 Token:
 
 $$
-T_i(t) = \mathrm{Trunc}_k\!\left(H\!\left(K_i(t) \| t \| \Phi_t \| \text{"TOK"}\right)\right).
+T_i(t) = \mathrm{Trunc}_k\!\left(H\!\left(K_i(t) \| t \| \Phi_t \| \text{TAG\_TOK}\right)\right).
 $$
 
 Implementation notes:
@@ -429,7 +432,7 @@ Computed public phase values:
 
 - $a_t=9$, $b_t=10$, $c_t=12$
 - $u_1=14$, $u_2=6$, $u_3=13$
-- $\Phi_t = \mathrm{SHA256}(\texttt{09 0a 0c 0e 06 0d} \| \text{"PHASE"}) = \texttt{0x809eec62…}$
+- $\Phi_t = \mathrm{SHA256}(\texttt{09 0a 0c 0e 06 0d} \| \text{TAG\_PHASE}) = \texttt{0x809eec62…}$
 
 Computed bouquet exponents and evaluations (all exponents reduced mod $18$):
 
@@ -439,8 +442,8 @@ Computed bouquet exponents and evaluations (all exponents reduced mod $18$):
 
 Final key and token:
 
-- $K_2(t)=\mathrm{SHA256}(i\|EA\|EB\|EC\|\Phi_t\|\text{"KDF"})=\texttt{0x4ca0cd19…}$
-- $T_2(t)=\mathrm{Trunc}_{64}(\mathrm{SHA256}(K_2(t)\|t\|\Phi_t\|\text{"TOK"}))=\texttt{0x548c40b9091d8ed7}$
+- $K_2(t)=\mathrm{SHA256}(i\|EA\|EB\|EC\|\Phi_t\|\text{TAG\_KDF})=\texttt{0x4ca0cd19…}$
+- $T_2(t)=\mathrm{Trunc}_{64}(\mathrm{SHA256}(K_2(t)\|t\|\Phi_t\|\text{TAG\_TOK}))=\texttt{0x548c40b9091d8ed7}$
 
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
@@ -501,7 +504,7 @@ $$
 
 $$
 S_{t+1} = H\!\left(
-S_t \| W_0 \| \cdots \| W_{x-1} \| m_0 \| \cdots \| m_{x-2} \| \Phi_t \| \text{"EVOLVE"}
+S_t \| W_0 \| \cdots \| W_{x-1} \| m_0 \| \cdots \| m_{x-2} \| \Phi_t \| \text{TAG\_EVOLVE}
 \right).
 $$
 
