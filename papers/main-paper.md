@@ -91,23 +91,23 @@ Each provider $i$ has three secret bouquets: $\mathrm{BouquetA}_i, \mathrm{Bouqu
 To avoid accidental cross-use of hashes (“domain confusion”), **every hash that serves a distinct role appends a distinct domain tag**.
 
 Glossary:
-- **CRT clock:** the public schedule formed by the three residues mod \(P,Q,R\).
-- **Lane / provider:** one of \(x\) independent validators that each own distinct secrets.
+- **CRT clock:** the public schedule formed by the three residues mod $P,Q,R$.
+- **Lane / provider:** one of $x$ independent validators that each own distinct secrets.
 - **Bouquet:** a per-lane list of modular bases (typically composite “prime compounds”) used in the modular product.
 - **QFT:** quantum Fourier transform (period finding) — optional analysis tool that can reveal *public* periods.
 
 Domain tags (constants) used in this paper:
-- `TAG_SEED` — derive the initial evolving state \(S_0\)
-- `TAG_W` — derive per-lane memory words \(W_i^{(0)}\)
-- `TAG_PRIME` — derive candidate primes for \(P,Q,R\) (and optionally \(M\))
-- `TAG_A0`, `TAG_B0`, `TAG_C0` — derive **public** phase offsets \(a_0,b_0,c_0\)
+- `TAG_SEED` — derive the initial evolving state $S_0$
+- `TAG_W` — derive per-lane memory words $W_i^{(0)}$
+- `TAG_PRIME` — derive candidate primes for $P,Q,R$ (and optionally $M$)
+- `TAG_A0`, `TAG_B0`, `TAG_C0` — derive **public** phase offsets $a_0,b_0,c_0$
 - `TAG_PERMKEY` — derive the device-only permutation key `perm_key`
-- `TAG_PERMSEED` — derive the per-block shuffle seed used by \(\pi_B\)
-- `TAG_PHASE` — domain tag for the phase digest \(\Phi_t\)
-- `TAG_EXP` — domain tag for bouquet exponent derivation \(e_j\)
-- `TAG_KDF` — domain tag for per-lane key material \(K_i(t)\)
-- `TAG_TOK` — domain tag for the final emitted token \(T_i(t)\)
-- `TAG_EVOLVE` — domain tag for state evolution \(S_{t+1}\)
+- `TAG_PERMSEED` — derive the per-block shuffle seed used by $\pi_B$
+- `TAG_PHASE` — domain tag for the phase digest $\Phi_t$
+- `TAG_EXP` — domain tag for bouquet exponent derivation $e_j$
+- `TAG_KDF` — domain tag for per-lane key material $K_i(t)$
+- `TAG_TOK` — domain tag for the final emitted token $T_i(t)$
+- `TAG_EVOLVE` — domain tag for state evolution $S_{t+1}$
 
 ### 3.1 Seed construction and coprime extraction
 The device bootstraps a root seed $Z$ from device-local entropy and context (for example: device secret, serial, provider list, and a boot nonce). In the demo, $Z$ is produced by a deterministic RNG seeded with `--seed`, then bound to labels with $H(\cdot)$:
@@ -273,14 +273,14 @@ flowchart TD
 
 ### 5.0 Canonical encoding and concatenation (unambiguous hash inputs)
 
-The operator `||` / \(\|\) in the formulas means **byte-string concatenation**. Implementations **MUST** use a canonical serialization so that different tuples cannot map to the same byte string (classic “`1|23` vs `12|3`” bug).
+The operator `||` / $\|$ in the formulas means **byte-string concatenation**. Implementations **MUST** use a canonical serialization so that different tuples cannot map to the same byte string (classic “`1|23` vs `12|3`” bug).
 
 Use fixed-length big-endian integer encoding (**I2OSP**) with lengths derived from the public moduli:
 
-- \(\ell_P=\lceil\log_2(P)/8\rceil\), \(\ell_Q\), \(\ell_R\), \(\ell_M\) similarly
-- lane identifier: \(\ell_i=4\) bytes (`enc_i(i) = I2OSP(i,4)`) unless you need a larger ID space
-- cycle counter: \(\ell_t=8\) bytes (`enc_t(t) = I2OSP(t,8)`) unless you expect more than \(2^{64}\) cycles
-- small indices (bouquet element index \(j\), prime-candidate index \(k\), …): `encU32(n) = I2OSP(n,4)`
+- $\ell_P=\lceil\log_2(P)/8\rceil$, $\ell_Q$, $\ell_R$, $\ell_M$ similarly
+- lane identifier: $\ell_i=4$ bytes (`enc_i(i) = I2OSP(i,4)`) unless you need a larger ID space
+- cycle counter: $\ell_t=8$ bytes (`enc_t(t) = I2OSP(t,8)`) unless you expect more than $2^{64}$ cycles
+- small indices (bouquet element index $j$, prime-candidate index $k$, …): `encU32(n) = I2OSP(n,4)`
 
 Encoding functions:
 
@@ -304,7 +304,7 @@ e_j = H\!\left(
 \mathrm{encRes}(x_{\mathrm{res}})\|\mathrm{encM}(u)\|\mathrm{encU32}(j)\|\mathrm{TAG\_EXP}
 \right) \bmod (M-1),
 $$
-where `encRes` is the residue encoder for \(a_t\) / \(b_t\) / \(c_t\) (use `encP`, `encQ`, or `encR` depending on which residue is in scope).
+where `encRes` is the residue encoder for $a_t$ / $b_t$ / $c_t$ (use `encP`, `encQ`, or `encR` depending on which residue is in scope).
 
 $$
 K_i(t)=H\!\left(
@@ -319,7 +319,7 @@ H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)
 \right).
 $$
 
-`Trunc_k` can mean “take the first \(k\) bits” (most common), or “interpret as an integer and reduce mod \(2^k\)”. The demo uses byte truncation.
+`Trunc_k` can mean “take the first $k$ bits” (most common), or “interpret as an integer and reduce mod $2^k$”. The demo uses byte truncation.
 
 **Rule of thumb:** never concatenate decimal strings, and never concatenate variable-length integers without either fixed widths or length-prefixes.
 
@@ -400,7 +400,7 @@ Providers do **not** know `perm_key`, so they cannot predict $\mathrm{idx}_t$ (e
 
 ### 5.3 Bouquet evaluation
 
-Each bouquet is a list of compounds \(C_j\), each a modular base (typically a product of primes). For a residue \(x_{\mathrm{res}}\) and coupling \(u\), define the per-element exponent:
+Each bouquet is a list of compounds $C_j$, each a modular base (typically a product of primes). For a residue $x_{\mathrm{res}}$ and coupling $u$, define the per-element exponent:
 
 $$
 e_j = H\!\left(
@@ -414,7 +414,7 @@ $$
 \mathrm{Eval}(\mathrm{Bouquet}, x_{\mathrm{res}}, u) = \prod_j C_j^{e_j} \bmod M.
 $$
 
-For provider \(i\):
+For provider $i$:
 
 $$
 \begin{aligned}
@@ -438,7 +438,7 @@ The demo exposes these families via compound generation modes while keeping the 
 
 ### 5.4 Token derivation
 
-Key derivation (domain-separated by lane identifier \(i\)):
+Key derivation (domain-separated by lane identifier $i$):
 
 $$
 K_i(t) = H\!\left(
@@ -456,9 +456,9 @@ H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)
 $$
 
 Implementation notes:
-- In code, \(K_i(t)\) is the **hash digest bytes** (not an integer).
+- In code, $K_i(t)$ is the **hash digest bytes** (not an integer).
 - When concatenating integers, always use the canonical fixed-length encoding (§5.0).
-- Including \(i\) inside the KDF provides explicit lane domain-separation even if two providers were accidentally provisioned with identical bouquets.
+- Including $i$ inside the KDF provides explicit lane domain-separation even if two providers were accidentally provisioned with identical bouquets.
 
 ### 5.4.1 Worked example with real integers (toy parameters + SHA-256)
 This example is **not** meant to be secure (the primes are tiny); it exists only to show the math and key composition end-to-end with concrete numbers.
@@ -632,12 +632,12 @@ flowchart LR
 
 ### 5.5 Device emission and state evolution
 
-The device computes only \(T_{\mathrm{idx}_t}(t)\) for the scheduled lane and updates internal state:
+The device computes only $T_{\mathrm{idx}_t}(t)$ for the scheduled lane and updates internal state:
 
-- \(W[i]\) is a per-lane **memory word**. Initialize as \(W_i^{(0)}\) (§3.1), then update only when lane \(i\) is active (e.g., store `Int(T) mod M` or store raw token bytes — choose one representation and encode it canonically in the hash below).
-- The seed \(S_t\) evolves using **all lanes** and adjacent products, so “inactive” lanes still influence the future through their last stored \(W[i]\).
+- $W[i]$ is a per-lane **memory word**. Initialize as $W_i^{(0)}$ (§3.1), then update only when lane $i$ is active (e.g., store `Int(T) mod M` or store raw token bytes — choose one representation and encode it canonically in the hash below).
+- The seed $S_t$ evolves using **all lanes** and adjacent products, so “inactive” lanes still influence the future through their last stored $W[i]$.
 
-For \(x\) lanes, define (non-cyclic adjacency):
+For $x$ lanes, define (non-cyclic adjacency):
 
 $$
 m_\ell = (W_\ell \cdot W_{\ell+1}) \bmod M, \quad \ell = 0,\ldots,x-2.
