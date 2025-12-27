@@ -27,7 +27,9 @@ Beyond PCPL, the same circuit can be “forked” by alternating variable sets o
 $$
 \begin{aligned}
 S_{t+1}^{(k)} &= H\!\left(C,\, S_t^{(k)},\, V_k,\, t\right), \\
-&\quad(T_i(t)) &= \mathrm{Trunc}_k\!\left(H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)\right).in W_k.
+T^{(k)}(t) &= \mathrm{Trunc}_k\!\left(
+H\!\left(K^{(k)}(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)
+\right),\quad t\in W_k.
 \end{aligned}
 $$
 
@@ -354,35 +356,46 @@ $$
 $$
 
 ### 5.2 Permutation schedule (“returns every x”)
-Let:
+
+The **schedule** (which provider is selected at each cycle) must be independent from the hashed token bytes.
+It is driven only by the public cycle counter and the device’s private permutation key.
+
+Define a block index and a slot inside that block:
 
 $$
-\begin{aligned}
-B &= \left\lfloor \frac{t}{x} \right\rfloor \\
-s = T_i(t) &= \mathrm{Trunc}_k\!\left(H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)\right) \bmod x
-\end{aligned}
+B = \left\lfloor \frac{t}{x} \right\rfloor,\qquad s = t \bmod x.
 $$
 
-Compute a permutation $\pi_B$ of $\{0,\ldots,x-1\}$ using a hash-driven shuffle seeded by a block-level phase digest (computed at $t = B\cdot x$) so the schedule is stable within each block. Then:
+For each block $B$, the device computes a permutation $\pi_B$ of $\{0,\ldots,x-1\}$ using a deterministic PRNG derived from:
+
+- the device-only `perm_key`
+- the block index $B$
+- the public digest $\Phi_{B\cdot x}$ (fixed for the block start)
+- the domain tag `TAG_PERMSEED`
+
+Then the selected lane for cycle $t$ is:
 
 $$
 \mathrm{idx}_t = \pi_B[s].
 $$
 
-This guarantees each provider appears exactly once per block.
+Because $\pi_B$ is a permutation, each lane appears **exactly once** per block of length $x$ (“returns every $x$”).
+Hashing and truncation happen *after* this selection and therefore cannot break the 1-of-$x$ property.
 
 ### 5.2.1 Device-side destination selection
-The device determines the current destination provider using only public phase data and its private permutation key:
+
+Using only public phase data and its private permutation key, the device computes:
 
 $$
 \begin{aligned}
-&B = \left\lfloor \frac{t}{x} \right\rfloor,\quad s =T_i(t) &= \mathrm{Trunc}_k\!\left(H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)\right).bmod x \\
-&\pi_B = \mathrm{Permute}\left(\mathrm{perm\_key}, B, \Phi_{B\cdot x}\right) \\
-&\mathrm{idx}_t = \pi_B[s]
+B &= \left\lfloor \frac{t}{x} \right\rfloor,\quad s = t \bmod x, \\
+\pi_B &= \mathrm{PermuteBlock}\left(\mathrm{perm\_key},\, B,\, \Phi_{B\cdot x},\, x\right), \\
+\mathrm{idx}_t &= \pi_B[s].
 \end{aligned}
 $$
 
-Providers do not know $\mathrm{perm\_key}$, so the schedule is blinded from them even though $t$ and $\Phi_t$ are public.
+Providers do **not** know `perm_key`, so they cannot predict $\mathrm{idx}_t$ (even though $t$ and $\Phi_t$ are public).
+
 
 ### 5.3 Bouquet evaluation
 
@@ -570,14 +583,25 @@ Both device and provider compute the same 256-bit hash output, then apply the sa
 Therefore truncation cannot “break synchronization” — it can only increase the chance that two different inputs collide in $k$ bits.
 Choose $k$ large enough for your threat model (e.g., 64 bits is already far beyond typical OTP sizes).
 
-#### D. Why this is “async”: providers don’t need the permutation key
-Providers do **not** need `perm_key` or $\pi_B$ to validate.
-They only validate *when contacted*:
+#### D. Why this is “async”: providers don’t need the permutation key (but they still run a synchronized circuit)
 
-- Device sends $(t, i, T)$ to provider $i$.
-- Provider computes $T_i(t)$ locally and checks equality.
+Providers do **not** need `perm_key` or $\pi_B$ to validate, because the expected token for lane $i$ at cycle $t$ is a pure function of:
 
-If $i$ is not the active lane at that time, the token simply won’t match — no schedule knowledge required.
+- public data: $t$ (or its epoch mapping) and $\Phi_t$
+- provider-$i$ secrets: $\mathrm{BouquetA}_i,\mathrm{BouquetB}_i,\mathrm{BouquetC}_i$
+- the agreed hash/KDF rules and domain tags
+
+What “async” means here is: **no extra coordination channel** is required to tell a provider *when* it will be selected.
+The provider simply runs the same per-cycle hash pipeline as the device (for its own lane only) and compares if/when a message arrives.
+
+Operationally:
+
+- Every cycle, provider $i$ advances its local counter to the current $t$ (using the same public epoch mapping as the device) and computes $T_i(t)$.
+- Most cycles there is no message; the computed token is discarded.
+- When a device message arrives claiming $(t, i, T)$, provider $i$ compares $T$ against its locally generated $T_i(t)$
+  (optionally checking a small $\pm\Delta$ window for clock skew / network jitter).
+
+Because the device contacts each provider **exactly once per block of length $x$**, a given provider sees a *matching* token only **1 time out of $x$ cycles** (and rejects/mismatches the other $x-1$).
 
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
@@ -586,20 +610,22 @@ flowchart LR
     t["cycle t"] --> Phi["Φ_t (public)"]
     Phi --> Perm["idx_t = π_B[t mod x] (device-only)"]
     Perm --> Lane["choose lane i = idx_t"]
-    Lane --> Ki["K_i(t) = SHA256(i||EA||EB||EC||Φ_t||TAG_KDF)"]
-    Ki --> Tok["T = Trunc_k(SHA256(K_i(t)||t||Φ_t||TAG_TOK))"]
+    Lane --> Ki["K_i(t) = H(i||EA||EB||EC||Φ_t||TAG_KDF)"]
+    Ki --> Tok["T = Trunc_k(H(K_i(t)||t||Φ_t||TAG_TOK))"]
+    Tok --> Send["send (t,i,T)"]
   end
 
-  subgraph Provider_i["Provider i (no permutation key)"]
-    Rt["receives: (t, i, T)"] --> RPhi["recompute Φ_t (public)"]
-    RPhi --> RKi["recompute K_i(t) (lane secrets)"]
-    RKi --> RTok["recompute T_i(t) then truncate"]
-    RTok --> Check{"T == T_i(t)?"}
+  subgraph Provider_i["Provider i (continuous validator)"]
+    Clock["public epoch → local t"] --> Loop["every cycle: compute Φ_t, EA/EB/EC, K_i(t), T_i(t)"]
+    Loop --> Buf["buffer T_i(t) (±Δ window)"]
+    Rx["receive (t,i,T)"] --> Cmp["constant-time compare"]
+    Buf --> Cmp
+    Cmp --> Match{"match & unused?"}
+    Match -->|yes| Accept["accept (≈1/x cycles)"]
+    Match -->|no| Reject["reject / ignore (≈x-1/x cycles)"]
   end
 
-  Tok --> Rt
-  Check -->|yes| Accept["accept"]
-  Check -->|no| Reject["reject/ignore"]
+  Send --> Rx
 ```
 
 
@@ -626,8 +652,25 @@ $$
 
 Implementation note: if \(W[i]\) and \(m_\ell\) are stored as integers, serialize them with `encM(·)` (or another fixed-width encoder) before hashing.
 
-### 5.6 Provider verification
-Provider $i$ recomputes $T_i(t)$ and accepts the token if it matches.
+### 5.6 Provider verification (continuous hashing circuit)
+
+A provider is **not** a passive “checker that wakes up at the right permutation time”.
+To be able to validate in constant time (and to match the intended hardware/circuit model), provider $i$ runs a synchronized per-cycle pipeline that continuously derives its current expected token.
+
+Minimal runtime behavior:
+
+1. **Clock discipline / epoch mapping.** Maintain a local view of the public cycle counter $t$ (e.g., from NTP/GPS time, a block height, or any agreed public epoch-to-$t$ mapping).
+2. **Per-cycle update.** For each cycle $t$, compute $\Phi_t$, then evaluate bouquets and derive:
+   $EA_i(t), EB_i(t), EC_i(t) \rightarrow K_i(t) \rightarrow T_i(t)$.
+3. **Small validation window (optional).** Keep $T_i(t)$ plus a small $\pm\Delta$ window (e.g., previous/next few cycles) to tolerate network delay and small clock skew.
+4. **On receive.** When a message arrives with $(t, i, T)$:
+   - reject if $i$ is not this provider’s identifier
+   - reject if $t$ is outside the allowed window
+   - constant-time compare $T$ with the locally buffered expected token(s)
+   - accept at most once per cycle (track recently accepted $(i,t)$ to prevent trivial replay inside the skew window)
+
+**Acceptance frequency:** because the device selects each provider exactly once per block of length $x$, provider $i$ will see a valid match only about **1 time in $x$ cycles**. All other cycles either have no message or produce a mismatch by construction.
+
 
 ### 5.7 Device-side vs provider-side variables
 The protocol deliberately separates what the device computes from what providers can infer:
@@ -743,24 +786,62 @@ Notes:
 - `Expand(seed)` is any deterministic method to obtain enough pseudorandom bytes from `seed`
   (e.g., `H(seed||0)`, `H(seed||1)`, …). Both device and any party that needs to recompute `π_B`
   must use the **same** expansion.
-- Providers do **not** need `perm_key` and do not need to know `π_B` to validate: they only verify when contacted.
+- Providers do **not** need `perm_key` and do not need to know `π_B` to validate. In practice they run the per-cycle hash pipeline continuously and compare against the current (or ±Δ window) expected token when contacted.
 
 
 ## 6. Correctness and periodicity
 
 ### 6.1 Exact 1-of-x matching
-Within each block of length $x$, $\pi_B$ is a permutation. Therefore each provider index appears exactly once per block, and exactly one provider matches per cycle.
 
-### 6.2 Phase periodicity
-The phase clock is three modular counters: $a_t = (a_0 + t) \bmod P$ and likewise for $b_t$ and $c_t$. The joint state repeats after the least common multiple of their moduli, so the period is $\mathrm{lcm}(P,Q,R)$. When $P,Q,R$ are pairwise coprime (i.e., $\gcd(P,Q)=\gcd(P,R)=\gcd(Q,R)=1$), the lcm is $PQR$.
+Within each block of length $x$, the device computes a permutation $\pi_B$ of $\{0,\ldots,x-1\}$ and selects:
 
-The *schedule* also depends on the block index $B=\lfloor t/x \rfloor$ and the slot $s =T_i(t) &= \mathrm{Trunc}_k\!\left(H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)\right).bmod x$, so the combined public schedule repeats after $\mathrm{lcm}(P,Q,R,x)$. If $x$ is coprime to each of $P,Q,R$ (i.e., $\gcd(P,x)=\gcd(Q,x)=\gcd(R,x)=1$), then the schedule period is exactly $PQRx$. 
+$$
+\mathrm{idx}_t = \pi_B[t \bmod x].
+$$
 
-If $x$ shares a factor with any of $P,Q,R$, the combined period is smaller. This periodicity is purely about the public clock; the choice of compound bases (even “blend” composites) does not change it, as long as those bases remain coprime with $M$.
+As the slot $s=t\bmod x$ runs through $0,1,\ldots,x-1$ inside the same block $B$, the permutation property guarantees that each lane identifier appears **exactly once**.
+Therefore:
+
+- in every block of $x$ cycles, the device contacts each provider exactly once
+- each provider $i$ will see a *matching* token only on its single scheduled cycle in that block (≈ **1 time out of $x$**)
+
+Hashing and truncation do not affect this property because they happen after lane selection.
+
+### 6.2 Phase and schedule periodicity
+
+The public phase clock is defined by three modular counters:
+
+$$
+a_t=(a_0+t)\bmod P,\quad b_t=(b_0+t)\bmod Q,\quad c_t=(c_0+t)\bmod R.
+$$
+
+The triple $(a_t,b_t,c_t)$ repeats with period:
+
+$$
+L = \mathrm{lcm}(P,Q,R).
+$$
+
+If $P,Q,R$ are pairwise coprime, then $L=PQR$.
+The derived values $u_1,u_2,u_3$ and the phase digest $\Phi_t$ are deterministic functions of $(a_t,b_t,c_t)$, so they repeat with the same period $L$.
+
+The lane-selection schedule adds the block structure of length $x$.
+If the permutation were fixed, combining phase period and block slotting would yield an overall cycle-period of $\mathrm{lcm}(L,x)$.
+In PCPL the permutation is *re-derived per block* from $(\mathrm{perm\_key}, B, \Phi_{B\cdot x})$, so practical repetition is pushed out further and is dominated by:
+
+- the phase period $L$ (public)
+- the block counter wrap-around implied by the chosen encoding length for $B$ (e.g., $2^{32}$ blocks if `encU32(B)` is used)
 
 ### 6.3 Modular exponent correctness
-With $M$ prime, the multiplicative group $\mathbb{F}_M^{\ast}$ has order $M-1$.
-Reducing exponents modulo $M-1$ makes $C_j^{e_j} \bmod M$ well-defined for any base $C_j$ with $\gcd(C_j, M)=1$. This holds for primes and composite compounds alike; the only disallowed case is a base sharing a factor with $M$, which would collapse the product (e.g., $C_j \equiv 0 \bmod M$).
+
+The `Eval(·)` step uses modular exponentiation and products modulo $M$.
+To keep these operations well-defined and avoid degenerate values, enforce:
+
+- **Coprime bases:** each base used in a product must be coprime with $M$ (in particular, not divisible by $M$), otherwise terms collapse (e.g., $C\equiv 0\pmod M$).
+- **Group arithmetic:** if $M$ is prime, the multiplicative group $\mathbb{F}_M^{\ast}$ has order $M-1$, so exponents can be reduced modulo $M-1$ without changing the result.
+  (If $M$ is composite, use a group where the reduction rule is explicit, or keep full-width exponents.)
+
+These checks belong in provisioning and bouquet generation, not at verification time.
+
 
 ### 6.4 Peer-count variations (x=2,3,4 and composite counts)
 Changing $x$ changes the block size, the number of permutations, and the chain width:
@@ -772,9 +853,9 @@ Changing $x$ changes the block size, the number of permutations, and the chain w
 | 4 | 4 | 24 | 3 | $2^2$ prime power |
 | 6 | 6 | 720 | 5 | composite ($2 \cdot 3$) |
 
-In general: block length $= x$, permutation space $= x!$, chain width $= x-1$,
-and schedule period $= \mathrm{lcm}(P,Q,R,x)$. For composite $x$ (e.g., $6=2\cdot 3$),
-choose $P,Q,R$ coprime with all prime factors of $x$ to avoid shrinking the period.
+In general: block length $= x$, permutation space $= x!$, chain width $= x-1$.
+The public phase repeats with period $\mathrm{lcm}(P,Q,R)$; the $x$-cycle block structure is an additional factor, and re-deriving $\pi_B$ per block pushes repetition out further (bounded in practice by the counter wrap-around of the chosen block encoding).
+For composite $x$ (e.g., $6=2\cdot 3$), choose $P,Q,R$ coprime with all prime factors of $x$ to avoid shrinking the phase/block interaction period.
 
 ## 7. Security intuition (informal)
 - **Lane isolation:** each provider uses distinct secret bouquets, so observing one lane does not reveal others.
