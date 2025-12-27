@@ -293,33 +293,33 @@ Domain tags (`TAG_PHASE`, `TAG_EXP`, `TAG_KDF`, `TAG_TOK`, …) are fixed byte s
 
 With this convention, the core digests become:
 
-\[
+$$
 \Phi_t = H\!\left(
 \mathrm{encP}(a_t)\|\mathrm{encQ}(b_t)\|\mathrm{encR}(c_t)\|
 \mathrm{encM}(u_1)\|\mathrm{encM}(u_2)\|\mathrm{encM}(u_3)\|
 \mathrm{TAG\_PHASE}
 \right).
-\]
+$$
 
-\[
+$$
 e_j = H\!\left(
 \mathrm{encRes}(x_{\mathrm{res}})\|\mathrm{encM}(u)\|\mathrm{encU32}(j)\|\mathrm{TAG\_EXP}
 \right) \bmod (M-1),
-\]
+$$
 where `encRes` is the residue encoder for \(a_t\) / \(b_t\) / \(c_t\) (use `encP`, `encQ`, or `encR` depending on which residue is in scope).
 
-\[
+$$
 K_i(t)=H\!\left(
 \mathrm{enc\_i}(i)\|\mathrm{encM}(EA_i(t))\|\mathrm{encM}(EB_i(t))\|\mathrm{encM}(EC_i(t))\|
 \Phi_t\|\mathrm{TAG\_KDF}
 \right),
-\]
+$$
 
-\[
+$$
 T_i(t)=\mathrm{Trunc}_k\!\left(
 H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)
 \right).
-\]
+$$
 
 `Trunc_k` can mean “take the first \(k\) bits” (most common), or “interpret as an integer and reduce mod \(2^k\)”. The demo uses byte truncation.
 
