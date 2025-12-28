@@ -61,6 +61,7 @@ def main() -> None:
 
     pcpl = load_pcpl_module()
     build_params = pcpl["build_params"]
+    build_compound_config = pcpl["build_compound_config"]
     build_fixture = pcpl["build_fixture"]
     phase_clock = pcpl["phase_clock"]
     lane_token = pcpl["lane_token"]
@@ -68,7 +69,18 @@ def main() -> None:
     permutation_for_block = pcpl["permutation_for_block"]
 
     params = build_params(args.x, args.token_bits)
-    secrets, state = build_fixture(params, args.seed)
+    compound_cfg = build_compound_config(
+        args.seed,
+        params,
+        num_compounds=4,
+        primes_per_compound=3,
+        compound_mode="classic",
+        compound_offset=0,
+        compound_prime_bits=0,
+        compound_pool_size=len(pcpl["PRIME_POOL"]),
+        pool_label="COMPOUND_POOL",
+    )
+    secrets, state = build_fixture(params, args.seed, compound_cfg)
 
     block_count = math.ceil(cycles / params.x)
     block_perms = []

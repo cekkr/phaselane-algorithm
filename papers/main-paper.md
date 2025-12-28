@@ -330,6 +330,8 @@ $$
 
 **Rule of thumb:** never concatenate decimal strings, and never concatenate variable-length integers without either fixed widths or length-prefixes.
 
+Demo note: the Python demo uses BLAKE2b and a typed, length-prefixed encoding for each hash part (tag + 4-byte length) instead of fixed-width I2OSP. Older demo runs omitted `enc_i(i)` in the KDF; the current demo includes it to match the spec, so token traces differ from earlier runs.
+
 ### 5.1 Phase clock
 Public offsets $a_0,b_0,c_0$ are part of the public configuration (§3.1.1).
 
@@ -887,14 +889,14 @@ For PDF export, the original wide table was replaced with an A4-friendly summary
 
 | t | block | slot | idx_t | device token (truncated) | matched provider |
 |---:|---:|---:|---:|---|---:|
-| 0 | 0 | 0 | 3 | `0xaa81443d…6e0e02` | 3 |
-| 1 | 0 | 1 | 0 | `0x21faa3d7…2dbe77` | 0 |
-| 2 | 0 | 2 | 2 | `0x888b2137…903179` | 2 |
-| 3 | 0 | 3 | 1 | `0xa591e8bf…03b4b4` | 1 |
-| 4 | 1 | 0 | 2 | `0x5da9a61c…1d52ff` | 2 |
-| 5 | 1 | 1 | 0 | `0x8abe0866…9d17b6` | 0 |
-| 6 | 1 | 2 | 1 | `0x39d33ef1…6fd92e` | 1 |
-| 7 | 1 | 3 | 3 | `0xe25bb134…064674` | 3 |
+| 0 | 0 | 0 | 3 | `0x26a948bf…f41dad` | 3 |
+| 1 | 0 | 1 | 0 | `0x836c0804…81b666` | 0 |
+| 2 | 0 | 2 | 2 | `0xcef769d5…d84a2d` | 2 |
+| 3 | 0 | 3 | 1 | `0x2eadad9a…dfc010` | 1 |
+| 4 | 1 | 0 | 2 | `0x38dc632f…99ff75` | 2 |
+| 5 | 1 | 1 | 0 | `0xf0f6cad1…1df52f` | 0 |
+| 6 | 1 | 2 | 1 | `0x05e8f0c6…8b22b4` | 1 |
+| 7 | 1 | 3 | 3 | `0x082dd884…a7b325` | 3 |
 
 ```mermaid
 %%{init: {"theme":"neutral"} }%%
@@ -905,14 +907,14 @@ sequenceDiagram
   participant P2 as Provider 2
   participant P3 as Provider 3
 
-  D->>P3: t=0  0xaa81443d…6e0e02
-  D->>P0: t=1  0x21faa3d7…2dbe77
-  D->>P2: t=2  0x888b2137…903179
-  D->>P1: t=3  0xa591e8bf…03b4b4
-  D->>P2: t=4  0x5da9a61c…1d52ff
-  D->>P0: t=5  0x8abe0866…9d17b6
-  D->>P1: t=6  0x39d33ef1…6fd92e
-  D->>P3: t=7  0xe25bb134…064674
+  D->>P3: t=0  0x26a948bf…f41dad
+  D->>P0: t=1  0x836c0804…81b666
+  D->>P2: t=2  0xcef769d5…d84a2d
+  D->>P1: t=3  0x2eadad9a…dfc010
+  D->>P2: t=4  0x38dc632f…99ff75
+  D->>P0: t=5  0xf0f6cad1…1df52f
+  D->>P1: t=6  0x05e8f0c6…8b22b4
+  D->>P3: t=7  0x082dd884…a7b325
 ```
 
 ### 8.2 Full token trace (verbatim values)

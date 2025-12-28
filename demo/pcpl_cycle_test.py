@@ -403,13 +403,13 @@ def qft_report(params: Params) -> None:
     print(f"qft-period: {period} (~{period.bit_length()} bits)")
 
 
-def lane_token(_index: int, t: int, phase: Phase, params: Params, secrets: ProviderSecrets) -> int:
+def lane_token(lane_idx: int, t: int, phase: Phase, params: Params, secrets: ProviderSecrets) -> int:
     """Shared per-cycle token derivation used by device and provider circuits."""
     ea = eval_bouquet(secrets.bouquetA, phase.a, phase.u1, params)
     eb = eval_bouquet(secrets.bouquetB, phase.b, phase.u2, params)
     ec = eval_bouquet(secrets.bouquetC, phase.c, phase.u3, params)
 
-    kdf = h_bytes(ea, eb, ec, phase.phi, "KDF", out_len=32)
+    kdf = h_bytes(lane_idx, ea, eb, ec, phase.phi, "KDF", out_len=32)
     tok_hash = h_bytes(kdf, t, phase.phi, "TOK", out_len=max(32, params.token_bytes))
     return trunc_bits(tok_hash, params.token_bits)
 

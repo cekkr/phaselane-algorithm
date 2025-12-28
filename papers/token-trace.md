@@ -51,104 +51,104 @@ $$
 
 | t | device token | matches provider |
 | --- | --- | --- |
-| 0 | `0xaa81443db40b5b1c43097327166e0e02` | P3 |
-| 1 | `0x21faa3d7dacdd0e36103bdf69b2dbe77` | P0 |
-| 2 | `0x888b21379781bc887f5d778c7b903179` | P2 |
-| 3 | `0xa591e8bf0845bb6a46322befc003b4b4` | P1 |
-| 4 | `0x5da9a61cd51d3ff367ba3113eb1d52ff` | P2 |
-| 5 | `0x8abe0866002f7ce535808b65879d17b6` | P0 |
-| 6 | `0x39d33ef184e9b1ddde964a83f06fd92e` | P1 |
-| 7 | `0xe25bb134f354591bc4575918a9064674` | P3 |
-| 8 | `0xc56aa5739df722c31e25cd016960b0fc` | P0 |
-| 9 | `0x5c02f89f89b84cb8257ad888fa3d9957` | P1 |
-| 10 | `0x3707398b4758b9a1737c9911ac1a9812` | P2 |
-| 11 | `0x3a0fc3432c4dd5ff8a8446a3102bd2de` | P3 |
-| 12 | `0xc4b3f3bae0d20b9750b43f66c88f642c` | P3 |
-| 13 | `0xf968d10c70dbbb379d3e3508c2251622` | P2 |
-| 14 | `0x615f4764ec38edccd78387d2203d56eb` | P1 |
-| 15 | `0x93af54dd5d79da451932ab9b4df9451f` | P0 |
+| 0 | `0x26a948bfe8744adc11eaf6581af41dad` | P3 |
+| 1 | `0x836c0804ae7691c04f9d2d4c8e81b666` | P0 |
+| 2 | `0xcef769d59b261f6241ee5ebeadd84a2d` | P2 |
+| 3 | `0x2eadad9a993ea91790bb8d88c0dfc010` | P1 |
+| 4 | `0x38dc632f8371dc3088c196be4f99ff75` | P2 |
+| 5 | `0xf0f6cad1e40167de4c91541b8b1df52f` | P0 |
+| 6 | `0x05e8f0c6699d789e756252ca0c8b22b4` | P1 |
+| 7 | `0x082dd88477ec3e1371b84b9c3fa7b325` | P3 |
+| 8 | `0xef6fba3df9b96843be9c9d8be84aa803` | P0 |
+| 9 | `0xa41a32780d86f44293b54f32f9adf2ff` | P1 |
+| 10 | `0x0b3951610e59ba3ea7dd9da4efe5a719` | P2 |
+| 11 | `0xab503463aa5c1dd76ee86ac0f530c21c` | P3 |
+| 12 | `0xe7a776729d6c1a78a90a39e4919d6cd6` | P3 |
+| 13 | `0x073739610a8e36b5c7cd72ad08282b73` | P2 |
+| 14 | `0x95e579907d48fe7c58c526f31abefc39` | P1 |
+| 15 | `0xcd12b0e85bc096fc80ea802b3924b751` | P0 |
 
 ## Provider lane P0
 
 | t | P0 token | match |
 | --- | --- | --- |
-| 0 | `0xeeafece1251ccf687691135f062cb4d7` |  |
-| 1 | `0x21faa3d7dacdd0e36103bdf69b2dbe77` | match |
-| 2 | `0x88ad5efb2c5761de52f141d23bc88540` |  |
-| 3 | `0x816f62b524482e9f535a2554d1b201a4` |  |
-| 4 | `0xfbcc12ba1996112e91f04f5e5752007b` |  |
-| 5 | `0x8abe0866002f7ce535808b65879d17b6` | match |
-| 6 | `0xaf724603668afe9e530ec505758015fd` |  |
-| 7 | `0x69e26d5ca4b56e5ea99891eaaf15792c` |  |
-| 8 | `0xc56aa5739df722c31e25cd016960b0fc` | match |
-| 9 | `0xae80b360eb05a477cb2ac8ea2dd786bf` |  |
-| 10 | `0x420b9e2d7ad7cdb5d0d4b487303f2f83` |  |
-| 11 | `0x43fa9c9ceaf9dfb8484de6bd801cbd8f` |  |
-| 12 | `0x1e85d55fdc37d0c649ac9f87f969b652` |  |
-| 13 | `0xb0e25671a557959fa14f17691393990f` |  |
-| 14 | `0xc87fefc64d406946a9e3faf2c82584d6` |  |
-| 15 | `0x93af54dd5d79da451932ab9b4df9451f` | match |
+| 0 | `0xc29c0fa323a5fe882a289611da4020ae` |  |
+| 1 | `0x836c0804ae7691c04f9d2d4c8e81b666` | match |
+| 2 | `0x8a7235a62729b131bb9e736f808e31c2` |  |
+| 3 | `0xaee80105c4272be33ebe3c05b4fd9adf` |  |
+| 4 | `0xab086b99464a6f83c4433df5a3373310` |  |
+| 5 | `0xf0f6cad1e40167de4c91541b8b1df52f` | match |
+| 6 | `0x665fb251c4849019d91317ce0e3983a9` |  |
+| 7 | `0xdcd5d1512418db2ccd9088ea172e307b` |  |
+| 8 | `0xef6fba3df9b96843be9c9d8be84aa803` | match |
+| 9 | `0x92e422480933c50d69f9ad18c363b6b9` |  |
+| 10 | `0x70e13909ab856e218d7a2e255ce1a6c8` |  |
+| 11 | `0x9a66501cdf007b0187664ddbcd954226` |  |
+| 12 | `0x0cf96ac9d00aadcbb60d991712eb6392` |  |
+| 13 | `0xf973f687ec93806d0a9a752b821fb777` |  |
+| 14 | `0x7f8d6923ae85ba945fdd79f39ce059b1` |  |
+| 15 | `0xcd12b0e85bc096fc80ea802b3924b751` | match |
 
 ## Provider lane P1
 
 | t | P1 token | match |
 | --- | --- | --- |
-| 0 | `0xed74cbe26554bf9a270f1d1d90dcb25d` |  |
-| 1 | `0xfcb1104a0c0ba7f9fa257abb65f4484f` |  |
-| 2 | `0x673bce6b3a80330a1421b1bcf7102326` |  |
-| 3 | `0xa591e8bf0845bb6a46322befc003b4b4` | match |
-| 4 | `0xdfb35020bcc5eda2736a65a8660cd188` |  |
-| 5 | `0xc64b06a0c2b808e627c3fe2910f0536d` |  |
-| 6 | `0x39d33ef184e9b1ddde964a83f06fd92e` | match |
-| 7 | `0x5c0d14d5cabd38ca17d323d54d8f0bcf` |  |
-| 8 | `0x31e897180054b0ace446266558de4576` |  |
-| 9 | `0x5c02f89f89b84cb8257ad888fa3d9957` | match |
-| 10 | `0x05853bcdb9a0f096c698c1a8345420a1` |  |
-| 11 | `0xd4565699201a3440b4cb70c15c48f3c8` |  |
-| 12 | `0x3d49f02aaf8349cabff87adf656dddfb` |  |
-| 13 | `0x298d005a6185ac15562addf92fa945c2` |  |
-| 14 | `0x615f4764ec38edccd78387d2203d56eb` | match |
-| 15 | `0x295062766449b339d2babc59ab90d7bc` |  |
+| 0 | `0x01b83b97648c1c78aafe66f3b3e7c4b5` |  |
+| 1 | `0xa5255e45521cfe81f1ef6313f328155c` |  |
+| 2 | `0xd4c2acb4d90acfe62ad1ead5ef76e536` |  |
+| 3 | `0x2eadad9a993ea91790bb8d88c0dfc010` | match |
+| 4 | `0xe2ad20c11371675181d5a4df5b6401f6` |  |
+| 5 | `0x8fad0ddb0e870c877005b9ca41740e3b` |  |
+| 6 | `0x05e8f0c6699d789e756252ca0c8b22b4` | match |
+| 7 | `0x4f269b5332813c2467b5afef3b1700b8` |  |
+| 8 | `0x48c354a73990e79c7ccd39cbf1123183` |  |
+| 9 | `0xa41a32780d86f44293b54f32f9adf2ff` | match |
+| 10 | `0xc0524cf1266fdefff9c652e67c2dd4a1` |  |
+| 11 | `0x4593dff57b3131b28e88d1d013666416` |  |
+| 12 | `0xeedf53ea8cf944a71f3b3d7d17b70d13` |  |
+| 13 | `0xc2422f24eac1c1b0c5b75b021295d981` |  |
+| 14 | `0x95e579907d48fe7c58c526f31abefc39` | match |
+| 15 | `0x4f512ed504dc8282a7de482240cee1d9` |  |
 
 ## Provider lane P2
 
 | t | P2 token | match |
 | --- | --- | --- |
-| 0 | `0xf84da16f0a9d23ca92b9598c2cccc4fb` |  |
-| 1 | `0xb7f7f5fb372075bde5349158efa5fca9` |  |
-| 2 | `0x888b21379781bc887f5d778c7b903179` | match |
-| 3 | `0x8593eef83487f09b5b30612843e00397` |  |
-| 4 | `0x5da9a61cd51d3ff367ba3113eb1d52ff` | match |
-| 5 | `0x1715f8e9f51c0129907481780e0d03bc` |  |
-| 6 | `0x9dd506512423c063f94c259c4517aff2` |  |
-| 7 | `0xffa8817c6c4d6b3806705a3446de34ba` |  |
-| 8 | `0x4d202a4ce2de455dd2f12d699a8e2b65` |  |
-| 9 | `0xcb3d5d9c1fcbefebd131ee67788f7e5c` |  |
-| 10 | `0x3707398b4758b9a1737c9911ac1a9812` | match |
-| 11 | `0x5dd99772024b726362467dafd4a6ad5f` |  |
-| 12 | `0x645bc475ddc85d3edd5fda65e100737f` |  |
-| 13 | `0xf968d10c70dbbb379d3e3508c2251622` | match |
-| 14 | `0xa9af89ad1e47092f6cb6e3ff59f49430` |  |
-| 15 | `0xad5621c5d6a249f4fd6cc130133e8e4a` |  |
+| 0 | `0xbcc5ceef7ad9dd3a453a647266f58e8b` |  |
+| 1 | `0x25f1ec79d68bad2619532a452865948b` |  |
+| 2 | `0xcef769d59b261f6241ee5ebeadd84a2d` | match |
+| 3 | `0xa132f160bdc16d7ff1c6e5e2da83b039` |  |
+| 4 | `0x38dc632f8371dc3088c196be4f99ff75` | match |
+| 5 | `0x5448bcdb4abf138787d4d2f4a3430bcf` |  |
+| 6 | `0x7de687e1f02bbae86d2619bd1f173a42` |  |
+| 7 | `0x23cfd4cc9a73636a5133bea067147316` |  |
+| 8 | `0x36cc138cc36842553684611a53ee88bd` |  |
+| 9 | `0x9153dd45c446faf735797d7fbf46bf00` |  |
+| 10 | `0x0b3951610e59ba3ea7dd9da4efe5a719` | match |
+| 11 | `0x6be422395bb50dc1e06a7d0710453e8c` |  |
+| 12 | `0x188e93bce21b4b82eb5b971692289b64` |  |
+| 13 | `0x073739610a8e36b5c7cd72ad08282b73` | match |
+| 14 | `0x345d0e29369201b5c0bf3f232156e2c0` |  |
+| 15 | `0x70eb74eceddb16a9321dca51e09dbf00` |  |
 
 ## Provider lane P3
 
 | t | P3 token | match |
 | --- | --- | --- |
-| 0 | `0xaa81443db40b5b1c43097327166e0e02` | match |
-| 1 | `0xcb440e82f41dd12c05d861a210208faa` |  |
-| 2 | `0x39001496e37a7d61dcd0b67485376618` |  |
-| 3 | `0xc204fbda03f97faa7bcf2a6b737960b3` |  |
-| 4 | `0x0984a1b59d2493b60a85a6b186402bf0` |  |
-| 5 | `0x7a42a0eae1727b8d0b41996c692ad5e3` |  |
-| 6 | `0xa2a9e6284b90f8fa643db155f801e918` |  |
-| 7 | `0xe25bb134f354591bc4575918a9064674` | match |
-| 8 | `0x9dcc87ed4663e699f271be1c571433e1` |  |
-| 9 | `0xa1aec92a45a9b8309c51ebeae3708f91` |  |
-| 10 | `0xf7ddca66eb47f0744b70b1cecffef59f` |  |
-| 11 | `0x3a0fc3432c4dd5ff8a8446a3102bd2de` | match |
-| 12 | `0xc4b3f3bae0d20b9750b43f66c88f642c` | match |
-| 13 | `0xb1dbfeaa9135401f55cb6c6aa769a19b` |  |
-| 14 | `0xd3deef9dbdd25c405c3af02dd6784ee5` |  |
-| 15 | `0x53ecfce7eeab443e8223131846a1cc4a` |  |
+| 0 | `0x26a948bfe8744adc11eaf6581af41dad` | match |
+| 1 | `0x5435b8a411cce3d305d413f494c37247` |  |
+| 2 | `0xca0fc50325422456b87e30820f96bdfe` |  |
+| 3 | `0x5597ff795bc6e480ef2f6b7865bd3086` |  |
+| 4 | `0xe58dceddf9a91dccebc34b1aea318d5b` |  |
+| 5 | `0xe21e3a97c983211fc2b8503e6d01d5da` |  |
+| 6 | `0x0fe6b016191fc319d3d04db997a2c16e` |  |
+| 7 | `0x082dd88477ec3e1371b84b9c3fa7b325` | match |
+| 8 | `0x47e2b829b3922acfc9f294240d171989` |  |
+| 9 | `0x0250b1d1b2c1f1f682a52cee87a61791` |  |
+| 10 | `0xd7e0c4a287ebba428d46583c4ad037e8` |  |
+| 11 | `0xab503463aa5c1dd76ee86ac0f530c21c` | match |
+| 12 | `0xe7a776729d6c1a78a90a39e4919d6cd6` | match |
+| 13 | `0x8e9fbc708db74369097f14ea99786ab0` |  |
+| 14 | `0xa589707d29a1e1a8741747e3ed2f7a83` |  |
+| 15 | `0x93aeeba22230f0877ca0b20471abade3` |  |
 
