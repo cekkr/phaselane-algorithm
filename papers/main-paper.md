@@ -113,12 +113,12 @@ Domain tags (constants) used in this paper:
 The device bootstraps a root seed $Z$ from device-local entropy and context (for example: device secret, serial, provider list, and a boot nonce). In the demo, $Z$ is produced by a deterministic RNG seeded with `--seed`, then bound to labels with $H(\cdot)$:
 
 - $\mathrm{perm\_key} = H(Z \| \text{TAG\_PERMKEY})$
-- $S_0 = H(Z \| \text{"SEED"})$
-- $W_i = \mathrm{Trunc}_k(H(Z \| \text{"W"} \| i))$
+- $S_0 = H(Z \| \text{TAG\_SEED})$
+- $W_i = \mathrm{Trunc}_k(H(Z \| \text{W} \| i))$
 
 To extrapolate coprimes for $P,Q,R$ (and optionally $M$), derive candidates from a seeded stream and select the first primes that are distinct and coprime with $x$:
 
-1. $c_k \leftarrow \mathrm{next\_prime}(H(Z \| \text{"PRIME"} \| k) \bmod 2^b)$
+1. $c_k \leftarrow \mathrm{next\_prime}(H(Z \| \text{PRIME} \| k) \bmod 2^b)$
 2. accept $c_k$ if $\gcd(c_k, x)=1$ and $c_k \notin \{P,Q,R,M\}$
 3. continue until $P,Q,R$ (and $M$ if generated) are assigned
 
@@ -128,9 +128,9 @@ The phase clock in §5.1 uses **public offsets** $a_0\in[0,P)$, $b_0\in[0,Q)$, $
 
 A simple deterministic derivation (used in the demo) is:
 
-- $a_0 = H(Z \| \text{"A0"}) \bmod P$
-- $b_0 = H(Z \| \text{"B0"}) \bmod Q$
-- $c_0 = H(Z \| \text{"C0"}) \bmod R$
+- $a_0 = H(Z \| \text{A0}) \bmod P$
+- $b_0 = H(Z \| \text{B0}) \bmod Q$
+- $c_0 = H(Z \| \text{C0}) \bmod R$
 
 Even if derived from the device root seed $Z$, these offsets are treated as **published configuration**, together with $x, P, Q, R$ (and $M$ if used). Equivalently, you can derive them from a separate *public* setup seed $Z_{\text{pub}}$.
 
