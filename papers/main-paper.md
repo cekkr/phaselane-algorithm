@@ -4,7 +4,7 @@
 
 # Prime-Compound Phase-Lane Token Protocol (PCPL) for Symmetric Continuous Tokenizer Devices
 
-### Continuous symmetric key generator using asymmetric keys
+### Continuous symmetric encryption starting from asymmetric keys
 
 Version 1.5 - 29 December 2025
 
