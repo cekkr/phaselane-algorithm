@@ -1,5 +1,3 @@
-
-
 | Author | Contact | Date |
 |---|---|---|
 | Riccardo Cecchini | rcecchini.ds[at]gmail.com | 25 December 2025 |
@@ -8,15 +6,15 @@
 
 ### Continuous symmetric key generator using asymmetric keys
 
-Version 1.4 - 28 December 2025
+Version 1.5 - 29 December 2025
 
 ## Abstract
-I present the Prime-Compound Phase-Lane Token Protocol (PCPL), a no-handshake token system where a device emits one token per cycle and exactly one provider can validate it. PCPL combines (1) a public phase clock derived from coprime residues, (2) hidden prime-compound bouquets per provider, and (3) device-only state evolution that chains all lanes. I also introduce the symmetric continuous tokenizer device model, motivated by FPGA-based dynamic hash circuits and twin circuits for peer validation. A step-by-step algorithm description, correctness properties, and a deterministic simulation trace are provided.
+I present the Prime-Compound Phase-Lane Token Protocol (PCPL), a no-handshake token system where a device emits one token per cycle and exactly one provider can validate it. PCPL combines (1) a public phase clock derived from coprime residues, (2) hidden prime-compound bouquets per provider, and (3) device-only state evolution that chains all lanes. I also introduce the symmetric continuous tokenizer device model, motivated by FPGA-based dynamic hash circuits and twin circuits for peer validation. A step-by-step algorithm description, correctness properties, and a deterministic simulation trace are provided. [1][2][3][15][16]
 
 ## 1. Symmetric continuous tokenizer devices
 PCPL runs on a “symmetric continuous tokenizer” device designed for consumer computing. The device is envisioned as a reconfigurable hardware unit (for example, an FPGA-based key) that can:
 
-- Acquire unique, device-specific hashing circuits or internal start variables.
+- Acquire unique, device-specific hashing circuits or internal start variables. [15][16]
 - Continuously generate short-lived tokens or keys.
 - Be validated only by its twin circuit(s), which share the same circuit family or seed lineage.
 
@@ -79,7 +77,7 @@ Let:
 - $x$ be the number of providers (lanes).
 - $P, Q, R$ be pairwise coprime primes (also coprime with $x$).
 - $M$ be a prime modulus for multiplicative-group arithmetic.
-- $H(\cdot)$ be a cryptographic hash (or a dynamic hash circuit).
+- $H(\cdot)$ be a cryptographic hash (or a dynamic hash circuit). [1][2][3]
 - $\mathrm{Trunc}_k(\cdot)$ be truncation to $k$ bits.
 - $t$ be the cycle counter.
 - $\|$ denote byte/bit-string concatenation.
@@ -88,13 +86,13 @@ Each provider $i$ has three secret bouquets: $\mathrm{BouquetA}_i, \mathrm{Bouqu
 
 ### 3.0 Symbols and domain tags
 
-To avoid accidental cross-use of hashes (“domain confusion”), **every hash that serves a distinct role appends a distinct domain tag**.
+To avoid accidental cross-use of hashes (“domain confusion”), **every hash that serves a distinct role appends a distinct domain tag**. [9][5]
 
 Glossary:
-- **CRT clock:** the public schedule formed by the three residues mod $P,Q,R$.
+- **CRT clock:** the public schedule formed by the three residues mod $P,Q,R$. [20]
 - **Lane / provider:** one of $x$ independent validators that each own distinct secrets.
 - **Bouquet:** a per-lane list of modular bases (typically composite “prime compounds”) used in the modular product.
-- **QFT:** quantum Fourier transform (period finding) — optional analysis tool that can reveal *public* periods.
+- **QFT:** quantum Fourier transform (period finding [18][19]) — optional analysis tool that can reveal *public* periods. [18][19]
 
 Domain tags (constants) used in this paper:
 - `SEED` — derive the initial evolving state $S_0$
@@ -105,7 +103,7 @@ Domain tags (constants) used in this paper:
 - `PERMSEED` — derive the per-block shuffle seed used by $\pi_B$
 - `PHASE` — domain tag for the phase digest $\Phi_t$
 - `EXP` — domain tag for bouquet exponent derivation $e_j$
-- `KDF` — domain tag for per-lane key material $K_i(t)$
+- `KDF` — domain tag for per-lane key material $K_i(t)$ [10][5]
 - `TOK` — domain tag for the final emitted token $T_i(t)$
 - `EVOLVE` — domain tag for state evolution $S_{t+1}$
 
@@ -282,7 +280,7 @@ which lane index is used and whether device-only state is updated.
 
 The operator `||` / $\|$ in the formulas means **byte-string concatenation**. Implementations **MUST** use a canonical serialization so that different tuples cannot map to the same byte string (classic “`1|23` vs `12|3`” bug).
 
-Use fixed-length big-endian integer encoding (**I2OSP**) with lengths derived from the public moduli:
+Use fixed-length big-endian integer encoding (**I2OSP [8]**) with lengths derived from the public moduli:
 
 - $\ell_P=\lceil\log_2(P)/8\rceil$, $\ell_Q$, $\ell_R$, $\ell_M$ similarly
 - lane identifier: $\ell_i=4$ bytes (`enc_i(i) = I2OSP(i,4)`) unless you need a larger ID space
@@ -328,9 +326,9 @@ $$
 
 `Trunc_k` can mean “take the first $k$ bits” (most common), or “interpret as an integer and reduce mod $2^k$”. The demo uses byte truncation.
 
-**Rule of thumb:** never concatenate decimal strings, and never concatenate variable-length integers without either fixed widths or length-prefixes.
+**Rule of thumb:** never concatenate decimal strings, and never concatenate variable-length integers without either fixed widths or length-prefixes. [9]
 
-Demo note: the Python demo uses BLAKE2b and a typed, length-prefixed encoding for each hash part (tag + 4-byte length) instead of fixed-width I2OSP. Older demo runs omitted `enc_i(i)` in the KDF; the current demo includes it to match the spec, so token traces differ from earlier runs.
+Demo note: the Python demo uses BLAKE2b [3] and a typed, length-prefixed encoding for each hash part (tag + 4-byte length) instead of fixed-width I2OSP. Older demo runs omitted `enc_i(i)` in the KDF; the current demo includes it to match the spec, so token traces differ from earlier runs.
 
 ### 5.1 Phase clock
 Public offsets $a_0,b_0,c_0$ are part of the public configuration (§3.1.1).
@@ -468,8 +466,9 @@ Implementation notes:
 - In code, $K_i(t)$ is the **hash digest bytes** (not an integer).
 - When concatenating integers, always use the canonical fixed-length encoding (§5.0).
 - Including $i$ inside the KDF provides explicit lane domain-separation even if two providers were accidentally provisioned with identical bouquets.
+- If you prefer a standardized PRF/KDF wrapper, use HMAC or HKDF with explicit context labels. [4][5][10]
 
-### 5.4.1 Worked example with real integers (toy parameters + SHA-256)
+### 5.4.1 Worked example with real integers (toy parameters + SHA-256 [1])
 This example is **not** meant to be secure (the primes are tiny); it exists only to show the math and key composition end-to-end with concrete numbers.
 
 Parameters:
@@ -628,7 +627,7 @@ flowchart LR
   subgraph Provider_i["Provider i (continuous validator)"]
     Clock["public epoch → local t"] --> Loop["every cycle: compute Φ_t, EA/EB/EC, K_i(t), T_i(t)"]
     Loop --> Buf["buffer T_i(t) (±Δ window)"]
-    Rx["receive (t,i,T)"] --> Cmp["constant-time compare"]
+    Rx["receive (t,i,T)"] --> Cmp["constant-time compare"] [17]
     Buf --> Cmp
     Cmp --> Match{"match & unused?"}
     Match -->|yes| Accept["accept (≈1/x cycles)"]
@@ -669,7 +668,7 @@ To be able to validate in constant time (and to match the intended hardware/circ
 
 Minimal runtime behavior:
 
-1. **Clock discipline / epoch mapping.** Maintain a local view of the public cycle counter $t$ (e.g., from NTP/GPS time, a block height, or any agreed public epoch-to-$t$ mapping).
+1. **Clock discipline / epoch mapping.** Maintain a local view of the public cycle counter $t$ (e.g., from NTP[13]/GPS time, a block height, or any agreed public epoch-to-$t$ mapping).; conceptually similar to the moving factor in HOTP/TOTP) [11][12]
 2. **Per-cycle update.** For each cycle $t$, compute $\Phi_t$, then evaluate bouquets and derive:
    $EA_i(t), EB_i(t), EC_i(t) \rightarrow K_i(t) \rightarrow T_i(t)$.
 3. **Small validation window (optional).** Keep $T_i(t)$ plus a small $\pm\Delta$ window (e.g., previous/next few cycles) to tolerate network delay and small clock skew.
@@ -738,7 +737,7 @@ function Phase(t):
     return (a,b,c,u1,u2,u3,Phi)
 
 function PermuteBlock(perm_key, B, Phi_block, x):
-    # Deterministic Fisher–Yates using hash-derived bytes as a PRNG stream.
+    # Deterministic Fisher–Yates [14] using hash-derived bytes as a PRNG stream. [6][7]
     # Stable for the whole block B.
     seed = H( perm_key || encU32(B) || Phi_block || PERMSEED )
     L = [0,1,2,...,x-1]
@@ -973,8 +972,52 @@ Full multi-configuration outputs (additional compound modes and seeds) are in `p
 - The permutation schedule is device-only; leakage of the permutation key can reveal lane order, but not lane tokens.
 - The security of the scheme relies on the strength of $H(\cdot)$ and the secrecy of bouquets, not on the hardness of factoring revealed integers.
 - The public period $\mathrm{lcm}(P,Q,R,x)$ is visible (and QFT-recoverable), so period size should be chosen large enough for the deployment horizon.
-- For testing, primes and compound bases can be generated from a seeded stream to avoid arbitrary constants.
+- For testing, primes and compound bases can be generated from a seeded stream to avoid arbitrary constants. [6][7]
 - This paper was developed and formatted with the help of OpenAI models.
 
 ## 10. Conclusion
 PCPL provides a deterministic, no-handshake token protocol with exact 1-of-$x$ matching and a device-only chaining mechanism. Combined with symmetric continuous tokenizer devices, it supports both provider validation and peer-to-peer isolation with dynamic, evolving secrets. The included simulation and trace demonstrate the protocol’s behavior cycle by cycle.
+
+## References
+1. [NIST FIPS 180-4 (Update 1), *Secure Hash Standard (SHS)*](https://csrc.nist.gov/pubs/fips/180-4/upd1/final)
+2. [NIST FIPS 202, *SHA-3 Standard: Permutation-Based Hash and Extendable-Output Functions*](https://csrc.nist.gov/pubs/fips/202/final)
+3. [RFC 7693, *The BLAKE2 Cryptographic Hash and Message Authentication Code*](https://www.rfc-editor.org/rfc/rfc7693.html)
+4. [RFC 2104, *HMAC: Keyed-Hashing for Message Authentication*](https://www.rfc-editor.org/rfc/rfc2104.html)
+5. [RFC 5869, *HMAC-based Extract-and-Expand Key Derivation Function (HKDF)*](https://datatracker.ietf.org/doc/html/rfc5869)
+6. [NIST SP 800-90A Rev. 1, *Recommendation for Random Number Generation Using Deterministic RBGs*](https://csrc.nist.gov/pubs/sp/800/90/a/r1/final)
+7. [RFC 4086, *Randomness Requirements for Security*](https://datatracker.ietf.org/doc/html/rfc4086)
+8. [RFC 8017, *PKCS #1: RSA Cryptography Specifications Version 2.2* (I2OSP/OS2IP)](https://www.rfc-editor.org/rfc/rfc8017.html)
+9. [NIST SP 800-185, *SHA-3 Derived Functions: cSHAKE, KMAC, TupleHash, and ParallelHash*](https://csrc.nist.gov/pubs/sp/800/185/final)
+10. [NIST SP 800-56C Rev. 2, *Recommendation for Key-Derivation Methods in Key-Establishment Schemes*](https://csrc.nist.gov/pubs/sp/800/56/c/r2/final)
+11. [RFC 4226, *HOTP: An HMAC-Based One-Time Password Algorithm*](https://www.rfc-editor.org/rfc/rfc4226.html)
+12. [RFC 6238, *TOTP: Time-Based One-Time Password Algorithm*](https://www.rfc-editor.org/rfc/rfc6238.html)
+13. [RFC 5905, *Network Time Protocol Version 4 (NTPv4)*](https://www.rfc-editor.org/rfc/rfc5905.html)
+14. [R. Durstenfeld (1964), “Algorithm 235: Random permutation”, *Communications of the ACM* 7(7)](https://dl.acm.org/doi/10.1145/364520.364540)
+15. [B. Gassend et al. (2002), “Controlled Physical Random Functions”, (PUFs)](https://people.csail.mit.edu/devadas/pubs/cpuf.pdf)
+16. [G. E. Suh & S. Devadas (2007), “Physical Unclonable Functions for Device Authentication and Secret Key Generation”, DAC ’07](https://people.csail.mit.edu/devadas/pubs/puf-dac07.pdf)
+17. [P. C. Kocher (1996), “Timing Attacks on Implementations of Diffie-Hellman, RSA, DSS, and Other Systems”, CRYPTO ’96](https://paulkocher.com/doc/TimingAttacks.pdf)
+18. [P. W. Shor (1994), “Algorithms for Quantum Computation: Discrete Logarithms and Factoring”, FOCS ’94](https://dl.acm.org/doi/10.1109/SFCS.1994.365700)
+19. [M. A. Nielsen & I. L. Chuang, *Quantum Computation and Quantum Information* (Cambridge University Press)](https://books.google.it/books?id=-s4DEy7o-a0C)
+20. [A. Menezes, P. van Oorschot, S. Vanstone, *Handbook of Applied Cryptography* (CRC Press; online edition)](https://cacr.uwaterloo.ca/hac/about/chap2.pdf)
+
+
+[1]: https://csrc.nist.gov/pubs/fips/180-4/upd1/final
+[2]: https://csrc.nist.gov/pubs/fips/202/final
+[3]: https://www.rfc-editor.org/rfc/rfc7693.html
+[4]: https://www.rfc-editor.org/rfc/rfc2104.html
+[5]: https://datatracker.ietf.org/doc/html/rfc5869
+[6]: https://csrc.nist.gov/pubs/sp/800/90/a/r1/final
+[7]: https://datatracker.ietf.org/doc/html/rfc4086
+[8]: https://www.rfc-editor.org/rfc/rfc8017.html
+[9]: https://csrc.nist.gov/pubs/sp/800/185/final
+[10]: https://csrc.nist.gov/pubs/sp/800/56/c/r2/final
+[11]: https://www.rfc-editor.org/rfc/rfc4226.html
+[12]: https://www.rfc-editor.org/rfc/rfc6238.html
+[13]: https://www.rfc-editor.org/rfc/rfc5905.html
+[14]: https://dl.acm.org/doi/10.1145/364520.364540
+[15]: https://people.csail.mit.edu/devadas/pubs/cpuf.pdf
+[16]: https://people.csail.mit.edu/devadas/pubs/puf-dac07.pdf
+[17]: https://paulkocher.com/doc/TimingAttacks.pdf
+[18]: https://dl.acm.org/doi/10.1109/SFCS.1994.365700
+[19]: https://books.google.it/books?id=-s4DEy7o-a0C
+[20]: https://cacr.uwaterloo.ca/hac/about/chap2.pdf
