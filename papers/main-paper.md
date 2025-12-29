@@ -29,7 +29,7 @@ $$
 \begin{aligned}
 S_{t+1}^{(k)} &= H\!\left(C,\, S_t^{(k)},\, V_k,\, t\right), \\
 T^{(k)}(t) &= \mathrm{Trunc}_k\!\left(
-H\!\left(K^{(k)}(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)
+H\!\left(K^{(k)}(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TOK}\right)
 \right),\quad t\in W_k.
 \end{aligned}
 $$
@@ -97,23 +97,23 @@ Glossary:
 - **QFT:** quantum Fourier transform (period finding) — optional analysis tool that can reveal *public* periods.
 
 Domain tags (constants) used in this paper:
-- `TAG_SEED` — derive the initial evolving state $S_0$
-- `TAG_W` — derive per-lane memory words $W_i^{(0)}$
-- `TAG_PRIME` — derive candidate primes for $P,Q,R$ (and optionally $M$)
-- `TAG_A0`, `TAG_B0`, `TAG_C0` — derive **public** phase offsets $a_0,b_0,c_0$
-- `TAG_PERMKEY` — derive the device-only permutation key `perm_key`
-- `TAG_PERMSEED` — derive the per-block shuffle seed used by $\pi_B$
-- `TAG_PHASE` — domain tag for the phase digest $\Phi_t$
-- `TAG_EXP` — domain tag for bouquet exponent derivation $e_j$
-- `TAG_KDF` — domain tag for per-lane key material $K_i(t)$
-- `TAG_TOK` — domain tag for the final emitted token $T_i(t)$
-- `TAG_EVOLVE` — domain tag for state evolution $S_{t+1}$
+- `SEED` — derive the initial evolving state $S_0$
+- `W` — derive per-lane memory words $W_i^{(0)}$
+- `PRIME` — derive candidate primes for $P,Q,R$ (and optionally $M$)
+- `A0`, `B0`, `C0` — derive **public** phase offsets $a_0,b_0,c_0$
+- `PERMKEY` — derive the device-only permutation key `perm_key`
+- `PERMSEED` — derive the per-block shuffle seed used by $\pi_B$
+- `PHASE` — domain tag for the phase digest $\Phi_t$
+- `EXP` — domain tag for bouquet exponent derivation $e_j$
+- `KDF` — domain tag for per-lane key material $K_i(t)$
+- `TOK` — domain tag for the final emitted token $T_i(t)$
+- `EVOLVE` — domain tag for state evolution $S_{t+1}$
 
 ### 3.1 Seed construction and coprime extraction
 The device bootstraps a root seed $Z$ from device-local entropy and context (for example: device secret, serial, provider list, and a boot nonce). In the demo, $Z$ is produced by a deterministic RNG seeded with `--seed`, then bound to labels with $H(\cdot)$:
 
-- $\mathrm{perm\_key} = H(Z \| \text{TAG\_PERMKEY})$
-- $S_0 = H(Z \| \text{TAG\_SEED})$
+- $\mathrm{perm\_key} = H(Z \| \text{PERMKEY})$
+- $S_0 = H(Z \| \text{SEED})$
 - $W_i = \mathrm{Trunc}_k(H(Z \| \text{W} \| i))$
 
 To extrapolate coprimes for $P,Q,R$ (and optionally $M$), derive candidates from a seeded stream and select the first primes that are distinct and coprime with $x$:
@@ -245,10 +245,10 @@ EA_i(t) &= \mathrm{Eval}(\mathrm{BouquetA}_i, a_t, u_1), \\
 EB_i(t) &= \mathrm{Eval}(\mathrm{BouquetB}_i, b_t, u_2), \\
 EC_i(t) &= \mathrm{Eval}(\mathrm{BouquetC}_i, c_t, u_3), \\
 K_i(t) &= H\!\left(
-\mathrm{enc\_i}(i)\|\mathrm{encM}(EA_i(t))\|\mathrm{encM}(EB_i(t))\|\mathrm{encM}(EC_i(t))\|\Phi_t\|\mathrm{TAG\_KDF}
+\mathrm{enc\_i}(i)\|\mathrm{encM}(EA_i(t))\|\mathrm{encM}(EB_i(t))\|\mathrm{encM}(EC_i(t))\|\Phi_t\|\mathrm{KDF}
 \right), \\
 T_i(t) &= \mathrm{Trunc}_k\!\left(
-H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)
+H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TOK}\right)
 \right).
 \end{aligned}
 $$
@@ -294,7 +294,7 @@ Encoding functions:
 - `encP(a) = I2OSP(a, ℓP)` and similarly `encQ`, `encR`, `encM`
 - `enc_i(i) = I2OSP(i, ℓi)`, `enc_t(t) = I2OSP(t, ℓt)`
 
-Domain tags (`TAG_PHASE`, `TAG_EXP`, `TAG_KDF`, `TAG_TOK`, …) are fixed byte strings as defined in §3.0 and are appended **as-is**. If you prefer numeric tags, serialize the numeric constant with `I2OSP(tag, 4)` (or any fixed width) — the only requirement is uniqueness.
+Domain tags (`PHASE`, `EXP`, `KDF`, `TOK`, …) are fixed byte strings as defined in §3.0 and are appended **as-is**. If you prefer numeric tags, serialize the numeric constant with `I2OSP(tag, 4)` (or any fixed width) — the only requirement is uniqueness.
 
 With this convention, the core digests become:
 
@@ -302,13 +302,13 @@ $$
 \Phi_t = H\!\left(
 \mathrm{encP}(a_t)\|\mathrm{encQ}(b_t)\|\mathrm{encR}(c_t)\|
 \mathrm{encM}(u_1)\|\mathrm{encM}(u_2)\|\mathrm{encM}(u_3)\|
-\mathrm{TAG\_PHASE}
+\mathrm{PHASE}
 \right).
 $$
 
 $$
 e_j = H\!\left(
-\mathrm{encRes}(x_{\mathrm{res}})\|\mathrm{encM}(u)\|\mathrm{encU32}(j)\|\mathrm{TAG\_EXP}
+\mathrm{encRes}(x_{\mathrm{res}})\|\mathrm{encM}(u)\|\mathrm{encU32}(j)\|\mathrm{EXP}
 \right) \bmod (M-1),
 $$
 where `encRes` is the residue encoder for $a_t$ / $b_t$ / $c_t$ (use `encP`, `encQ`, or `encR` depending on which residue is in scope).
@@ -316,13 +316,13 @@ where `encRes` is the residue encoder for $a_t$ / $b_t$ / $c_t$ (use `encP`, `en
 $$
 K_i(t)=H\!\left(
 \mathrm{enc\_i}(i)\|\mathrm{encM}(EA_i(t))\|\mathrm{encM}(EB_i(t))\|\mathrm{encM}(EC_i(t))\|
-\Phi_t\|\mathrm{TAG\_KDF}
+\Phi_t\|\mathrm{KDF}
 \right),
 $$
 
 $$
 T_i(t)=\mathrm{Trunc}_k\!\left(
-H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)
+H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TOK}\right)
 \right).
 $$
 
@@ -361,7 +361,7 @@ $$
 \Phi_t = H\!\left(
 \mathrm{encP}(a_t)\|\mathrm{encQ}(b_t)\|\mathrm{encR}(c_t)\|
 \mathrm{encM}(u_1)\|\mathrm{encM}(u_2)\|\mathrm{encM}(u_3)\|
-\mathrm{TAG\_PHASE}
+\mathrm{PHASE}
 \right).
 $$
 
@@ -381,7 +381,7 @@ For each block $B$, the device computes a permutation $\pi_B$ of $\{0,\ldots,x-1
 - the device-only `perm_key`
 - the block index $B$
 - the public digest $\Phi_{B\cdot x}$ (fixed for the block start)
-- the domain tag `TAG_PERMSEED`
+- the domain tag `PERMSEED`
 
 Then the selected lane for cycle $t$ is:
 
@@ -413,7 +413,7 @@ Each bouquet is a list of compounds $C_j$, each a modular base (typically a prod
 
 $$
 e_j = H\!\left(
-\mathrm{encRes}(x_{\mathrm{res}})\|\mathrm{encM}(u)\|\mathrm{encU32}(j)\|\mathrm{TAG\_EXP}
+\mathrm{encRes}(x_{\mathrm{res}})\|\mathrm{encM}(u)\|\mathrm{encU32}(j)\|\mathrm{EXP}
 \right) \bmod (M-1).
 $$
 
@@ -452,7 +452,7 @@ Key derivation (domain-separated by lane identifier $i$):
 $$
 K_i(t) = H\!\left(
 \mathrm{enc\_i}(i)\|\mathrm{encM}(EA_i(t))\|\mathrm{encM}(EB_i(t))\|\mathrm{encM}(EC_i(t))\|
-\Phi_t\|\mathrm{TAG\_KDF}
+\Phi_t\|\mathrm{KDF}
 \right).
 $$
 
@@ -460,7 +460,7 @@ Token:
 
 $$
 T_i(t) = \mathrm{Trunc}_k\!\left(
-H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TAG\_TOK}\right)
+H\!\left(K_i(t)\|\mathrm{enc\_t}(t)\|\Phi_t\|\mathrm{TOK}\right)
 \right).
 $$
 
@@ -493,7 +493,7 @@ Computed public phase values:
 
 - $a_t=9$, $b_t=10$, $c_t=12$
 - $u_1=14$, $u_2=6$, $u_3=13$
-- $\Phi_t = \mathrm{SHA256}(\texttt{09 0a 0c 0e 06 0d} \| \text{TAG\_PHASE}) = \texttt{0x809eec62…}$
+- $\Phi_t = \mathrm{SHA256}(\texttt{09 0a 0c 0e 06 0d} \| \text{PHASE}) = \texttt{0x809eec62…}$
 
 Computed bouquet exponents and evaluations (all exponents reduced mod $18$):
 
@@ -503,8 +503,8 @@ Computed bouquet exponents and evaluations (all exponents reduced mod $18$):
 
 Final key and token:
 
-- $K_2(t)=\mathrm{SHA256}(i\|EA\|EB\|EC\|\Phi_t\|\text{TAG\_KDF})=\texttt{0x4ca0cd19…}$
-- $T_2(t)=\mathrm{Trunc}_{64}(\mathrm{SHA256}(K_2(t)\|t\|\Phi_t\|\text{TAG\_TOK}))=\texttt{0x548c40b9091d8ed7}$
+- $K_2(t)=\mathrm{SHA256}(i\|EA\|EB\|EC\|\Phi_t\|\text{KDF})=\texttt{0x4ca0cd19…}$
+- $T_2(t)=\mathrm{Trunc}_{64}(\mathrm{SHA256}(K_2(t)\|t\|\Phi_t\|\text{TOK}))=\texttt{0x548c40b9091d8ed7}$
 
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
@@ -573,11 +573,11 @@ So “returns every $x$” is preserved as long as `Permute(...)` is determinist
 For any fixed lane $i$ and cycle $t$, the derivation is a pure function:
 
 $$
-K_i(t)=H(\mathrm{enc}_i(i)\|\mathrm{encM}(EA_i(t))\|\mathrm{encM}(EB_i(t))\|\mathrm{encM}(EC_i(t))\|\Phi_t\|\mathrm{TAG\_KDF})
+K_i(t)=H(\mathrm{enc}_i(i)\|\mathrm{encM}(EA_i(t))\|\mathrm{encM}(EB_i(t))\|\mathrm{encM}(EC_i(t))\|\Phi_t\|\mathrm{KDF})
 $$
 
 $$
-T_i(t)=\mathrm{Trunc}_k\Big(H\big(K_i(t)\|\mathrm{enc}_t(t)\|\Phi_t\|\mathrm{TAG\_TOK}\big)\Big).
+T_i(t)=\mathrm{Trunc}_k\Big(H\big(K_i(t)\|\mathrm{enc}_t(t)\|\Phi_t\|\mathrm{TOK}\big)\Big).
 $$
 
 There are no hidden “external variables” beyond:
@@ -620,8 +620,8 @@ flowchart LR
     t["cycle t"] --> Phi["Φ_t (public)"]
     Phi --> Perm["idx_t = π_B[t mod x] (device-only)"]
     Perm --> Lane["choose lane i = idx_t"]
-    Lane --> Ki["K_i(t) = H(i||EA||EB||EC||Φ_t||TAG_KDF)"]
-    Ki --> Tok["T = Trunc_k(H(K_i(t)||t||Φ_t||TAG_TOK))"]
+    Lane --> Ki["K_i(t) = H(i||EA||EB||EC||Φ_t||KDF)"]
+    Ki --> Tok["T = Trunc_k(H(K_i(t)||t||Φ_t||TOK))"]
     Tok --> Send["send (t,i,T)"]
   end
 
@@ -656,7 +656,7 @@ Seed evolution:
 
 $$
 S_{t+1} = H\!\left(
-S_t \| W_0 \| \cdots \| W_{x-1} \| m_0 \| \cdots \| m_{x-2} \| \Phi_t \| \mathrm{TAG\_EVOLVE}
+S_t \| W_0 \| \cdots \| W_{x-1} \| m_0 \| \cdots \| m_{x-2} \| \Phi_t \| \mathrm{EVOLVE}
 \right).
 $$
 
@@ -722,7 +722,7 @@ The following pseudocode matches the specification above (not optimized).
 #   x, P, Q, R, M, a0, b0, c0
 # Hash function H(·) and Trunc_k(·) agreed by all parties
 # Canonical encoders: encP, encQ, encR, encM, enc_i, enc_t, encU32
-# Domain tags: TAG_PHASE, TAG_EXP, TAG_KDF, TAG_TOK, TAG_EVOLVE, TAG_PERMSEED
+# Domain tags: PHASE, EXP, KDF, TOK, EVOLVE, PERMSEED
 
 function Phase(t):
     a = (a0 + t) mod P
@@ -734,13 +734,13 @@ function Phase(t):
 
     Phi = H( encP(a) || encQ(b) || encR(c) ||
              encM(u1) || encM(u2) || encM(u3) ||
-             TAG_PHASE )
+             PHASE )
     return (a,b,c,u1,u2,u3,Phi)
 
 function PermuteBlock(perm_key, B, Phi_block, x):
     # Deterministic Fisher–Yates using hash-derived bytes as a PRNG stream.
     # Stable for the whole block B.
-    seed = H( perm_key || encU32(B) || Phi_block || TAG_PERMSEED )
+    seed = H( perm_key || encU32(B) || Phi_block || PERMSEED )
     L = [0,1,2,...,x-1]
     stream = Expand(seed)      # e.g., seed || H(seed||0) || H(seed||1) || ...
     for i from x-1 downto 1:
@@ -753,7 +753,7 @@ function EvalBouquet(bouquet, res_encoder, x_res, u, M):
     acc = 1 mod M
     for j from 0 to len(bouquet)-1:
         Cj = bouquet[j] mod M
-        ej = H( res_encoder(x_res) || encM(u) || encU32(j) || TAG_EXP ) mod (M-1)
+        ej = H( res_encoder(x_res) || encM(u) || encU32(j) || EXP ) mod (M-1)
         acc = (acc * pow(Cj, ej, M)) mod M
     return acc
 
@@ -763,8 +763,8 @@ function LaneToken(i, t, bouquets_i):
     EB = EvalBouquet(bouquets_i.B, encQ, b, u2, M)
     EC = EvalBouquet(bouquets_i.C, encR, c, u3, M)
 
-    K  = H( enc_i(i) || encM(EA) || encM(EB) || encM(EC) || Phi || TAG_KDF )
-    T  = Trunc_k( H( K || enc_t(t) || Phi || TAG_TOK ) )
+    K  = H( enc_i(i) || encM(EA) || encM(EB) || encM(EC) || Phi || KDF )
+    T  = Trunc_k( H( K || enc_t(t) || Phi || TOK ) )
     return T
 
 # DEVICE (emitter)
@@ -783,7 +783,7 @@ for each cycle t = 0,1,2,...:
 
     W[idx] = Int(T) mod M   # or store raw bytes; if bytes, encode consistently in EVOLVE
     m[ℓ] = (W[ℓ] * W[ℓ+1]) mod M for ℓ = 0..x-2
-    S = H( S || W[0] || ... || W[x-1] || m[0] || ... || m[x-2] || Phi || TAG_EVOLVE )
+    S = H( S || W[0] || ... || W[x-1] || m[0] || ... || m[x-2] || Phi || EVOLVE )
 
 # PROVIDER i (validator)
 state: bouquets_i (secret), i (public identifier)
