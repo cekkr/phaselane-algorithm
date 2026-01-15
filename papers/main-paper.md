@@ -627,7 +627,7 @@ flowchart LR
   subgraph Provider_i["Provider i (continuous validator)"]
     Clock["public epoch → local t"] --> Loop["every cycle: compute Φ_t, EA/EB/EC, K_i(t), T_i(t)"]
     Loop --> Buf["buffer T_i(t) (±Δ window)"]
-    Rx["receive (t,i,T)"] --> Cmp["constant-time compare"] [17]
+    Rx["receive (t,i,T)"] --> Cmp["constant-time compare [17]"]
     Buf --> Cmp
     Cmp --> Match{"match & unused?"}
     Match -->|yes| Accept["accept (≈1/x cycles)"]
