@@ -206,3 +206,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 .DS_Store
+
+# PCPL evolvo generated artifacts
+demo/pcpl-evolvo/runs/*
+!demo/pcpl-evolvo/runs/.gitkeep

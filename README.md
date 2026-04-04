@@ -84,6 +84,24 @@ Cycle-by-cycle Python simulation with deterministic parameters.
 python3 demo/pcpl_cycle_test.py --cycles 200
 ```
 
+## Empirical Evolvo Project
+
+An evolvable practical harness now lives in `demo/pcpl-evolvo/`.
+It evaluates PCPL mathematical variants against correctness, synchronization,
+security proxy metrics, and circuit-cost/timing constraints.
+
+Quick run:
+
+```bash
+python3 demo/pcpl-evolvo/run_experiments.py --profile fast
+```
+
+Auto-run with timestamped logs:
+
+```bash
+./demo/pcpl-evolvo/run_auto.sh --profile fast
+```
+
 What it validates:
 - The permutation is valid and returns every x.
 - Exactly 1-of-x providers match per cycle.

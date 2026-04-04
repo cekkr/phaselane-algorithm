@@ -1,0 +1,3 @@
+[submodule "demo/pcpl-evolvo/evolvo"]
+	path = demo/pcpl-evolvo/evolvo
+	url = https://github.com/Geckos-Ink/evolvo
