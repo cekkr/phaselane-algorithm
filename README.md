@@ -86,32 +86,34 @@ python3 demo/pcpl_cycle_test.py --cycles 200
 
 ## Empirical Evolvo Project
 
-An evolvable practical harness now lives in `demo/pcpl-evolvo/`.
-It evaluates PCPL mathematical variants against correctness, synchronization,
-security proxy metrics, and circuit-cost/timing constraints.
+Continuous co-evolution now lives in `demo/pcpl-evolvo/`.
+It evolves:
+- defender circuits to optimize PCPL correctness, sync, cost, and security;
+- attacker circuits to actively break lane routing/token predictability.
 
-Quick run:
+Single round:
 
 ```bash
-python3 demo/pcpl-evolvo/run_experiments.py --profile fast
+python3 demo/pcpl-evolvo/run_experiments.py --profile fast --rounds 1
+```
+
+Continuous/resumable run (same `--out-dir` to keep evolving from archive elites):
+
+```bash
+python3 demo/pcpl-evolvo/run_experiments.py \
+  --profile fast \
+  --out-dir demo/pcpl-evolvo/runs/mainline \
+  --rounds 5
 ```
 
 Auto-run with timestamped logs:
 
 ```bash
-./demo/pcpl-evolvo/run_auto.sh --profile fast
+./demo/pcpl-evolvo/run_auto.sh --profile fast --rounds 3
 ```
 
-What it validates:
-- The permutation is valid and returns every x.
-- Exactly 1-of-x providers match per cycle.
-- Each provider matches exactly once per block of x cycles.
-- Optional chaining divergence check.
-
-Notes:
-- The demo uses blake2b with length-prefixed encoding to avoid ambiguous
-  concatenation.
-- Tokens are truncated to the requested bit length; defaults are for validation.
+Outputs include `archive.json`, per-round reports under
+`demo/pcpl-evolvo/runs/<run>/rounds/`, and global `results.json/report.md`.
 
 ## Peer-count snapshot (x=2..5)
 Fixed primes (near 1e6) with a 64-cycle linear window:

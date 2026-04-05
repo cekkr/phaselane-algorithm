@@ -1,74 +1,73 @@
-# PCPL Evolvo (Empirical Practical Harness)
+# PCPL Evolvo (Continuous Co-Evolution)
 
-This project adds an empirical, evolvable PCPL environment focused on:
+This project provides a practical, empirical PCPL optimizer with:
 
-- preserving core PCPL protocol properties (1-of-x, per-block lane fairness, deterministic sync),
-- evaluating computational/timing cost trade-offs for device and provider circuits,
-- searching for practical math control circuits with `evolvo`.
+- continuous defender evolution,
+- adversarial attacker evolution (circuit breakers),
+- persistent elite archive and resumable rounds,
+- scoring for correctness, sync drift/timing, cost, and security resistance.
 
-It is intentionally built on top of the existing deterministic reference implementation in `demo/pcpl_cycle_test.py`.
+It is built directly on top of the deterministic protocol reference in `demo/pcpl_cycle_test.py`.
 
 ## Structure
 
-- `evolvo/` - Git submodule ([Geckos-Ink/evolvo](https://github.com/Geckos-Ink/evolvo)).
-- `src/pcpl_evolvo/simulation.py` - PCPL scenario simulator, scoring, and metric extraction.
-- `src/pcpl_evolvo/experiment.py` - baseline evaluation + evolution loop + report generation.
-- `run_experiments.py` - main runner.
-- `run_auto.sh` - one-command run with timestamped logs.
-- `runs/` - generated results.
+- `evolvo/` - git submodule (`Geckos-Ink/evolvo`).
+- `src/pcpl_evolvo/simulation.py` - PCPL simulation + scoring model.
+- `src/pcpl_evolvo/experiment.py` - continuous co-evolution engine + archive persistence.
+- `run_experiments.py` - CLI runner.
+- `run_auto.sh` - one-command execution with timestamped logs.
+- `runs/` - generated artifacts (ignored in git, except `.gitkeep`).
 
-## What is evolved
+## Scoring model
 
-A GFSL circuit outputs per-cycle control values that tune practical math behavior:
+Defender score includes:
 
-- active compound ratio (cost/security trade-off),
-- kernel choice for lane mixing,
-- stride seed for compound index selection.
+- protocol principles: exact `1-of-x`, block fairness, permutation validity,
+- synchronization: drift loss rate and absolute-time reference resync (`0..10000 ms` windows),
+- operation/device/provider costs: operation-weighted cycle timing vs budget,
+- security: collision/replay/shared-device impersonation resistance,
+- brute-force and reverse-hack resistance measured against evolved attackers.
 
-The simulator then applies those controls while keeping PCPL scheduling semantics and deterministic timing behavior.
+Attacker score is based on learned advantage at predicting routed lane/token fragments.
 
-## Scoring dimensions
+## Continuous evolution
 
-Each scenario is scored from:
+The engine runs round-by-round and saves:
 
-- protocol correctness (`one_of_x`, block fairness, permutation validity, cross-lane rejection),
-- symmetric synchronization and timing discrimination,
-- security proxies (cross-lane collisions, replay-window repeats),
-- computational cost proxy (device/provider compound usage ratio),
-- runtime budget compliance.
+- defender + attacker elites in `archive.json`,
+- per-round reports in `runs/<run>/rounds/round-XXXX/`,
+- global summary in `results.json` and `report.md`.
+
+Subsequent runs can resume from the same `--out-dir` and continue evolving from top archived genomes.
 
 ## Usage
 
-From repository root:
+### Single round
 
 ```bash
-python3 demo/pcpl-evolvo/run_experiments.py --profile fast
+python3 demo/pcpl-evolvo/run_experiments.py --profile fast --rounds 1
 ```
 
-or with automatic timestamped logs:
+### Continuous/resumable rounds
 
 ```bash
-./demo/pcpl-evolvo/run_auto.sh --profile fast
+python3 demo/pcpl-evolvo/run_experiments.py \
+  --profile fast \
+  --out-dir demo/pcpl-evolvo/runs/mainline \
+  --rounds 5
 ```
 
-Heavier profile:
+Run again with the same `--out-dir` to continue from archive elites.
+
+### Auto script
 
 ```bash
-python3 demo/pcpl-evolvo/run_experiments.py --profile full --generations 40 --population-size 32
+./demo/pcpl-evolvo/run_auto.sh --profile fast --rounds 3
 ```
 
-## Outputs
+## Main CLI options
 
-Each run creates `demo/pcpl-evolvo/runs/<timestamp>-<profile>/` with:
-
-- `results.json` - full machine-readable results,
-- `summary.json` - short run summary,
-- `generation-log.jsonl` - generation-by-generation scoring,
-- `best-genome.txt` - evolved effective GFSL trace,
-- `report.md` - human-readable experiment report,
-- `console.log` when using `run_auto.sh`.
-
-## Notes
-
-- The evolvo source is loaded directly from `demo/pcpl-evolvo/evolvo/src`.
-- The reference PCPL implementation is loaded dynamically from `demo/pcpl_cycle_test.py` to keep protocol semantics aligned.
+- `--population-size`, `--generations`
+- `--attacker-population-size`, `--attacker-generations`
+- `--elite-pool`, `--archive-limit`
+- `--no-resume` (start fresh even if archive exists)
