@@ -59,6 +59,30 @@ python3 demo/pcpl-evolvo/run_experiments.py \
 
 Run again with the same `--out-dir` to continue from archive elites.
 
+### Continuous exhaustive parameter sweep (`--continuous`)
+
+```bash
+python3 demo/pcpl-evolvo/run_experiments.py \
+  --profile fast \
+  --out-dir demo/pcpl-evolvo/runs/mainline \
+  --rounds 1 \
+  --continuous
+```
+
+This mode keeps running until you stop it (`Ctrl+C`), executes all generated
+parameter combinations in sweeps, and continuously saves:
+
+- per-combo archives/results under `continuous-runs/`,
+- global live state in `continuous-state.json`,
+- top scores/genomes in `continuous-leaderboard.json`,
+- append-only run log in `continuous.log`.
+
+Optional stop cap:
+
+```bash
+python3 demo/pcpl-evolvo/run_experiments.py --continuous --continuous-max-iterations 10
+```
+
 ### Auto script
 
 ```bash

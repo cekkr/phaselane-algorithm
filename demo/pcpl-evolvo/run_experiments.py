@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
+import random
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List
 import sys
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -15,6 +18,96 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from pcpl_evolvo.experiment import ExperimentConfig, run_experiment
+
+
+def _safe_int(value: int, minimum: int = 1) -> int:
+    return max(minimum, int(value))
+
+
+def _param_choices(base: int, *, minimum: int = 1, high_factor: float = 1.5) -> List[int]:
+    base = _safe_int(base, minimum=minimum)
+    high = _safe_int(round(base * high_factor), minimum=minimum)
+    high = max(high, base + 1)
+    if high == base:
+        return [base]
+    return [base, high]
+
+
+def _combo_label(combo: Dict[str, Any]) -> str:
+    return (
+        f"p{combo['population_size']}-g{combo['generations']}"
+        f"-i{combo['initial_instructions']}"
+        f"-ap{combo['attacker_population_size']}"
+        f"-ag{combo['attacker_generations']}"
+        f"-e{combo['elite_pool']}"
+    )
+
+
+def _build_continuous_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    """Generate a finite exhaustive parameter grid for continuous sweeps."""
+    populations = _param_choices(args.population_size, minimum=4, high_factor=1.5)
+    generations = _param_choices(args.generations, minimum=1, high_factor=1.6)
+    instructions = _param_choices(args.initial_instructions, minimum=3, high_factor=1.5)
+    attacker_populations = _param_choices(
+        args.attacker_population_size,
+        minimum=3,
+        high_factor=1.5,
+    )
+    attacker_generations = _param_choices(
+        args.attacker_generations,
+        minimum=1,
+        high_factor=1.6,
+    )
+    elites = _param_choices(args.elite_pool, minimum=4, high_factor=1.4)
+
+    combos: List[Dict[str, Any]] = []
+    for values in itertools.product(
+        populations,
+        generations,
+        instructions,
+        attacker_populations,
+        attacker_generations,
+        elites,
+    ):
+        pop, gen, instr, apop, agen, elite = values
+        combos.append(
+            {
+                "population_size": pop,
+                "generations": gen,
+                "initial_instructions": instr,
+                "attacker_population_size": apop,
+                "attacker_generations": agen,
+                "elite_pool": min(pop, elite),
+                "archive_limit": max(args.archive_limit, min(pop * 6, args.archive_limit * 2)),
+            }
+        )
+
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for combo in combos:
+        dedup[_combo_label(combo)] = combo
+    return list(dedup.values())
+
+
+def _write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _run_once(config: ExperimentConfig) -> Dict[str, Any]:
+    summary = run_experiment(config)
+    summary_path = Path(summary["out_dir"]) / "summary.json"
+    _write_json(summary_path, summary)
+    return summary
+
+
+def _print_summary(summary: Dict[str, Any]) -> None:
+    print("[pcpl-evolvo] completed")
+    print(f"[pcpl-evolvo] out_dir={summary['out_dir']}")
+    print(f"[pcpl-evolvo] best_score={summary['best_score']:.6f}")
+    print(f"[pcpl-evolvo] best_attacker_score={summary['best_attacker_score']:.6f}")
+    print(f"[pcpl-evolvo] rounds_completed={summary['rounds_completed']}")
+    print(f"[pcpl-evolvo] results={summary['results_json']}")
+    print(f"[pcpl-evolvo] report={summary['report_path']}")
+    print(f"[pcpl-evolvo] archive={summary['archive_path']}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,6 +183,23 @@ def parse_args() -> argparse.Namespace:
             "demo/pcpl-evolvo/runs/<timestamp>-<profile>"
         ),
     )
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help=(
+            "Run forever (until Ctrl+C), sweeping all generated parameter "
+            "combinations and continuously saving archives/stats."
+        ),
+    )
+    parser.add_argument(
+        "--continuous-max-iterations",
+        type=int,
+        default=0,
+        help=(
+            "Optional cap for continuous mode iterations; 0 means infinite "
+            "(until user stop)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -102,34 +212,164 @@ def main() -> None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         out_dir = (PROJECT_DIR / "runs" / f"{stamp}-{args.profile}").resolve()
 
-    config = ExperimentConfig(
-        out_dir=out_dir,
-        profile=args.profile,
-        seed=args.seed,
-        population_size=args.population_size,
-        generations=args.generations,
-        initial_instructions=args.initial_instructions,
-        rounds=args.rounds,
-        attacker_population_size=args.attacker_population_size,
-        attacker_generations=args.attacker_generations,
-        elite_pool=args.elite_pool,
-        archive_limit=args.archive_limit,
-        resume=not args.no_resume,
+    if not args.continuous:
+        config = ExperimentConfig(
+            out_dir=out_dir,
+            profile=args.profile,
+            seed=args.seed,
+            population_size=args.population_size,
+            generations=args.generations,
+            initial_instructions=args.initial_instructions,
+            rounds=args.rounds,
+            attacker_population_size=args.attacker_population_size,
+            attacker_generations=args.attacker_generations,
+            elite_pool=args.elite_pool,
+            archive_limit=args.archive_limit,
+            resume=not args.no_resume,
+        )
+
+        summary = _run_once(config)
+        _print_summary(summary)
+        return
+
+    if args.no_resume:
+        print("[pcpl-evolvo] warning: --no-resume ignored in --continuous mode")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    runs_root = out_dir / "continuous-runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
+
+    grid = _build_continuous_grid(args)
+    if not grid:
+        raise RuntimeError("Continuous grid is empty")
+
+    state_path = out_dir / "continuous-state.json"
+    leaderboard_path = out_dir / "continuous-leaderboard.json"
+    log_path = out_dir / "continuous.log"
+
+    rng = random.Random(args.seed)
+    order = list(range(len(grid)))
+    rng.shuffle(order)
+
+    leaderboard: Dict[str, Dict[str, Any]] = {}
+    total_iterations = 0
+    total_sweeps = 0
+
+    print(
+        "[pcpl-evolvo] continuous mode: combos={count} rounds-per-iteration={rounds} output={out}".format(
+            count=len(grid),
+            rounds=max(1, args.rounds),
+            out=out_dir,
+        )
     )
 
-    summary = run_experiment(config)
+    try:
+        while True:
+            for slot, combo_idx in enumerate(order):
+                combo = grid[combo_idx]
+                combo_name = _combo_label(combo)
+                combo_dir = runs_root / combo_name
+                combo_dir.mkdir(parents=True, exist_ok=True)
 
-    summary_path = out_dir / "summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+                run_seed = args.seed + (total_iterations * 7_919) + slot
+                config = ExperimentConfig(
+                    out_dir=combo_dir,
+                    profile=args.profile,
+                    seed=run_seed,
+                    population_size=combo["population_size"],
+                    generations=combo["generations"],
+                    initial_instructions=combo["initial_instructions"],
+                    rounds=max(1, args.rounds),
+                    attacker_population_size=combo["attacker_population_size"],
+                    attacker_generations=combo["attacker_generations"],
+                    elite_pool=combo["elite_pool"],
+                    archive_limit=combo["archive_limit"],
+                    resume=True,
+                )
 
-    print("[pcpl-evolvo] completed")
-    print(f"[pcpl-evolvo] out_dir={summary['out_dir']}")
-    print(f"[pcpl-evolvo] best_score={summary['best_score']:.6f}")
-    print(f"[pcpl-evolvo] best_attacker_score={summary['best_attacker_score']:.6f}")
-    print(f"[pcpl-evolvo] rounds_completed={summary['rounds_completed']}")
-    print(f"[pcpl-evolvo] results={summary['results_json']}")
-    print(f"[pcpl-evolvo] report={summary['report_path']}")
-    print(f"[pcpl-evolvo] archive={summary['archive_path']}")
+                print(
+                    "[pcpl-evolvo] iter={iter} sweep={sweep} combo={combo} seed={seed}".format(
+                        iter=total_iterations,
+                        sweep=total_sweeps,
+                        combo=combo_name,
+                        seed=run_seed,
+                    )
+                )
+                summary = _run_once(config)
+                leaderboard[combo_name] = {
+                    "combo": combo,
+                    "best_score": summary["best_score"],
+                    "best_signature": summary["best_signature"],
+                    "best_attacker_score": summary["best_attacker_score"],
+                    "best_attacker_signature": summary["best_attacker_signature"],
+                    "rounds_completed": summary["rounds_completed"],
+                    "archive_path": summary["archive_path"],
+                    "updated_at": datetime.now().isoformat(),
+                }
+
+                top = sorted(
+                    leaderboard.values(),
+                    key=lambda item: float(item["best_score"]),
+                    reverse=True,
+                )[:20]
+                state_payload = {
+                    "continuous": True,
+                    "profile": args.profile,
+                    "iterations_completed": total_iterations + 1,
+                    "sweeps_completed": total_sweeps,
+                    "grid_size": len(grid),
+                    "latest_combo": combo_name,
+                    "latest_summary": summary,
+                    "updated_at": datetime.now().isoformat(),
+                }
+                _write_json(state_path, state_payload)
+                _write_json(
+                    leaderboard_path,
+                    {
+                        "updated_at": datetime.now().isoformat(),
+                        "leaders": top,
+                    },
+                )
+
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        "{ts} iter={iter} sweep={sweep} combo={combo} score={score:.6f} attacker={attack:.6f} rounds={rounds}\n".format(
+                            ts=datetime.now().isoformat(),
+                            iter=total_iterations,
+                            sweep=total_sweeps,
+                            combo=combo_name,
+                            score=float(summary["best_score"]),
+                            attack=float(summary["best_attacker_score"]),
+                            rounds=int(summary["rounds_completed"]),
+                        )
+                    )
+
+                _print_summary(summary)
+                total_iterations += 1
+
+                if (
+                    args.continuous_max_iterations > 0
+                    and total_iterations >= args.continuous_max_iterations
+                ):
+                    print(
+                        "[pcpl-evolvo] continuous stop: reached --continuous-max-iterations="
+                        f"{args.continuous_max_iterations}"
+                    )
+                    return
+
+            total_sweeps += 1
+            rng.shuffle(order)
+            print(
+                "[pcpl-evolvo] sweep complete: sweeps={sweeps} iterations={iters}".format(
+                    sweeps=total_sweeps,
+                    iters=total_iterations,
+                )
+            )
+    except KeyboardInterrupt:
+        print("[pcpl-evolvo] continuous mode stopped by user (Ctrl+C)")
+        print(f"[pcpl-evolvo] state={state_path}")
+        print(f"[pcpl-evolvo] leaderboard={leaderboard_path}")
+        print(f"[pcpl-evolvo] log={log_path}")
 
 
 if __name__ == "__main__":

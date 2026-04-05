@@ -106,6 +106,16 @@ python3 demo/pcpl-evolvo/run_experiments.py \
   --rounds 5
 ```
 
+Continuous parameter-combination sweep (runs until stopped):
+
+```bash
+python3 demo/pcpl-evolvo/run_experiments.py \
+  --profile fast \
+  --out-dir demo/pcpl-evolvo/runs/mainline \
+  --rounds 1 \
+  --continuous
+```
+
 Auto-run with timestamped logs:
 
 ```bash
