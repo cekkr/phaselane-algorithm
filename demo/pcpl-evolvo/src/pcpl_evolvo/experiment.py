@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import hashlib
 import json
+import os
+import platform
 import random
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -41,6 +44,24 @@ class ExperimentConfig:
     elite_pool: int = 12
     archive_limit: int = 64
     resume: bool = True
+    parallel_workers: int = 0
+    parallel_backend: str = "auto"  # auto|process|thread|off
+    use_supervised_guide: bool = True
+    preferred_device: str = "auto"  # auto|cpu|cuda|mps
+
+
+@dataclass(frozen=True)
+class ResourcePlan:
+    cpu_count: int
+    parallel_workers: int
+    parallel_backend: str
+    gpu_backend: str
+    gpu_available: bool
+    torch_available: bool
+    platform: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 class SafeGFSLEvolver(GFSLEvolver):
@@ -51,16 +72,28 @@ class SafeGFSLEvolver(GFSLEvolver):
         generations: int,
         evaluator,
         progress_callback=None,
+        batch_evaluator=None,
     ):
         for gen in range(generations):
             self.generation = gen
 
-            for genome in self.population:
-                if genome.fitness is None:
-                    try:
-                        genome.fitness = evaluator(genome)
-                    except Exception:
-                        genome.fitness = -float("inf")
+            if batch_evaluator is not None:
+                try:
+                    batch_evaluator(self.population)
+                except Exception:
+                    for genome in self.population:
+                        if genome.fitness is None:
+                            try:
+                                genome.fitness = evaluator(genome)
+                            except Exception:
+                                genome.fitness = -float("inf")
+            else:
+                for genome in self.population:
+                    if genome.fitness is None:
+                        try:
+                            genome.fitness = evaluator(genome)
+                        except Exception:
+                            genome.fitness = -float("inf")
 
             self.population.sort(
                 key=lambda g: g.fitness or -float("inf"), reverse=True
@@ -118,6 +151,161 @@ class SafeGFSLEvolver(GFSLEvolver):
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _detect_gpu_backend(preferred_device: str = "auto") -> Tuple[str, bool, bool]:
+    torch_available = False
+    backend = "none"
+    try:
+        import torch  # type: ignore
+
+        torch_available = True
+        if preferred_device != "auto":
+            preferred = preferred_device.lower()
+            if preferred == "cuda" and torch.cuda.is_available():
+                backend = "cuda"
+            elif preferred == "mps":
+                mps_ok = bool(
+                    hasattr(torch.backends, "mps")
+                    and torch.backends.mps.is_available()
+                )
+                if mps_ok:
+                    backend = "mps"
+            elif preferred == "cpu":
+                backend = "none"
+        else:
+            if torch.cuda.is_available():
+                backend = "cuda"
+            elif (
+                hasattr(torch.backends, "mps")
+                and torch.backends.mps.is_available()
+            ):
+                backend = "mps"
+    except Exception:
+        torch_available = False
+        backend = "none"
+
+    return backend, backend != "none", torch_available
+
+
+def _resolve_resource_plan(config: ExperimentConfig, max_population: int) -> ResourcePlan:
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    workers = int(config.parallel_workers)
+    if workers <= 0:
+        workers = cpu_count
+    workers = max(1, min(workers, max(1, max_population)))
+
+    requested_backend = str(config.parallel_backend).lower()
+    if requested_backend not in {"auto", "process", "thread", "off"}:
+        requested_backend = "auto"
+    if requested_backend == "off":
+        resolved_backend = "off"
+        workers = 1
+    elif requested_backend == "auto":
+        resolved_backend = "process" if workers > 1 else "off"
+    else:
+        resolved_backend = requested_backend if workers > 1 else "off"
+
+    if platform.system().lower().startswith("win") and resolved_backend == "process":
+        # Keep behavior predictable on macOS/Linux request, but avoid fragile forks elsewhere.
+        resolved_backend = "thread"
+
+    gpu_backend, gpu_available, torch_available = _detect_gpu_backend(config.preferred_device)
+    return ResourcePlan(
+        cpu_count=cpu_count,
+        parallel_workers=workers,
+        parallel_backend=resolved_backend,
+        gpu_backend=gpu_backend,
+        gpu_available=gpu_available,
+        torch_available=torch_available,
+        platform=platform.platform(),
+    )
+
+
+def _metrics_from_rows(rows: Sequence[Dict[str, Any]]) -> List[ScenarioMetrics]:
+    return [ScenarioMetrics(**row) for row in rows]
+
+
+def _build_supervised_guide_if_available(
+    config: ExperimentConfig,
+    plan: ResourcePlan,
+):
+    if not config.use_supervised_guide or not plan.torch_available:
+        return None
+    try:
+        from evolvo.supervised import GFSLSupervisedGuide
+    except Exception:
+        return None
+
+    if config.preferred_device.lower() != "auto":
+        device = config.preferred_device.lower()
+    elif plan.gpu_backend != "none":
+        device = plan.gpu_backend
+    else:
+        device = "cpu"
+    try:
+        return GFSLSupervisedGuide(device=device)
+    except Exception:
+        return None
+
+
+def _defender_eval_worker(task: Tuple[GFSLGenome, Sequence[ScenarioConfig], Optional[GFSLGenome]]) -> Tuple[float, List[Dict[str, Any]]]:
+    genome, scenarios, attacker = task
+    ensure_genome_io(genome)
+    if attacker is not None:
+        ensure_attacker_genome_io(attacker)
+    score, metrics = evaluate_across_scenarios(scenarios, genome, attacker=attacker)
+    return float(score), _metrics_rows(metrics)
+
+
+def _attacker_eval_worker(task: Tuple[GFSLGenome, GFSLGenome, Sequence[ScenarioConfig]]) -> Tuple[float, List[Dict[str, Any]]]:
+    attacker, defender, scenarios = task
+    ensure_attacker_genome_io(attacker)
+    ensure_genome_io(defender)
+    _, metrics = evaluate_across_scenarios(scenarios, defender, attacker=attacker)
+    attack_adv = _mean_metric(metrics, "attacker_advantage_score")
+    lane_success = _mean_metric(metrics, "attacker_lane_success_rate")
+    token_success = _mean_metric(metrics, "attacker_token_success_rate")
+    effective = len(attacker.extract_effective_algorithm())
+    if effective == 0:
+        score = attack_adv - 0.08
+    else:
+        complexity_penalty = min(0.10, max(0.0, (effective - 18) * 0.0025))
+        score = attack_adv + (0.04 * lane_success) + (0.02 * token_success) - complexity_penalty
+    return float(score), _metrics_rows(metrics)
+
+
+def _evaluate_pending_parallel(
+    *,
+    pending: Sequence[Tuple[int, GFSLGenome]],
+    backend: str,
+    workers: int,
+    worker_fn,
+    build_task,
+    attr_name: str,
+) -> None:
+    if not pending:
+        return
+
+    if backend == "off" or workers <= 1:
+        for _, genome in pending:
+            score, rows = worker_fn(build_task(genome))
+            setattr(genome, attr_name, _metrics_from_rows(rows))
+            genome.fitness = float(score)
+        return
+
+    tasks = [build_task(genome) for _, genome in pending]
+    if backend == "process":
+        executor_cls = concurrent.futures.ProcessPoolExecutor
+    else:
+        executor_cls = concurrent.futures.ThreadPoolExecutor
+
+    with executor_cls(max_workers=workers) as executor:
+        results = list(executor.map(worker_fn, tasks))
+
+    for (_, genome), (score, rows) in zip(pending, results):
+        setattr(genome, attr_name, _metrics_from_rows(rows))
+        genome.fitness = float(score)
 
 
 def _mean_metric(metrics: Sequence[ScenarioMetrics], attr: str) -> float:
@@ -428,14 +616,196 @@ def _baseline_rows(scenarios: Sequence[ScenarioConfig]) -> List[Dict[str, Any]]:
     return rows
 
 
+def _leaderboard_markdown(entries: Sequence[Dict[str, Any]], *, title: str) -> str:
+    lines = [f"# {title}", "", "| rank | score | round | signature | effective |", "| ---: | ---: | ---: | --- | ---: |"]
+    for idx, entry in enumerate(entries, start=1):
+        genome = entry.get("genome", {})
+        lines.append(
+            "| {rank} | {score:.6f} | {round_idx} | `{sig}` | {effective} |".format(
+                rank=idx,
+                score=float(entry.get("score", 0.0)),
+                round_idx=int(entry.get("round", -1)),
+                sig=str(entry.get("signature", "")),
+                effective=int(genome.get("effective_size", 0)),
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _mean_metrics_row(metrics_rows: Sequence[Dict[str, Any]]) -> Dict[str, float]:
+    if not metrics_rows:
+        return {}
+    keys = [k for k, v in metrics_rows[0].items() if isinstance(v, (float, int))]
+    means: Dict[str, float] = {}
+    for key in keys:
+        values = [float(row.get(key, 0.0)) for row in metrics_rows]
+        means[key] = sum(values) / float(max(1, len(values)))
+    return means
+
+
+def _write_view_outputs(
+    *,
+    out_dir: Path,
+    config: ExperimentConfig,
+    resource_plan: ResourcePlan,
+    archive: Dict[str, Any],
+    baseline_rows: Sequence[Dict[str, Any]],
+) -> Dict[str, str]:
+    views_dir = out_dir / "views"
+    best_dir = out_dir / "best"
+    leaderboards_dir = out_dir / "leaderboards"
+    summaries_dir = out_dir / "summaries"
+    for path in (views_dir, best_dir, leaderboards_dir, summaries_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+    defender_top = list(archive.get("defender_elites", []))
+    attacker_top = list(archive.get("attacker_elites", []))
+
+    defender_top10 = defender_top[:10]
+    attacker_top10 = attacker_top[:10]
+    (leaderboards_dir / "defender-top10.json").write_text(
+        json.dumps(defender_top10, indent=2),
+        encoding="utf-8",
+    )
+    (leaderboards_dir / "attacker-top10.json").write_text(
+        json.dumps(attacker_top10, indent=2),
+        encoding="utf-8",
+    )
+    (leaderboards_dir / "defender-top10.md").write_text(
+        _leaderboard_markdown(defender_top10, title="Defender Top 10"),
+        encoding="utf-8",
+    )
+    (leaderboards_dir / "attacker-top10.md").write_text(
+        _leaderboard_markdown(attacker_top10, title="Attacker Top 10"),
+        encoding="utf-8",
+    )
+
+    best_defender = defender_top10[:1]
+    best_attacker = attacker_top10[:1]
+    best_paths: Dict[str, str] = {}
+    if best_defender:
+        defender_entry = best_defender[0]
+        defender_genome = _deserialize_genome(defender_entry["genome"])
+        defender_path = best_dir / "best-defender-genome.txt"
+        defender_path.write_text(
+            "\n".join(defender_genome.to_human_readable()) + "\n",
+            encoding="utf-8",
+        )
+        (best_dir / "best-defender.json").write_text(
+            json.dumps(defender_entry, indent=2),
+            encoding="utf-8",
+        )
+        best_paths["best_defender_genome"] = str(defender_path)
+
+    if best_attacker:
+        attacker_entry = best_attacker[0]
+        attacker_genome = _deserialize_genome(attacker_entry["genome"])
+        attacker_path = best_dir / "best-attacker-genome.txt"
+        attacker_path.write_text(
+            "\n".join(attacker_genome.to_human_readable()) + "\n",
+            encoding="utf-8",
+        )
+        (best_dir / "best-attacker.json").write_text(
+            json.dumps(attacker_entry, indent=2),
+            encoding="utf-8",
+        )
+        best_paths["best_attacker_genome"] = str(attacker_path)
+
+    conclusion_lines: List[str] = []
+    conclusion_lines.append("# PCPL Evolvo Conclusions")
+    conclusion_lines.append("")
+    conclusion_lines.append(f"- profile: `{config.profile}`")
+    conclusion_lines.append(f"- rounds completed: `{len(archive.get('rounds', []))}`")
+    conclusion_lines.append(f"- backend: `{resource_plan.parallel_backend}`")
+    conclusion_lines.append(f"- workers: `{resource_plan.parallel_workers}`")
+    conclusion_lines.append(f"- gpu backend: `{resource_plan.gpu_backend}`")
+    conclusion_lines.append("")
+    if best_defender:
+        defender_mean = _mean_metrics_row(best_defender[0].get("metrics", []))
+        conclusion_lines.append("## Best Defender Summary")
+        conclusion_lines.append(
+            "- score={score:.6f}, principle={principle:.4f}, security={security:.4f}, sync={sync:.4f}, cost={cost:.4f}".format(
+                score=float(best_defender[0].get("score", 0.0)),
+                principle=float(defender_mean.get("principle_score", 0.0)),
+                security=float(defender_mean.get("security_score", 0.0)),
+                sync=float(defender_mean.get("sync_score", 0.0)),
+                cost=float(defender_mean.get("cost_score", 0.0)),
+            )
+        )
+        conclusion_lines.append(
+            "- brute_force_resistance={bf:.4f}, reverse_hack_resistance={rh:.4f}, sync_loss={sl:.4f}".format(
+                bf=float(defender_mean.get("brute_force_resistance_score", 0.0)),
+                rh=float(defender_mean.get("reverse_hack_resistance_score", 0.0)),
+                sl=float(defender_mean.get("sync_loss_rate", 0.0)),
+            )
+        )
+        conclusion_lines.append("")
+    if best_attacker:
+        attacker_mean = _mean_metrics_row(best_attacker[0].get("metrics", []))
+        conclusion_lines.append("## Strongest Attacker Summary")
+        conclusion_lines.append(
+            "- score={score:.6f}, lane_success={lane:.4f}, token_success={token:.4f}, attacker_adv={adv:.4f}".format(
+                score=float(best_attacker[0].get("score", 0.0)),
+                lane=float(attacker_mean.get("attacker_lane_success_rate", 0.0)),
+                token=float(attacker_mean.get("attacker_token_success_rate", 0.0)),
+                adv=float(attacker_mean.get("attacker_advantage_score", 0.0)),
+            )
+        )
+        conclusion_lines.append("")
+    conclusion_lines.append("## Baseline Means")
+    conclusion_lines.append("")
+    for row in baseline_rows:
+        conclusion_lines.append(
+            "- `{name}`: {score:.4f}".format(
+                name=str(row["name"]),
+                score=float(row["mean_score"]),
+            )
+        )
+    conclusion_path = summaries_dir / "conclusions.md"
+    conclusion_path.write_text("\n".join(conclusion_lines) + "\n", encoding="utf-8")
+
+    index_lines: List[str] = []
+    index_lines.append("# PCPL Evolvo Run Index")
+    index_lines.append("")
+    index_lines.append("## Quick Links")
+    index_lines.append(f"- conclusions: `{conclusion_path}`")
+    index_lines.append(f"- defender leaderboard: `{leaderboards_dir / 'defender-top10.md'}`")
+    index_lines.append(f"- attacker leaderboard: `{leaderboards_dir / 'attacker-top10.md'}`")
+    if "best_defender_genome" in best_paths:
+        index_lines.append(f"- best defender genome: `{best_paths['best_defender_genome']}`")
+    if "best_attacker_genome" in best_paths:
+        index_lines.append(f"- best attacker genome: `{best_paths['best_attacker_genome']}`")
+    index_lines.append("")
+    index_lines.append("## Output Layout")
+    index_lines.append("- `rounds/`: per-round artifacts and reports")
+    index_lines.append("- `best/`: best genome snapshots + metadata")
+    index_lines.append("- `leaderboards/`: top ranked defenders/attackers")
+    index_lines.append("- `summaries/`: final conclusions and compact overview")
+    index_path = views_dir / "index.md"
+    index_path.write_text("\n".join(index_lines) + "\n", encoding="utf-8")
+
+    return {
+        "index_path": str(index_path),
+        "conclusion_path": str(conclusion_path),
+        "defender_leaderboard_path": str(leaderboards_dir / "defender-top10.md"),
+        "attacker_leaderboard_path": str(leaderboards_dir / "attacker-top10.md"),
+        **best_paths,
+    }
+
+
 def _run_defender_round(
     *,
     config: ExperimentConfig,
+    resource_plan: ResourcePlan,
     scenarios: Sequence[ScenarioConfig],
     archive: Dict[str, Any],
     attacker: Optional[GFSLGenome],
 ) -> Tuple[SafeGFSLEvolver, List[Dict[str, Any]]]:
-    evolver = SafeGFSLEvolver(population_size=config.population_size)
+    guide = _build_supervised_guide_if_available(config, resource_plan)
+    evolver = SafeGFSLEvolver(
+        population_size=config.population_size,
+        supervised_guide=guide,
+    )
     _seed_population_from_archive(
         evolver=evolver,
         archive_elites=archive.get("defender_elites", []),
@@ -479,18 +849,50 @@ def _run_defender_round(
             )
         )
 
-    evolver.evolve(config.generations, fitness, progress_callback=progress)
+    def batch_eval(population: List[GFSLGenome]) -> None:
+        pending = [
+            (idx, genome)
+            for idx, genome in enumerate(population)
+            if genome.fitness is None
+        ]
+        if not pending:
+            return
+
+        _evaluate_pending_parallel(
+            pending=pending,
+            backend=resource_plan.parallel_backend,
+            workers=resource_plan.parallel_workers,
+            worker_fn=_defender_eval_worker,
+            build_task=lambda g: (
+                g,
+                scenarios,
+                copy.deepcopy(attacker) if attacker is not None else None,
+            ),
+            attr_name="_pcpl_metrics",
+        )
+
+    evolver.evolve(
+        config.generations,
+        fitness,
+        progress_callback=progress,
+        batch_evaluator=batch_eval,
+    )
     return evolver, generation_log
 
 
 def _run_attacker_round(
     *,
     config: ExperimentConfig,
+    resource_plan: ResourcePlan,
     scenarios: Sequence[ScenarioConfig],
     archive: Dict[str, Any],
     defender: GFSLGenome,
 ) -> Tuple[SafeGFSLEvolver, List[Dict[str, Any]]]:
-    evolver = SafeGFSLEvolver(population_size=config.attacker_population_size)
+    guide = _build_supervised_guide_if_available(config, resource_plan)
+    evolver = SafeGFSLEvolver(
+        population_size=config.attacker_population_size,
+        supervised_guide=guide,
+    )
     _seed_population_from_archive(
         evolver=evolver,
         archive_elites=archive.get("attacker_elites", []),
@@ -537,7 +939,34 @@ def _run_attacker_round(
             )
         )
 
-    evolver.evolve(config.attacker_generations, fitness, progress_callback=progress)
+    def batch_eval(population: List[GFSLGenome]) -> None:
+        pending = [
+            (idx, attacker_genome)
+            for idx, attacker_genome in enumerate(population)
+            if attacker_genome.fitness is None
+        ]
+        if not pending:
+            return
+
+        _evaluate_pending_parallel(
+            pending=pending,
+            backend=resource_plan.parallel_backend,
+            workers=resource_plan.parallel_workers,
+            worker_fn=_attacker_eval_worker,
+            build_task=lambda attacker_genome: (
+                attacker_genome,
+                copy.deepcopy(defender),
+                scenarios,
+            ),
+            attr_name="_attack_metrics",
+        )
+
+    evolver.evolve(
+        config.attacker_generations,
+        fitness,
+        progress_callback=progress,
+        batch_evaluator=batch_eval,
+    )
     return evolver, generation_log
 
 
@@ -547,6 +976,10 @@ def run_continuous_experiment(
 ) -> Dict[str, Any]:
     """Run persistent defender/attacker co-evolution for one or more rounds."""
     scenario_list = list(scenarios) if scenarios is not None else default_scenarios(config.profile)
+    resource_plan = _resolve_resource_plan(
+        config,
+        max(config.population_size, config.attacker_population_size),
+    )
 
     out_dir = Path(config.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -556,6 +989,16 @@ def run_continuous_experiment(
     archive_path = out_dir / "archive.json"
     archive = _load_archive(archive_path) if config.resume else _load_archive(Path("/dev/null"))
     baseline_rows = _baseline_rows(scenario_list)
+
+    print(
+        "[pcpl-evolvo] resources cpu={cpu} backend={backend} workers={workers} gpu={gpu} torch={torch}".format(
+            cpu=resource_plan.cpu_count,
+            backend=resource_plan.parallel_backend,
+            workers=resource_plan.parallel_workers,
+            gpu=resource_plan.gpu_backend,
+            torch=resource_plan.torch_available,
+        )
+    )
 
     random.seed(config.seed)
 
@@ -582,6 +1025,7 @@ def run_continuous_experiment(
         # Defender evolution under current strongest attacker.
         defender_evolver, defender_log = _run_defender_round(
             config=config,
+            resource_plan=resource_plan,
             scenarios=scenario_list,
             archive=archive,
             attacker=current_attacker,
@@ -593,6 +1037,7 @@ def run_continuous_experiment(
         # Attacker co-evolution against this defender.
         attacker_evolver, attacker_log = _run_attacker_round(
             config=config,
+            resource_plan=resource_plan,
             scenarios=scenario_list,
             archive=archive,
             defender=preliminary_defender,
@@ -723,11 +1168,20 @@ def run_continuous_experiment(
         )
 
     # Build global summary and report.
+    view_paths = _write_view_outputs(
+        out_dir=out_dir,
+        config=config,
+        resource_plan=resource_plan,
+        archive=archive,
+        baseline_rows=baseline_rows,
+    )
+
     final_summary = {
         "config": {
             **asdict(config),
             "out_dir": str(out_dir),
         },
+        "resources": resource_plan.to_dict(),
         "baselines": baseline_rows,
         "rounds_completed": len(archive.get("rounds", [])),
         "best_defender": archive.get("defender_elites", [])[:1],
@@ -739,6 +1193,7 @@ def run_continuous_experiment(
             "attacker_signature": last_attacker_signature,
             "round_dir": str(last_round_dir) if last_round_dir else None,
         },
+        "views": view_paths,
     }
 
     results_json = out_dir / "results.json"
@@ -751,6 +1206,13 @@ def run_continuous_experiment(
     report_lines.append(f"- rounds completed: `{len(archive.get('rounds', []))}`")
     report_lines.append(f"- best defender score: `{last_defender_score:.6f}`")
     report_lines.append(f"- best attacker score: `{last_attacker_score:.6f}`")
+    report_lines.append(
+        "- resources: backend={backend} workers={workers} gpu={gpu}".format(
+            backend=resource_plan.parallel_backend,
+            workers=resource_plan.parallel_workers,
+            gpu=resource_plan.gpu_backend,
+        )
+    )
     report_lines.append("")
     report_lines.append("## Baselines")
     report_lines.append("")
@@ -779,6 +1241,8 @@ def run_continuous_experiment(
         "best_attacker_score": last_attacker_score,
         "best_attacker_signature": last_attacker_signature,
         "rounds_completed": len(archive.get("rounds", [])),
+        "resource_plan": resource_plan.to_dict(),
+        **view_paths,
     }
     return summary
 

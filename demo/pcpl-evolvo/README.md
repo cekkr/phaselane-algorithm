@@ -36,7 +36,12 @@ The engine runs round-by-round and saves:
 
 - defender + attacker elites in `archive.json`,
 - per-round reports in `runs/<run>/rounds/round-XXXX/`,
-- global summary in `results.json` and `report.md`.
+- global summary in `results.json` and `report.md`,
+- structured views:
+  - `views/index.md`,
+  - `leaderboards/defender-top10.md`, `leaderboards/attacker-top10.md`,
+  - `best/best-defender-genome.txt`, `best/best-attacker-genome.txt`,
+  - `summaries/conclusions.md`.
 
 Subsequent runs can resume from the same `--out-dir` and continue evolving from top archived genomes.
 
@@ -45,7 +50,7 @@ Subsequent runs can resume from the same `--out-dir` and continue evolving from 
 ### Single round
 
 ```bash
-python3 demo/pcpl-evolvo/run_experiments.py --profile fast --rounds 1
+python3 demo/pcpl-evolvo/run_experiments.py --profile fast --rounds 1 --workers 0
 ```
 
 ### Continuous/resumable rounds
@@ -54,7 +59,9 @@ python3 demo/pcpl-evolvo/run_experiments.py --profile fast --rounds 1
 python3 demo/pcpl-evolvo/run_experiments.py \
   --profile fast \
   --out-dir demo/pcpl-evolvo/runs/mainline \
-  --rounds 5
+  --rounds 5 \
+  --parallel-backend process \
+  --workers 0
 ```
 
 Run again with the same `--out-dir` to continue from archive elites.
@@ -95,3 +102,6 @@ python3 demo/pcpl-evolvo/run_experiments.py --continuous --continuous-max-iterat
 - `--attacker-population-size`, `--attacker-generations`
 - `--elite-pool`, `--archive-limit`
 - `--no-resume` (start fresh even if archive exists)
+- `--parallel-backend {auto,process,thread,off}`, `--workers` (`0` = all CPUs)
+- `--no-supervised-guide`
+- `--device {auto,cpu,cuda,mps}` (for optional supervised guide acceleration)

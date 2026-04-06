@@ -108,6 +108,19 @@ def _print_summary(summary: Dict[str, Any]) -> None:
     print(f"[pcpl-evolvo] results={summary['results_json']}")
     print(f"[pcpl-evolvo] report={summary['report_path']}")
     print(f"[pcpl-evolvo] archive={summary['archive_path']}")
+    if "resource_plan" in summary:
+        plan = summary["resource_plan"]
+        print(
+            "[pcpl-evolvo] resources backend={backend} workers={workers} gpu={gpu}".format(
+                backend=plan.get("parallel_backend"),
+                workers=plan.get("parallel_workers"),
+                gpu=plan.get("gpu_backend"),
+            )
+        )
+    if "index_path" in summary:
+        print(f"[pcpl-evolvo] index={summary['index_path']}")
+    if "conclusion_path" in summary:
+        print(f"[pcpl-evolvo] conclusions={summary['conclusion_path']}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -200,6 +213,31 @@ def parse_args() -> argparse.Namespace:
             "(until user stop)."
         ),
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help=(
+            "Parallel fitness workers. 0 means auto (use all available CPU cores)."
+        ),
+    )
+    parser.add_argument(
+        "--parallel-backend",
+        choices=("auto", "process", "thread", "off"),
+        default="auto",
+        help="Parallel backend for fitness evaluation.",
+    )
+    parser.add_argument(
+        "--no-supervised-guide",
+        action="store_true",
+        help="Disable optional supervised guide acceleration.",
+    )
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda", "mps"),
+        default="auto",
+        help="Preferred compute device for supervised guide.",
+    )
     return parser.parse_args()
 
 
@@ -226,6 +264,10 @@ def main() -> None:
             elite_pool=args.elite_pool,
             archive_limit=args.archive_limit,
             resume=not args.no_resume,
+            parallel_workers=args.workers,
+            parallel_backend=args.parallel_backend,
+            use_supervised_guide=not args.no_supervised_guide,
+            preferred_device=args.device,
         )
 
         summary = _run_once(config)
@@ -285,6 +327,10 @@ def main() -> None:
                     elite_pool=combo["elite_pool"],
                     archive_limit=combo["archive_limit"],
                     resume=True,
+                    parallel_workers=args.workers,
+                    parallel_backend=args.parallel_backend,
+                    use_supervised_guide=not args.no_supervised_guide,
+                    preferred_device=args.device,
                 )
 
                 print(

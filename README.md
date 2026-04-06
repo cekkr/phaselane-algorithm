@@ -123,7 +123,8 @@ Auto-run with timestamped logs:
 ```
 
 Outputs include `archive.json`, per-round reports under
-`demo/pcpl-evolvo/runs/<run>/rounds/`, and global `results.json/report.md`.
+`demo/pcpl-evolvo/runs/<run>/rounds/`, global `results.json/report.md`, and
+structured views under `views/`, `best/`, `leaderboards/`, `summaries/`.
 
 ## Peer-count snapshot (x=2..5)
 Fixed primes (near 1e6) with a 64-cycle linear window:
