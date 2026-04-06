@@ -125,8 +125,11 @@ class PredictiveStageController:
             return
 
         population = max(1.0, float(stats.get("population", 1.0)))
-        quick_rate = float(stats.get("quick_kept", 0.0)) / population
-        mid_rate = float(stats.get("mid_kept", 0.0)) / population
+        quick_kept = float(stats.get("quick_kept", 0.0))
+        mid_kept = float(stats.get("mid_kept", 0.0))
+        quick_rate = quick_kept / population
+        mid_rate = mid_kept / population
+        mid_over_quick = mid_kept / max(1.0, quick_kept)
         probe_samples = max(1.0, float(stats.get("probe_samples", 0.0)))
         probe_win_rate = float(stats.get("probe_wins", 0.0)) / probe_samples
         novelty_quick = float(stats.get("novelty_quick", 0.0))
@@ -155,6 +158,14 @@ class PredictiveStageController:
                 self.mid_cycle_fraction += 0.015
             elif novelty < 0.15:
                 self.quick_cycle_fraction -= 0.01
+
+        # Enforce staged selectivity: if a stage keeps almost everyone, tighten it.
+        if population >= 3.0 and quick_rate > 0.90:
+            self.quick_keep_ratio -= 0.07
+            self.quick_cycle_fraction -= 0.02
+        if quick_kept >= 2.0 and mid_over_quick > 0.88:
+            self.mid_keep_ratio -= 0.05
+            self.mid_cycle_fraction -= 0.015
 
         self.clamp()
 
@@ -457,6 +468,19 @@ def _predictive_cut_score(score: float, stage: str, penalty: float) -> float:
     if stage == "mid":
         return (score * 0.94) - (0.5 * penalty)
     return score
+
+
+def _stage_keep_count(total: int, ratio: float, *, min_keep: int) -> int:
+    count = max(0, int(total))
+    if count <= 0:
+        return 0
+    if count == 1:
+        return 1
+    keep = max(int(min_keep), int(math.ceil(float(count) * float(ratio))))
+    keep = min(count, keep)
+    if keep >= count:
+        keep = count - 1
+    return max(1, keep)
 
 
 def _rank_with_novelty(
@@ -886,11 +910,11 @@ def _build_round_report(
     lines.append("")
     lines.append("## Defender Evolution")
     lines.append("")
-    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe | eval q>m>f | keep q>m | probes |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: |")
     for row in defender_log:
         lines.append(
-            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} |".format(
+            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {stage_eval} | {stage_keep} | {probe_n} |".format(
                 generation=row["generation"],
                 best_score=row["best_score"],
                 principle=row["principle"],
@@ -904,16 +928,19 @@ def _build_round_report(
                 mk=float(row.get("mid_keep", 0.0)),
                 kv=int(row.get("key_variants", 0)),
                 probe=float(row.get("probe_win_rate", 0.0)),
+                stage_eval=str(row.get("stage_eval", "0>0>0")),
+                stage_keep=str(row.get("stage_keep", "0>0")),
+                probe_n=int(row.get("probe_samples", 0)),
             )
         )
     lines.append("")
     lines.append("## Attacker Evolution")
     lines.append("")
-    lines.append("| gen | attack_score | lane_success | token_success | attacker_adv | q frac/keep | m frac/keep | key var | probe |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| gen | attack_score | lane_success | token_success | attacker_adv | q frac/keep | m frac/keep | key var | probe | eval q>m>f | keep q>m | probes |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: |")
     for row in attacker_log:
         lines.append(
-            "| {generation} | {attack_score:.4f} | {lane_success:.4f} | {token_success:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} |".format(
+            "| {generation} | {attack_score:.4f} | {lane_success:.4f} | {token_success:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {stage_eval} | {stage_keep} | {probe_n} |".format(
                 generation=row["generation"],
                 attack_score=row["attack_score"],
                 lane_success=row["lane_success"],
@@ -925,6 +952,9 @@ def _build_round_report(
                 mk=float(row.get("mid_keep", 0.0)),
                 kv=int(row.get("key_variants", 0)),
                 probe=float(row.get("probe_win_rate", 0.0)),
+                stage_eval=str(row.get("stage_eval", "0>0>0")),
+                stage_keep=str(row.get("stage_keep", "0>0")),
+                probe_n=int(row.get("probe_samples", 0)),
             )
         )
     return "\n".join(lines) + "\n"
@@ -1214,10 +1244,20 @@ def _run_defender_round(
             "mid_keep": float(controller.mid_keep_ratio),
             "key_variants": int(controller.key_variant_count),
             "probe_win_rate": float(stage_stats.get("probe_win_rate", 0.0)),
+            "stage_eval": "{q}>{m}>{f}".format(
+                q=int(stage_stats.get("quick_eval", 0.0)),
+                m=int(stage_stats.get("mid_eval", 0.0)),
+                f=int(stage_stats.get("full_eval", 0.0)),
+            ),
+            "stage_keep": "{q}>{m}".format(
+                q=int(stage_stats.get("quick_kept", 0.0)),
+                m=int(stage_stats.get("mid_kept", 0.0)),
+            ),
+            "probe_samples": int(stage_stats.get("probe_samples", 0.0)),
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f}".format(
+            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n}".format(
                 gen=gen,
                 score=best_fitness,
                 security=row["security"],
@@ -1229,6 +1269,9 @@ def _run_defender_round(
                 mk=row["mid_keep"],
                 kv=row["key_variants"],
                 probe=row["probe_win_rate"],
+                stage_eval=row["stage_eval"],
+                stage_keep=row["stage_keep"],
+                probe_n=row["probe_samples"],
             )
         )
 
@@ -1243,6 +1286,9 @@ def _run_defender_round(
 
         local_stage: Dict[str, float] = {
             "population": float(len(pending)),
+            "quick_eval": float(len(pending)),
+            "mid_eval": 0.0,
+            "full_eval": 0.0,
             "quick_kept": 0.0,
             "mid_kept": 0.0,
             "probe_samples": 0.0,
@@ -1266,6 +1312,9 @@ def _run_defender_round(
                 ),
                 attr_name="_pcpl_metrics",
             )
+            local_stage["full_eval"] = float(len(pending))
+            local_stage["quick_kept"] = float(len(pending))
+            local_stage["mid_kept"] = float(len(pending))
             stage_stats.clear()
             stage_stats.update(local_stage)
             return
@@ -1299,7 +1348,11 @@ def _run_defender_round(
             archive_signatures=archive_signatures,
             novelty_bonus=config.novelty_bonus,
         )
-        keep_quick_n = max(2, int(math.ceil(len(ranked_quick) * float(controller.quick_keep_ratio))))
+        keep_quick_n = _stage_keep_count(
+            len(ranked_quick),
+            float(controller.quick_keep_ratio),
+            min_keep=2,
+        )
         keep_quick_ids = {
             id(item[1]) for item in ranked_quick[: min(len(ranked_quick), keep_quick_n)]
         }
@@ -1322,6 +1375,7 @@ def _run_defender_round(
             for idx, genome in pending
             if id(genome) in keep_quick_ids
         ]
+        local_stage["mid_eval"] = float(len(mid_pending))
         if not mid_pending:
             controller.apply_feedback(local_stage)
             stage_stats.clear()
@@ -1356,7 +1410,11 @@ def _run_defender_round(
             archive_signatures=archive_signatures,
             novelty_bonus=max(0.0, 0.5 * config.novelty_bonus),
         )
-        keep_mid_n = max(1, int(math.ceil(len(ranked_mid) * float(controller.mid_keep_ratio))))
+        keep_mid_n = _stage_keep_count(
+            len(ranked_mid),
+            float(controller.mid_keep_ratio),
+            min_keep=1,
+        )
         keep_mid_ids = {
             id(item[1]) for item in ranked_mid[: min(len(ranked_mid), keep_mid_n)]
         }
@@ -1379,6 +1437,7 @@ def _run_defender_round(
             for idx, genome in mid_pending
             if id(genome) in keep_mid_ids
         ]
+        local_stage["full_eval"] = float(len(full_pending))
         if not full_pending:
             controller.apply_feedback(local_stage)
             stage_stats.clear()
@@ -1555,10 +1614,20 @@ def _run_attacker_round(
             "mid_keep": float(controller.mid_keep_ratio),
             "key_variants": int(controller.key_variant_count),
             "probe_win_rate": float(stage_stats.get("probe_win_rate", 0.0)),
+            "stage_eval": "{q}>{m}>{f}".format(
+                q=int(stage_stats.get("quick_eval", 0.0)),
+                m=int(stage_stats.get("mid_eval", 0.0)),
+                f=int(stage_stats.get("full_eval", 0.0)),
+            ),
+            "stage_keep": "{q}>{m}".format(
+                q=int(stage_stats.get("quick_kept", 0.0)),
+                m=int(stage_stats.get("mid_kept", 0.0)),
+            ),
+            "probe_samples": int(stage_stats.get("probe_samples", 0.0)),
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f}".format(
+            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n}".format(
                 gen=gen,
                 score=best_fitness,
                 lane=row["lane_success"],
@@ -1569,6 +1638,9 @@ def _run_attacker_round(
                 mk=row["mid_keep"],
                 kv=row["key_variants"],
                 probe=row["probe_win_rate"],
+                stage_eval=row["stage_eval"],
+                stage_keep=row["stage_keep"],
+                probe_n=row["probe_samples"],
             )
         )
 
@@ -1583,6 +1655,9 @@ def _run_attacker_round(
 
         local_stage: Dict[str, float] = {
             "population": float(len(pending)),
+            "quick_eval": float(len(pending)),
+            "mid_eval": 0.0,
+            "full_eval": 0.0,
             "quick_kept": 0.0,
             "mid_kept": 0.0,
             "probe_samples": 0.0,
@@ -1606,6 +1681,9 @@ def _run_attacker_round(
                 ),
                 attr_name="_attack_metrics",
             )
+            local_stage["full_eval"] = float(len(pending))
+            local_stage["quick_kept"] = float(len(pending))
+            local_stage["mid_kept"] = float(len(pending))
             stage_stats.clear()
             stage_stats.update(local_stage)
             return
@@ -1638,7 +1716,11 @@ def _run_attacker_round(
             archive_signatures=archive_signatures,
             novelty_bonus=config.novelty_bonus,
         )
-        keep_quick_n = max(2, int(math.ceil(len(ranked_quick) * float(controller.quick_keep_ratio))))
+        keep_quick_n = _stage_keep_count(
+            len(ranked_quick),
+            float(controller.quick_keep_ratio),
+            min_keep=2,
+        )
         keep_quick_ids = {
             id(item[1]) for item in ranked_quick[: min(len(ranked_quick), keep_quick_n)]
         }
@@ -1661,6 +1743,7 @@ def _run_attacker_round(
             for idx, attacker_genome in pending
             if id(attacker_genome) in keep_quick_ids
         ]
+        local_stage["mid_eval"] = float(len(mid_pending))
         if not mid_pending:
             controller.apply_feedback(local_stage)
             stage_stats.clear()
@@ -1694,7 +1777,11 @@ def _run_attacker_round(
             archive_signatures=archive_signatures,
             novelty_bonus=max(0.0, 0.5 * config.novelty_bonus),
         )
-        keep_mid_n = max(1, int(math.ceil(len(ranked_mid) * float(controller.mid_keep_ratio))))
+        keep_mid_n = _stage_keep_count(
+            len(ranked_mid),
+            float(controller.mid_keep_ratio),
+            min_keep=1,
+        )
         keep_mid_ids = {
             id(item[1]) for item in ranked_mid[: min(len(ranked_mid), keep_mid_n)]
         }
@@ -1717,6 +1804,7 @@ def _run_attacker_round(
             for idx, attacker_genome in mid_pending
             if id(attacker_genome) in keep_mid_ids
         ]
+        local_stage["full_eval"] = float(len(full_pending))
         if not full_pending:
             controller.apply_feedback(local_stage)
             stage_stats.clear()
