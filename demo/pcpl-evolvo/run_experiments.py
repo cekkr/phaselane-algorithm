@@ -238,6 +238,36 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Preferred compute device for supervised guide.",
     )
+    parser.add_argument(
+        "--parent-pool-ratio",
+        type=float,
+        default=0.60,
+        help="Fraction of top genomes used as parent pool (less random dispersivity).",
+    )
+    parser.add_argument(
+        "--stagnation-patience",
+        type=int,
+        default=4,
+        help="Generations without improvement before increasing mutation pressure.",
+    )
+    parser.add_argument(
+        "--mutation-floor",
+        type=float,
+        default=0.12,
+        help="Minimum adaptive mutation rate.",
+    )
+    parser.add_argument(
+        "--mutation-ceiling",
+        type=float,
+        default=0.55,
+        help="Maximum adaptive mutation rate.",
+    )
+    parser.add_argument(
+        "--mutation-step",
+        type=float,
+        default=0.05,
+        help="Adaptive mutation step when stagnating/improving.",
+    )
     return parser.parse_args()
 
 
@@ -268,6 +298,11 @@ def main() -> None:
             parallel_backend=args.parallel_backend,
             use_supervised_guide=not args.no_supervised_guide,
             preferred_device=args.device,
+            parent_pool_ratio=args.parent_pool_ratio,
+            stagnation_patience=args.stagnation_patience,
+            mutation_floor=args.mutation_floor,
+            mutation_ceiling=args.mutation_ceiling,
+            mutation_step=args.mutation_step,
         )
 
         summary = _run_once(config)
@@ -331,6 +366,11 @@ def main() -> None:
                     parallel_backend=args.parallel_backend,
                     use_supervised_guide=not args.no_supervised_guide,
                     preferred_device=args.device,
+                    parent_pool_ratio=args.parent_pool_ratio,
+                    stagnation_patience=args.stagnation_patience,
+                    mutation_floor=args.mutation_floor,
+                    mutation_ceiling=args.mutation_ceiling,
+                    mutation_step=args.mutation_step,
                 )
 
                 print(

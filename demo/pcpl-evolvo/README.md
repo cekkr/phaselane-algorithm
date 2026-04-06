@@ -105,3 +105,8 @@ python3 demo/pcpl-evolvo/run_experiments.py --continuous --continuous-max-iterat
 - `--parallel-backend {auto,process,thread,off}`, `--workers` (`0` = all CPUs)
 - `--no-supervised-guide`
 - `--device {auto,cpu,cuda,mps}` (for optional supervised guide acceleration)
+- `--parent-pool-ratio`, `--stagnation-patience`, `--mutation-floor`, `--mutation-ceiling`, `--mutation-step`
+
+Notes:
+- Process workers are now reused across generations/rounds for lower spawn overhead and higher sustained CPU utilization.
+- The adaptive parent-pool + mutation schedule reduces random dispersivity and focuses search around top genomes while preserving exploration.
