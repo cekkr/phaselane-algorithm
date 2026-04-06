@@ -268,6 +268,71 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Adaptive mutation step when stagnating/improving.",
     )
+    parser.add_argument(
+        "--no-statistical-predictive",
+        action="store_true",
+        help="Disable staged statistical evaluation and run full evaluation on all genomes.",
+    )
+    parser.add_argument(
+        "--quick-cycle-fraction",
+        type=float,
+        default=0.20,
+        help="Fraction of cycles used by quick stage.",
+    )
+    parser.add_argument(
+        "--mid-cycle-fraction",
+        type=float,
+        default=0.55,
+        help="Fraction of cycles used by medium stage.",
+    )
+    parser.add_argument(
+        "--quick-keep-ratio",
+        type=float,
+        default=0.65,
+        help="Fraction of genomes kept after quick stage.",
+    )
+    parser.add_argument(
+        "--mid-keep-ratio",
+        type=float,
+        default=0.35,
+        help="Fraction of genomes kept after medium stage.",
+    )
+    parser.add_argument(
+        "--key-variants",
+        type=int,
+        default=3,
+        help="How many key generation/sharing variants to test per scenario.",
+    )
+    parser.add_argument(
+        "--novelty-bonus",
+        type=float,
+        default=0.03,
+        help="Fitness bonus for novel non-duplicate genomes during staged ranking.",
+    )
+    parser.add_argument(
+        "--predictive-penalty",
+        type=float,
+        default=0.05,
+        help="Penalty applied when a genome is cut by predictive stages.",
+    )
+    parser.add_argument(
+        "--device-mhz",
+        type=float,
+        default=100.0,
+        help="Simulated consumer device frequency in MHz.",
+    )
+    parser.add_argument(
+        "--provider-mhz",
+        type=float,
+        default=300.0,
+        help="Simulated provider frequency in MHz.",
+    )
+    parser.add_argument(
+        "--max-test-seconds",
+        type=float,
+        default=10.0,
+        help="Long-horizon timing projection target (seconds).",
+    )
     return parser.parse_args()
 
 
@@ -303,6 +368,17 @@ def main() -> None:
             mutation_floor=args.mutation_floor,
             mutation_ceiling=args.mutation_ceiling,
             mutation_step=args.mutation_step,
+            statistical_predictive=not args.no_statistical_predictive,
+            quick_cycle_fraction=args.quick_cycle_fraction,
+            mid_cycle_fraction=args.mid_cycle_fraction,
+            quick_keep_ratio=args.quick_keep_ratio,
+            mid_keep_ratio=args.mid_keep_ratio,
+            key_variant_count=args.key_variants,
+            novelty_bonus=args.novelty_bonus,
+            predictive_penalty=args.predictive_penalty,
+            device_mhz=args.device_mhz,
+            provider_mhz=args.provider_mhz,
+            max_test_time_seconds=args.max_test_seconds,
         )
 
         summary = _run_once(config)
@@ -371,6 +447,17 @@ def main() -> None:
                     mutation_floor=args.mutation_floor,
                     mutation_ceiling=args.mutation_ceiling,
                     mutation_step=args.mutation_step,
+                    statistical_predictive=not args.no_statistical_predictive,
+                    quick_cycle_fraction=args.quick_cycle_fraction,
+                    mid_cycle_fraction=args.mid_cycle_fraction,
+                    quick_keep_ratio=args.quick_keep_ratio,
+                    mid_keep_ratio=args.mid_keep_ratio,
+                    key_variant_count=args.key_variants,
+                    novelty_bonus=args.novelty_bonus,
+                    predictive_penalty=args.predictive_penalty,
+                    device_mhz=args.device_mhz,
+                    provider_mhz=args.provider_mhz,
+                    max_test_time_seconds=args.max_test_seconds,
                 )
 
                 print(

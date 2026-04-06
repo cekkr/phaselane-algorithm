@@ -6,11 +6,12 @@ import concurrent.futures
 import copy
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import platform
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -54,6 +55,17 @@ class ExperimentConfig:
     mutation_floor: float = 0.12
     mutation_ceiling: float = 0.55
     mutation_step: float = 0.05
+    statistical_predictive: bool = True
+    quick_cycle_fraction: float = 0.20
+    mid_cycle_fraction: float = 0.55
+    quick_keep_ratio: float = 0.65
+    mid_keep_ratio: float = 0.35
+    key_variant_count: int = 3
+    novelty_bonus: float = 0.03
+    predictive_penalty: float = 0.05
+    device_mhz: float = 100.0
+    provider_mhz: float = 300.0
+    max_test_time_seconds: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -280,6 +292,94 @@ def _resolve_resource_plan(config: ExperimentConfig, max_population: int) -> Res
 
 def _metrics_from_rows(rows: Sequence[Dict[str, Any]]) -> List[ScenarioMetrics]:
     return [ScenarioMetrics(**row) for row in rows]
+
+
+def _mix_seed(seed: int, label: str) -> int:
+    payload = f"{int(seed)}:{label}".encode("utf-8")
+    return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "big")
+
+
+def _variant_seed(base_seed: int, variant_index: int) -> Tuple[int, str]:
+    if variant_index <= 0:
+        return int(base_seed), "base"
+    if variant_index == 1:
+        # Deliberately low-entropy shared seed to test weak/shared provisioning.
+        return int((base_seed % 4096) + 17), "shared-low-entropy"
+    if variant_index == 2:
+        return _mix_seed(base_seed, "rotating-derived"), "rotating-derived"
+    return _mix_seed(base_seed, f"lineage-xor:{variant_index}"), f"lineage-{variant_index}"
+
+
+def _build_stage_scenarios(
+    scenarios: Sequence[ScenarioConfig],
+    *,
+    cycle_fraction: float,
+    key_variant_count: int,
+    device_mhz: float,
+    provider_mhz: float,
+    max_test_time_seconds: float,
+) -> List[ScenarioConfig]:
+    stage_scenarios: List[ScenarioConfig] = []
+    fraction = max(0.05, min(1.0, float(cycle_fraction)))
+    variants = max(1, int(key_variant_count))
+    for scenario in scenarios:
+        stage_cycles = max(10, int(round(float(scenario.cycles) * fraction)))
+        for idx in range(variants):
+            var_seed, label = _variant_seed(scenario.seed, idx)
+            stage_scenarios.append(
+                replace(
+                    scenario,
+                    name=f"{scenario.name}:{label}:f{int(round(fraction * 100.0))}",
+                    seed=var_seed,
+                    cycles=stage_cycles,
+                    device_mhz=float(device_mhz),
+                    provider_mhz=float(provider_mhz),
+                    max_test_time_seconds=float(max_test_time_seconds),
+                )
+            )
+    return stage_scenarios
+
+
+def _predictive_cut_score(score: float, stage: str, penalty: float) -> float:
+    if stage == "quick":
+        return (score * 0.88) - penalty
+    if stage == "mid":
+        return (score * 0.94) - (0.5 * penalty)
+    return score
+
+
+def _rank_with_novelty(
+    genomes: Sequence[GFSLGenome],
+    *,
+    archive_signatures: set[str],
+    novelty_bonus: float,
+) -> List[Tuple[float, GFSLGenome, str]]:
+    ranked: List[Tuple[float, GFSLGenome, str]] = []
+    local_seen: set[str] = set()
+    for genome in genomes:
+        signature = _canonical_signature(genome)
+        base = float(genome.fitness or -float("inf"))
+        novel = signature not in archive_signatures and signature not in local_seen
+        local_seen.add(signature)
+        ranked.append((base + (novelty_bonus if novel else 0.0), genome, signature))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked
+
+
+def _mark_duplicate_genomes(
+    genomes: Sequence[GFSLGenome],
+    *,
+    stage: str,
+    penalty: float,
+) -> None:
+    seen: Dict[str, GFSLGenome] = {}
+    ordered = sorted(genomes, key=lambda g: float(g.fitness or -float("inf")), reverse=True)
+    for genome in ordered:
+        signature = _canonical_signature(genome)
+        if signature not in seen:
+            seen[signature] = genome
+            continue
+        genome.fitness = _predictive_cut_score(float(genome.fitness or -float("inf")), stage, penalty + 0.015)
 
 
 def _build_supervised_guide_if_available(
@@ -654,12 +754,15 @@ def _build_round_report(
     lines.append("## Scenarios")
     for scenario in scenarios:
         lines.append(
-            "- `{name}`: x={x}, cycles={cycles}, budget_ms={budget}, abs_ref_ms={abs_ms}".format(
+            "- `{name}`: x={x}, cycles={cycles}, budget_ms={budget}, abs_ref_ms={abs_ms}, dev_mhz={dev_mhz}, prov_mhz={prov_mhz}, max_test_s={max_s}".format(
                 name=scenario.name,
                 x=scenario.x,
                 cycles=scenario.cycles,
                 budget=scenario.cycle_budget_ms,
                 abs_ms=scenario.absolute_time_ms,
+                dev_mhz=scenario.device_mhz,
+                prov_mhz=scenario.provider_mhz,
+                max_s=scenario.max_test_time_seconds,
             )
         )
     lines.append("")
@@ -835,10 +938,12 @@ def _write_view_outputs(
             )
         )
         conclusion_lines.append(
-            "- brute_force_resistance={bf:.4f}, reverse_hack_resistance={rh:.4f}, sync_loss={sl:.4f}".format(
+            "- brute_force_resistance={bf:.4f}, reverse_hack_resistance={rh:.4f}, sync_loss={sl:.4f}, projected_sync_loss_10s={psl:.4f}, horizon_sync={hs:.4f}".format(
                 bf=float(defender_mean.get("brute_force_resistance_score", 0.0)),
                 rh=float(defender_mean.get("reverse_hack_resistance_score", 0.0)),
                 sl=float(defender_mean.get("sync_loss_rate", 0.0)),
+                psl=float(defender_mean.get("projected_sync_loss_rate", 0.0)),
+                hs=float(defender_mean.get("horizon_sync_score", 0.0)),
             )
         )
         conclusion_lines.append("")
@@ -924,17 +1029,46 @@ def _run_defender_round(
     )
 
     generation_log: List[Dict[str, Any]] = []
+    archive_signatures = {
+        str(entry.get("canonical_signature"))
+        for entry in archive.get("defender_elites", [])
+        if entry.get("canonical_signature")
+    }
+    full_scenarios = _build_stage_scenarios(
+        scenarios,
+        cycle_fraction=1.0,
+        key_variant_count=config.key_variant_count,
+        device_mhz=config.device_mhz,
+        provider_mhz=config.provider_mhz,
+        max_test_time_seconds=config.max_test_time_seconds,
+    )
+    quick_scenarios = _build_stage_scenarios(
+        scenarios,
+        cycle_fraction=config.quick_cycle_fraction,
+        key_variant_count=min(2, max(1, config.key_variant_count)),
+        device_mhz=config.device_mhz,
+        provider_mhz=config.provider_mhz,
+        max_test_time_seconds=config.max_test_time_seconds,
+    )
+    mid_scenarios = _build_stage_scenarios(
+        scenarios,
+        cycle_fraction=config.mid_cycle_fraction,
+        key_variant_count=min(3, max(1, config.key_variant_count)),
+        device_mhz=config.device_mhz,
+        provider_mhz=config.provider_mhz,
+        max_test_time_seconds=config.max_test_time_seconds,
+    )
 
     def fitness(genome: GFSLGenome) -> float:
         ensure_genome_io(genome)
-        score, metrics = evaluate_across_scenarios(scenarios, genome, attacker=attacker)
+        score, metrics = evaluate_across_scenarios(full_scenarios, genome, attacker=attacker)
         genome._pcpl_metrics = metrics  # type: ignore[attr-defined]
         return score
 
     def progress(gen: int, best: GFSLGenome, best_fitness: float) -> None:
         metrics = getattr(best, "_pcpl_metrics", None)
         if metrics is None:
-            _, metrics = evaluate_across_scenarios(scenarios, best, attacker=attacker)
+            _, metrics = evaluate_across_scenarios(full_scenarios, best, attacker=attacker)
             best._pcpl_metrics = metrics
 
         row = {
@@ -966,6 +1100,23 @@ def _run_defender_round(
         if not pending:
             return
 
+        if not config.statistical_predictive:
+            _evaluate_pending_parallel(
+                pending=pending,
+                backend=resource_plan.parallel_backend,
+                workers=resource_plan.parallel_workers,
+                executor=shared_executor,
+                worker_fn=_defender_eval_worker,
+                build_task=lambda g: (
+                    g,
+                    full_scenarios,
+                    copy.deepcopy(attacker) if attacker is not None else None,
+                ),
+                attr_name="_pcpl_metrics",
+            )
+            return
+
+        # Stage 1: fast statistical screen.
         _evaluate_pending_parallel(
             pending=pending,
             backend=resource_plan.parallel_backend,
@@ -974,7 +1125,101 @@ def _run_defender_round(
             worker_fn=_defender_eval_worker,
             build_task=lambda g: (
                 g,
-                scenarios,
+                quick_scenarios,
+                copy.deepcopy(attacker) if attacker is not None else None,
+            ),
+            attr_name="_pcpl_metrics",
+        )
+        pending_genomes = [genome for _, genome in pending]
+        _mark_duplicate_genomes(
+            pending_genomes,
+            stage="quick",
+            penalty=config.predictive_penalty,
+        )
+        ranked_quick = _rank_with_novelty(
+            pending_genomes,
+            archive_signatures=archive_signatures,
+            novelty_bonus=config.novelty_bonus,
+        )
+        keep_quick_n = max(2, int(math.ceil(len(ranked_quick) * float(config.quick_keep_ratio))))
+        keep_quick_ids = {
+            id(item[1]) for item in ranked_quick[: min(len(ranked_quick), keep_quick_n)]
+        }
+        for _, genome, _ in ranked_quick:
+            if id(genome) in keep_quick_ids:
+                genome.fitness = None
+            else:
+                genome.fitness = _predictive_cut_score(
+                    float(genome.fitness or -float("inf")),
+                    "quick",
+                    float(config.predictive_penalty),
+                )
+
+        mid_pending = [
+            (idx, genome)
+            for idx, genome in pending
+            if id(genome) in keep_quick_ids
+        ]
+        if not mid_pending:
+            return
+
+        # Stage 2: medium-depth check.
+        _evaluate_pending_parallel(
+            pending=mid_pending,
+            backend=resource_plan.parallel_backend,
+            workers=resource_plan.parallel_workers,
+            executor=shared_executor,
+            worker_fn=_defender_eval_worker,
+            build_task=lambda g: (
+                g,
+                mid_scenarios,
+                copy.deepcopy(attacker) if attacker is not None else None,
+            ),
+            attr_name="_pcpl_metrics",
+        )
+        mid_genomes = [genome for _, genome in mid_pending]
+        _mark_duplicate_genomes(
+            mid_genomes,
+            stage="mid",
+            penalty=config.predictive_penalty,
+        )
+        ranked_mid = _rank_with_novelty(
+            mid_genomes,
+            archive_signatures=archive_signatures,
+            novelty_bonus=max(0.0, 0.5 * config.novelty_bonus),
+        )
+        keep_mid_n = max(1, int(math.ceil(len(ranked_mid) * float(config.mid_keep_ratio))))
+        keep_mid_ids = {
+            id(item[1]) for item in ranked_mid[: min(len(ranked_mid), keep_mid_n)]
+        }
+        for _, genome, _ in ranked_mid:
+            if id(genome) in keep_mid_ids:
+                genome.fitness = None
+            else:
+                genome.fitness = _predictive_cut_score(
+                    float(genome.fitness or -float("inf")),
+                    "mid",
+                    float(config.predictive_penalty),
+                )
+
+        full_pending = [
+            (idx, genome)
+            for idx, genome in mid_pending
+            if id(genome) in keep_mid_ids
+        ]
+        if not full_pending:
+            return
+
+        # Stage 3: full-depth validation on finalists.
+        _evaluate_pending_parallel(
+            pending=full_pending,
+            backend=resource_plan.parallel_backend,
+            workers=resource_plan.parallel_workers,
+            executor=shared_executor,
+            worker_fn=_defender_eval_worker,
+            build_task=lambda g: (
+                g,
+                full_scenarios,
                 copy.deepcopy(attacker) if attacker is not None else None,
             ),
             attr_name="_pcpl_metrics",
@@ -1018,10 +1263,39 @@ def _run_attacker_round(
     )
 
     generation_log: List[Dict[str, Any]] = []
+    archive_signatures = {
+        str(entry.get("canonical_signature"))
+        for entry in archive.get("attacker_elites", [])
+        if entry.get("canonical_signature")
+    }
+    full_scenarios = _build_stage_scenarios(
+        scenarios,
+        cycle_fraction=1.0,
+        key_variant_count=config.key_variant_count,
+        device_mhz=config.device_mhz,
+        provider_mhz=config.provider_mhz,
+        max_test_time_seconds=config.max_test_time_seconds,
+    )
+    quick_scenarios = _build_stage_scenarios(
+        scenarios,
+        cycle_fraction=config.quick_cycle_fraction,
+        key_variant_count=min(2, max(1, config.key_variant_count)),
+        device_mhz=config.device_mhz,
+        provider_mhz=config.provider_mhz,
+        max_test_time_seconds=config.max_test_time_seconds,
+    )
+    mid_scenarios = _build_stage_scenarios(
+        scenarios,
+        cycle_fraction=config.mid_cycle_fraction,
+        key_variant_count=min(3, max(1, config.key_variant_count)),
+        device_mhz=config.device_mhz,
+        provider_mhz=config.provider_mhz,
+        max_test_time_seconds=config.max_test_time_seconds,
+    )
 
     def fitness(attacker: GFSLGenome) -> float:
         ensure_attacker_genome_io(attacker)
-        _, metrics = evaluate_across_scenarios(scenarios, defender, attacker=attacker)
+        _, metrics = evaluate_across_scenarios(full_scenarios, defender, attacker=attacker)
         attacker._attack_metrics = metrics  # type: ignore[attr-defined]
         attack_adv = _mean_metric(metrics, "attacker_advantage_score")
         lane_success = _mean_metric(metrics, "attacker_lane_success_rate")
@@ -1035,7 +1309,7 @@ def _run_attacker_round(
     def progress(gen: int, best: GFSLGenome, best_fitness: float) -> None:
         metrics = getattr(best, "_attack_metrics", None)
         if metrics is None:
-            _, metrics = evaluate_across_scenarios(scenarios, defender, attacker=best)
+            _, metrics = evaluate_across_scenarios(full_scenarios, defender, attacker=best)
             best._attack_metrics = metrics
         row = {
             "generation": int(gen),
@@ -1063,6 +1337,22 @@ def _run_attacker_round(
         if not pending:
             return
 
+        if not config.statistical_predictive:
+            _evaluate_pending_parallel(
+                pending=pending,
+                backend=resource_plan.parallel_backend,
+                workers=resource_plan.parallel_workers,
+                executor=shared_executor,
+                worker_fn=_attacker_eval_worker,
+                build_task=lambda attacker_genome: (
+                    attacker_genome,
+                    copy.deepcopy(defender),
+                    full_scenarios,
+                ),
+                attr_name="_attack_metrics",
+            )
+            return
+
         _evaluate_pending_parallel(
             pending=pending,
             backend=resource_plan.parallel_backend,
@@ -1072,7 +1362,99 @@ def _run_attacker_round(
             build_task=lambda attacker_genome: (
                 attacker_genome,
                 copy.deepcopy(defender),
-                scenarios,
+                quick_scenarios,
+            ),
+            attr_name="_attack_metrics",
+        )
+        pending_genomes = [genome for _, genome in pending]
+        _mark_duplicate_genomes(
+            pending_genomes,
+            stage="quick",
+            penalty=config.predictive_penalty,
+        )
+        ranked_quick = _rank_with_novelty(
+            pending_genomes,
+            archive_signatures=archive_signatures,
+            novelty_bonus=config.novelty_bonus,
+        )
+        keep_quick_n = max(2, int(math.ceil(len(ranked_quick) * float(config.quick_keep_ratio))))
+        keep_quick_ids = {
+            id(item[1]) for item in ranked_quick[: min(len(ranked_quick), keep_quick_n)]
+        }
+        for _, genome, _ in ranked_quick:
+            if id(genome) in keep_quick_ids:
+                genome.fitness = None
+            else:
+                genome.fitness = _predictive_cut_score(
+                    float(genome.fitness or -float("inf")),
+                    "quick",
+                    float(config.predictive_penalty),
+                )
+
+        mid_pending = [
+            (idx, attacker_genome)
+            for idx, attacker_genome in pending
+            if id(attacker_genome) in keep_quick_ids
+        ]
+        if not mid_pending:
+            return
+
+        _evaluate_pending_parallel(
+            pending=mid_pending,
+            backend=resource_plan.parallel_backend,
+            workers=resource_plan.parallel_workers,
+            executor=shared_executor,
+            worker_fn=_attacker_eval_worker,
+            build_task=lambda attacker_genome: (
+                attacker_genome,
+                copy.deepcopy(defender),
+                mid_scenarios,
+            ),
+            attr_name="_attack_metrics",
+        )
+        mid_genomes = [genome for _, genome in mid_pending]
+        _mark_duplicate_genomes(
+            mid_genomes,
+            stage="mid",
+            penalty=config.predictive_penalty,
+        )
+        ranked_mid = _rank_with_novelty(
+            mid_genomes,
+            archive_signatures=archive_signatures,
+            novelty_bonus=max(0.0, 0.5 * config.novelty_bonus),
+        )
+        keep_mid_n = max(1, int(math.ceil(len(ranked_mid) * float(config.mid_keep_ratio))))
+        keep_mid_ids = {
+            id(item[1]) for item in ranked_mid[: min(len(ranked_mid), keep_mid_n)]
+        }
+        for _, genome, _ in ranked_mid:
+            if id(genome) in keep_mid_ids:
+                genome.fitness = None
+            else:
+                genome.fitness = _predictive_cut_score(
+                    float(genome.fitness or -float("inf")),
+                    "mid",
+                    float(config.predictive_penalty),
+                )
+
+        full_pending = [
+            (idx, attacker_genome)
+            for idx, attacker_genome in mid_pending
+            if id(attacker_genome) in keep_mid_ids
+        ]
+        if not full_pending:
+            return
+
+        _evaluate_pending_parallel(
+            pending=full_pending,
+            backend=resource_plan.parallel_backend,
+            workers=resource_plan.parallel_workers,
+            executor=shared_executor,
+            worker_fn=_attacker_eval_worker,
+            build_task=lambda attacker_genome: (
+                attacker_genome,
+                copy.deepcopy(defender),
+                full_scenarios,
             ),
             attr_name="_attack_metrics",
         )
@@ -1091,7 +1473,16 @@ def run_continuous_experiment(
     scenarios: Optional[Sequence[ScenarioConfig]] = None,
 ) -> Dict[str, Any]:
     """Run persistent defender/attacker co-evolution for one or more rounds."""
-    scenario_list = list(scenarios) if scenarios is not None else default_scenarios(config.profile)
+    raw_scenarios = list(scenarios) if scenarios is not None else default_scenarios(config.profile)
+    scenario_list = [
+        replace(
+            scenario,
+            device_mhz=float(config.device_mhz),
+            provider_mhz=float(config.provider_mhz),
+            max_test_time_seconds=float(config.max_test_time_seconds),
+        )
+        for scenario in raw_scenarios
+    ]
     resource_plan = _resolve_resource_plan(
         config,
         max(config.population_size, config.attacker_population_size),
@@ -1105,6 +1496,14 @@ def run_continuous_experiment(
     archive_path = out_dir / "archive.json"
     archive = _load_archive(archive_path) if config.resume else _load_archive(Path("/dev/null"))
     baseline_rows = _baseline_rows(scenario_list)
+    selection_scenarios = _build_stage_scenarios(
+        scenario_list,
+        cycle_fraction=1.0,
+        key_variant_count=max(1, config.key_variant_count),
+        device_mhz=config.device_mhz,
+        provider_mhz=config.provider_mhz,
+        max_test_time_seconds=config.max_test_time_seconds,
+    )
 
     print(
         "[pcpl-evolvo] resources cpu={cpu} backend={backend} workers={workers} gpu={gpu} torch={torch}".format(
@@ -1179,7 +1578,7 @@ def run_continuous_experiment(
             for candidate in top_candidates:
                 ensure_genome_io(candidate)
                 score, metrics = evaluate_across_scenarios(
-                    scenario_list,
+                    selection_scenarios,
                     candidate,
                     attacker=best_attacker,
                 )
@@ -1189,7 +1588,7 @@ def run_continuous_experiment(
                     selected_defender = candidate
 
             attacker_score, attacker_metrics = evaluate_across_scenarios(
-                scenario_list,
+                selection_scenarios,
                 selected_defender,
                 attacker=best_attacker,
             )
@@ -1331,6 +1730,23 @@ def run_continuous_experiment(
                 backend=resource_plan.parallel_backend,
                 workers=resource_plan.parallel_workers,
                 gpu=resource_plan.gpu_backend,
+            )
+        )
+        report_lines.append(
+            "- statistical: enabled={enabled} quick={quick:.2f} mid={mid:.2f} keep={keep_q:.2f}/{keep_m:.2f} key_variants={key_vars}".format(
+                enabled=config.statistical_predictive,
+                quick=float(config.quick_cycle_fraction),
+                mid=float(config.mid_cycle_fraction),
+                keep_q=float(config.quick_keep_ratio),
+                keep_m=float(config.mid_keep_ratio),
+                key_vars=int(config.key_variant_count),
+            )
+        )
+        report_lines.append(
+            "- timing-horizon: max_test_s={max_s:.1f} device_mhz={dev:.1f} provider_mhz={prov:.1f}".format(
+                max_s=float(config.max_test_time_seconds),
+                dev=float(config.device_mhz),
+                prov=float(config.provider_mhz),
             )
         )
         report_lines.append("")

@@ -78,6 +78,15 @@ To reduce random dispersivity and improve CPU utilization in future runs, the im
   - local refinement pressure around high-quality genomes.
 - New tuning controls exposed in CLI:
   - `--parent-pool-ratio`, `--stagnation-patience`, `--mutation-floor`, `--mutation-ceiling`, `--mutation-step`.
+- Statistical predictive staged evaluation added:
+  - quick/mid/full cycle fractions with predictive cuts (`--quick-cycle-fraction`, `--mid-cycle-fraction`, keep ratios),
+  - novelty-aware ranking to prioritize non-duplicate genomes and prune expected/no-new candidates.
+  - benchmark with staged mode and key variants: `off=36.55s` vs `process(8 workers)=18.93s` real time (~`48.2%` faster).
+- Multi-key validation added in staged evaluation:
+  - each scenario can be expanded to multiple key-generation/key-sharing variants (`--key-variants`) to stress validity and attacker resistance.
+- Long-horizon timing projection added:
+  - default `10s` projection with simulated frequencies (`--device-mhz=100`, `--provider-mhz=300`),
+  - projected sync-loss and horizon sync metrics are now tracked in scoring outputs.
 
 ## Next recommended run protocol
 

@@ -103,6 +103,9 @@ class ScenarioConfig:
     sync_tolerance_ms: float = 25.0
     resync_window_ms: float = 4.0
     attack_token_bits: int = 16
+    device_mhz: float = 100.0
+    provider_mhz: float = 300.0
+    max_test_time_seconds: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -155,6 +158,8 @@ class ScenarioMetrics:
     avg_device_cycle_ms: float
     avg_provider_cycle_ms: float
     absolute_time_reference_ms: float
+    projected_sync_loss_rate: float
+    horizon_sync_score: float
     device_compound_ratio: float
     provider_compound_ratio: float
     elapsed_seconds: float
@@ -605,6 +610,8 @@ def evaluate_scenario(
 
     device_cycle_acc_ms = 0.0
     provider_cycle_acc_ms = 0.0
+    device_freq_scale = 100.0 / float(max(1e-6, scenario.device_mhz))
+    provider_freq_scale = 100.0 / float(max(1e-6, scenario.provider_mhz))
 
     prev_emitted = 0
     prev_idx = 0
@@ -710,6 +717,8 @@ def evaluate_scenario(
 
         device_cycle_ms = controller_ms + (lane_pow_selected * pow_cost_ms) + (3.0 * hash_cost_ms)
         provider_cycle_ms = controller_ms + (provider_pow_max * pow_cost_ms) + (3.0 * hash_cost_ms)
+        device_cycle_ms *= device_freq_scale
+        provider_cycle_ms *= provider_freq_scale
         device_cycle_ms += 0.004
         provider_cycle_ms += 0.004
 
@@ -816,6 +825,19 @@ def evaluate_scenario(
     sync_loss_rate = sync_lost_cycles / float(max(1, scenario.cycles))
     resync_success_rate = resync_successes / float(max(1, resync_attempts)) if resync_attempts else 1.0
 
+    horizon_cycles = int(
+        max(
+            1.0,
+            (float(max(1e-6, scenario.max_test_time_seconds)) * 1000.0)
+            / float(max(1e-9, scenario.cycle_budget_ms)),
+        )
+    )
+    projection_ratio = horizon_cycles / float(max(1, scenario.cycles))
+    effective_sync_loss = sync_loss_rate * (1.0 - (0.70 * resync_success_rate))
+    projection_multiplier = min(8.0, max(1.0, projection_ratio ** 0.35))
+    projected_sync_loss_rate = clamp(effective_sync_loss * projection_multiplier, 0.0, 1.0)
+    horizon_sync_score = 1.0 - projected_sync_loss_rate
+
     cross_lane_collision_rate = cross_lane_collisions / float(max(1, collision_checks))
     replay_rate = replay_hits / float(max(1, replay_checks))
     controller_fail_rate = controller_fails / float(max(1, scenario.cycles * params.x))
@@ -864,10 +886,11 @@ def evaluate_scenario(
         + 0.20 * attack_reject_rate
     )
     sync_score = (
-        0.35 * twin_sync_rate
-        + 0.15 * timing_reject_rate
-        + 0.35 * (1.0 - sync_loss_rate)
-        + 0.15 * resync_success_rate
+        0.22 * twin_sync_rate
+        + 0.08 * timing_reject_rate
+        + 0.22 * (1.0 - sync_loss_rate)
+        + 0.12 * resync_success_rate
+        + 0.36 * horizon_sync_score
     )
     security_score = (
         0.22 * (1.0 - clamp(cross_lane_collision_rate, 0.0, 1.0))
@@ -886,7 +909,11 @@ def evaluate_scenario(
     budget_ns = float(max(1, scenario.timing_budget_ns))
     runtime_score = _budget_score(ns_per_cycle / budget_ns)
 
-    stability_score = 1.0 - clamp(controller_fail_rate + (0.40 * sync_loss_rate), 0.0, 1.0)
+    stability_score = 1.0 - clamp(
+        controller_fail_rate + (0.20 * sync_loss_rate) + (0.30 * projected_sync_loss_rate),
+        0.0,
+        1.0,
+    )
 
     total_score = (
         0.30 * principle_score
@@ -944,6 +971,8 @@ def evaluate_scenario(
         avg_device_cycle_ms=avg_device_cycle_ms,
         avg_provider_cycle_ms=avg_provider_cycle_ms,
         absolute_time_reference_ms=float(scenario.absolute_time_ms),
+        projected_sync_loss_rate=projected_sync_loss_rate,
+        horizon_sync_score=horizon_sync_score,
         device_compound_ratio=device_compound_ratio,
         provider_compound_ratio=provider_compound_ratio,
         elapsed_seconds=elapsed,
