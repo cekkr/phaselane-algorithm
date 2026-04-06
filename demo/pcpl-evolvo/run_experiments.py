@@ -277,31 +277,36 @@ def parse_args() -> argparse.Namespace:
         "--quick-cycle-fraction",
         type=float,
         default=0.20,
-        help="Fraction of cycles used by quick stage.",
+        help="Initial fraction of cycles used by quick stage (auto-tuned at runtime).",
     )
     parser.add_argument(
         "--mid-cycle-fraction",
         type=float,
         default=0.55,
-        help="Fraction of cycles used by medium stage.",
+        help="Initial fraction of cycles used by medium stage (auto-tuned at runtime).",
     )
     parser.add_argument(
         "--quick-keep-ratio",
         type=float,
         default=0.65,
-        help="Fraction of genomes kept after quick stage.",
+        help="Initial fraction of genomes kept after quick stage (auto-tuned at runtime).",
     )
     parser.add_argument(
         "--mid-keep-ratio",
         type=float,
         default=0.35,
-        help="Fraction of genomes kept after medium stage.",
+        help="Initial fraction of genomes kept after medium stage (auto-tuned at runtime).",
     )
     parser.add_argument(
         "--key-variants",
         type=int,
         default=3,
-        help="How many key generation/sharing variants to test per scenario.",
+        help="Initial key generation/sharing variants per scenario (auto-tuned at runtime).",
+    )
+    parser.add_argument(
+        "--no-auto-statistical-tuning",
+        action="store_true",
+        help="Keep staged fractions/ratios fixed to CLI values (disable real-time auto-tuning).",
     )
     parser.add_argument(
         "--novelty-bonus",
@@ -376,6 +381,7 @@ def main() -> None:
             key_variant_count=args.key_variants,
             novelty_bonus=args.novelty_bonus,
             predictive_penalty=args.predictive_penalty,
+            auto_statistical_tuning=not args.no_auto_statistical_tuning,
             device_mhz=args.device_mhz,
             provider_mhz=args.provider_mhz,
             max_test_time_seconds=args.max_test_seconds,
@@ -455,6 +461,7 @@ def main() -> None:
                     key_variant_count=args.key_variants,
                     novelty_bonus=args.novelty_bonus,
                     predictive_penalty=args.predictive_penalty,
+                    auto_statistical_tuning=not args.no_auto_statistical_tuning,
                     device_mhz=args.device_mhz,
                     provider_mhz=args.provider_mhz,
                     max_test_time_seconds=args.max_test_seconds,

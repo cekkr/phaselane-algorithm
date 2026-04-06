@@ -106,12 +106,14 @@ python3 demo/pcpl-evolvo/run_experiments.py --continuous --continuous-max-iterat
 - `--no-supervised-guide`
 - `--device {auto,cpu,cuda,mps}` (for optional supervised guide acceleration)
 - `--parent-pool-ratio`, `--stagnation-patience`, `--mutation-floor`, `--mutation-ceiling`, `--mutation-step`
-- `--quick-cycle-fraction`, `--mid-cycle-fraction`, `--quick-keep-ratio`, `--mid-keep-ratio`
+- `--quick-cycle-fraction`, `--mid-cycle-fraction`, `--quick-keep-ratio`, `--mid-keep-ratio` (initial seeds, auto-tuned in real time)
 - `--key-variants`, `--novelty-bonus`, `--predictive-penalty`
 - `--device-mhz`, `--provider-mhz`, `--max-test-seconds` (long-horizon timing projection; default 10s)
 - `--no-statistical-predictive` (force full brute evaluation for all genomes)
+- `--no-auto-statistical-tuning` (keep stage fractions/ratios fixed to CLI values)
 
 Notes:
 - Process workers are now reused across generations/rounds for lower spawn overhead and higher sustained CPU utilization.
 - The adaptive parent-pool + mutation schedule reduces random dispersivity and focuses search around top genomes while preserving exploration.
 - Staged statistical mode (default) evaluates all genomes quickly, then expands only novel/promising ones to deeper testing with key-generation variants.
+- Stage fractions/keep ratios/key-variants are auto-tuned from runtime statistics (probe false-negative rate, novelty rate, keep-throughput) and persisted in `archive.json` for following rounds.

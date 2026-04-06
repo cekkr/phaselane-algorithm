@@ -63,6 +63,7 @@ class ExperimentConfig:
     key_variant_count: int = 3
     novelty_bonus: float = 0.03
     predictive_penalty: float = 0.05
+    auto_statistical_tuning: bool = True
     device_mhz: float = 100.0
     provider_mhz: float = 300.0
     max_test_time_seconds: float = 10.0
@@ -80,6 +81,116 @@ class ResourcePlan:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, float(value)))
+
+
+@dataclass
+class PredictiveStageController:
+    quick_cycle_fraction: float
+    mid_cycle_fraction: float
+    quick_keep_ratio: float
+    mid_keep_ratio: float
+    key_variant_count: int
+    auto_tune: bool = True
+
+    @staticmethod
+    def from_config(config: ExperimentConfig) -> "PredictiveStageController":
+        return PredictiveStageController(
+            quick_cycle_fraction=float(config.quick_cycle_fraction),
+            mid_cycle_fraction=float(config.mid_cycle_fraction),
+            quick_keep_ratio=float(config.quick_keep_ratio),
+            mid_keep_ratio=float(config.mid_keep_ratio),
+            key_variant_count=int(config.key_variant_count),
+            auto_tune=bool(config.auto_statistical_tuning),
+        )
+
+    def clamp(self) -> None:
+        self.quick_cycle_fraction = clamp(self.quick_cycle_fraction, 0.08, 0.65)
+        self.mid_cycle_fraction = clamp(
+            max(self.mid_cycle_fraction, self.quick_cycle_fraction + 0.12),
+            0.25,
+            0.95,
+        )
+        self.quick_keep_ratio = clamp(self.quick_keep_ratio, 0.35, 0.92)
+        self.mid_keep_ratio = clamp(self.mid_keep_ratio, 0.12, 0.80)
+        self.mid_keep_ratio = min(self.mid_keep_ratio, max(0.12, self.quick_keep_ratio - 0.05))
+        self.key_variant_count = max(1, min(6, int(self.key_variant_count)))
+
+    def apply_feedback(self, stats: Dict[str, float]) -> None:
+        self.clamp()
+        if not self.auto_tune:
+            return
+
+        population = max(1.0, float(stats.get("population", 1.0)))
+        quick_rate = float(stats.get("quick_kept", 0.0)) / population
+        mid_rate = float(stats.get("mid_kept", 0.0)) / population
+        probe_samples = max(1.0, float(stats.get("probe_samples", 0.0)))
+        probe_win_rate = float(stats.get("probe_wins", 0.0)) / probe_samples
+        novelty_quick = float(stats.get("novelty_quick", 0.0))
+        novelty_mid = float(stats.get("novelty_mid", 0.0))
+        novelty = 0.5 * (novelty_quick + novelty_mid)
+
+        if probe_win_rate > 0.20:
+            self.quick_keep_ratio += 0.08
+            self.mid_keep_ratio += 0.06
+            self.quick_cycle_fraction += 0.05
+            self.mid_cycle_fraction += 0.05
+            self.key_variant_count += 1
+        elif probe_win_rate < 0.05 and novelty < 0.20 and quick_rate > 0.62:
+            self.quick_keep_ratio -= 0.05
+            self.mid_keep_ratio -= 0.04
+            self.quick_cycle_fraction -= 0.03
+            self.mid_cycle_fraction -= 0.03
+            if self.key_variant_count > 2:
+                self.key_variant_count -= 1
+        else:
+            # Softly converge to target stage-throughput.
+            self.quick_keep_ratio += 0.03 * (0.55 - quick_rate)
+            self.mid_keep_ratio += 0.03 * (0.30 - mid_rate)
+            if novelty > 0.45:
+                self.quick_cycle_fraction += 0.015
+                self.mid_cycle_fraction += 0.015
+            elif novelty < 0.15:
+                self.quick_cycle_fraction -= 0.01
+
+        self.clamp()
+
+    def to_dict(self) -> Dict[str, Any]:
+        self.clamp()
+        return {
+            "quick_cycle_fraction": float(self.quick_cycle_fraction),
+            "mid_cycle_fraction": float(self.mid_cycle_fraction),
+            "quick_keep_ratio": float(self.quick_keep_ratio),
+            "mid_keep_ratio": float(self.mid_keep_ratio),
+            "key_variant_count": int(self.key_variant_count),
+            "auto_tune": bool(self.auto_tune),
+        }
+
+
+def _seed_controller_from_payload(
+    controller: PredictiveStageController,
+    payload: Optional[Dict[str, Any]],
+) -> PredictiveStageController:
+    if not isinstance(payload, dict):
+        controller.clamp()
+        return controller
+
+    if "quick_cycle_fraction" in payload:
+        controller.quick_cycle_fraction = float(payload["quick_cycle_fraction"])
+    if "mid_cycle_fraction" in payload:
+        controller.mid_cycle_fraction = float(payload["mid_cycle_fraction"])
+    if "quick_keep_ratio" in payload:
+        controller.quick_keep_ratio = float(payload["quick_keep_ratio"])
+    if "mid_keep_ratio" in payload:
+        controller.mid_keep_ratio = float(payload["mid_keep_ratio"])
+    if "key_variant_count" in payload:
+        controller.key_variant_count = int(payload["key_variant_count"])
+
+    controller.clamp()
+    return controller
 
 
 class SafeGFSLEvolver(GFSLEvolver):
@@ -622,6 +733,7 @@ def _load_archive(path: Path) -> Dict[str, Any]:
             "defender_elites": [],
             "attacker_elites": [],
             "rounds": [],
+            "predictive_profile": {},
             "updated_at": None,
         }
     try:
@@ -631,11 +743,13 @@ def _load_archive(path: Path) -> Dict[str, Any]:
             "defender_elites": [],
             "attacker_elites": [],
             "rounds": [],
+            "predictive_profile": {},
             "updated_at": None,
         }
     payload.setdefault("defender_elites", [])
     payload.setdefault("attacker_elites", [])
     payload.setdefault("rounds", [])
+    payload.setdefault("predictive_profile", {})
     payload.setdefault("updated_at", None)
     return payload
 
@@ -772,11 +886,11 @@ def _build_round_report(
     lines.append("")
     lines.append("## Defender Evolution")
     lines.append("")
-    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for row in defender_log:
         lines.append(
-            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} |".format(
+            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} |".format(
                 generation=row["generation"],
                 best_score=row["best_score"],
                 principle=row["principle"],
@@ -784,21 +898,33 @@ def _build_round_report(
                 cost=row["cost"],
                 sync_loss=row["sync_loss"],
                 attacker_adv=row["attacker_adv"],
+                qf=float(row.get("quick_fraction", 0.0)),
+                qk=float(row.get("quick_keep", 0.0)),
+                mf=float(row.get("mid_fraction", 0.0)),
+                mk=float(row.get("mid_keep", 0.0)),
+                kv=int(row.get("key_variants", 0)),
+                probe=float(row.get("probe_win_rate", 0.0)),
             )
         )
     lines.append("")
     lines.append("## Attacker Evolution")
     lines.append("")
-    lines.append("| gen | attack_score | lane_success | token_success | attacker_adv |")
-    lines.append("| --- | ---: | ---: | ---: | ---: |")
+    lines.append("| gen | attack_score | lane_success | token_success | attacker_adv | q frac/keep | m frac/keep | key var | probe |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for row in attacker_log:
         lines.append(
-            "| {generation} | {attack_score:.4f} | {lane_success:.4f} | {token_success:.4f} | {attacker_adv:.4f} |".format(
+            "| {generation} | {attack_score:.4f} | {lane_success:.4f} | {token_success:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} |".format(
                 generation=row["generation"],
                 attack_score=row["attack_score"],
                 lane_success=row["lane_success"],
                 token_success=row["token_success"],
                 attacker_adv=row["attacker_adv"],
+                qf=float(row.get("quick_fraction", 0.0)),
+                qk=float(row.get("quick_keep", 0.0)),
+                mf=float(row.get("mid_fraction", 0.0)),
+                mk=float(row.get("mid_keep", 0.0)),
+                kv=int(row.get("key_variants", 0)),
+                probe=float(row.get("probe_win_rate", 0.0)),
             )
         )
     return "\n".join(lines) + "\n"
@@ -1034,33 +1160,35 @@ def _run_defender_round(
         for entry in archive.get("defender_elites", [])
         if entry.get("canonical_signature")
     }
-    full_scenarios = _build_stage_scenarios(
-        scenarios,
-        cycle_fraction=1.0,
-        key_variant_count=config.key_variant_count,
-        device_mhz=config.device_mhz,
-        provider_mhz=config.provider_mhz,
-        max_test_time_seconds=config.max_test_time_seconds,
+    controller = PredictiveStageController.from_config(config)
+    controller = _seed_controller_from_payload(
+        controller,
+        archive.get("predictive_profile", {}).get("defender"),
     )
-    quick_scenarios = _build_stage_scenarios(
-        scenarios,
-        cycle_fraction=config.quick_cycle_fraction,
-        key_variant_count=min(2, max(1, config.key_variant_count)),
-        device_mhz=config.device_mhz,
-        provider_mhz=config.provider_mhz,
-        max_test_time_seconds=config.max_test_time_seconds,
-    )
-    mid_scenarios = _build_stage_scenarios(
-        scenarios,
-        cycle_fraction=config.mid_cycle_fraction,
-        key_variant_count=min(3, max(1, config.key_variant_count)),
-        device_mhz=config.device_mhz,
-        provider_mhz=config.provider_mhz,
-        max_test_time_seconds=config.max_test_time_seconds,
-    )
+    stage_stats: Dict[str, float] = {}
+
+    def make_scenarios(stage: str) -> List[ScenarioConfig]:
+        if stage == "quick":
+            frac = controller.quick_cycle_fraction
+            key_variants = min(2, max(1, controller.key_variant_count))
+        elif stage == "mid":
+            frac = controller.mid_cycle_fraction
+            key_variants = min(3, max(1, controller.key_variant_count))
+        else:
+            frac = 1.0
+            key_variants = max(1, controller.key_variant_count)
+        return _build_stage_scenarios(
+            scenarios,
+            cycle_fraction=frac,
+            key_variant_count=key_variants,
+            device_mhz=config.device_mhz,
+            provider_mhz=config.provider_mhz,
+            max_test_time_seconds=config.max_test_time_seconds,
+        )
 
     def fitness(genome: GFSLGenome) -> float:
         ensure_genome_io(genome)
+        full_scenarios = make_scenarios("full")
         score, metrics = evaluate_across_scenarios(full_scenarios, genome, attacker=attacker)
         genome._pcpl_metrics = metrics  # type: ignore[attr-defined]
         return score
@@ -1068,6 +1196,7 @@ def _run_defender_round(
     def progress(gen: int, best: GFSLGenome, best_fitness: float) -> None:
         metrics = getattr(best, "_pcpl_metrics", None)
         if metrics is None:
+            full_scenarios = make_scenarios("full")
             _, metrics = evaluate_across_scenarios(full_scenarios, best, attacker=attacker)
             best._pcpl_metrics = metrics
 
@@ -1079,15 +1208,27 @@ def _run_defender_round(
             "cost": _mean_metric(metrics, "cost_score"),
             "sync_loss": _mean_metric(metrics, "sync_loss_rate"),
             "attacker_adv": _mean_metric(metrics, "attacker_advantage_score"),
+            "quick_fraction": float(controller.quick_cycle_fraction),
+            "mid_fraction": float(controller.mid_cycle_fraction),
+            "quick_keep": float(controller.quick_keep_ratio),
+            "mid_keep": float(controller.mid_keep_ratio),
+            "key_variants": int(controller.key_variant_count),
+            "probe_win_rate": float(stage_stats.get("probe_win_rate", 0.0)),
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f}".format(
+            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f}".format(
                 gen=gen,
                 score=best_fitness,
                 security=row["security"],
                 cost=row["cost"],
                 attack_adv=row["attacker_adv"],
+                qf=row["quick_fraction"],
+                qk=row["quick_keep"],
+                mf=row["mid_fraction"],
+                mk=row["mid_keep"],
+                kv=row["key_variants"],
+                probe=row["probe_win_rate"],
             )
         )
 
@@ -1100,7 +1241,18 @@ def _run_defender_round(
         if not pending:
             return
 
+        local_stage: Dict[str, float] = {
+            "population": float(len(pending)),
+            "quick_kept": 0.0,
+            "mid_kept": 0.0,
+            "probe_samples": 0.0,
+            "probe_wins": 0.0,
+            "novelty_quick": 0.0,
+            "novelty_mid": 0.0,
+        }
+
         if not config.statistical_predictive:
+            full_scenarios = make_scenarios("full")
             _evaluate_pending_parallel(
                 pending=pending,
                 backend=resource_plan.parallel_backend,
@@ -1114,7 +1266,13 @@ def _run_defender_round(
                 ),
                 attr_name="_pcpl_metrics",
             )
+            stage_stats.clear()
+            stage_stats.update(local_stage)
             return
+
+        quick_scenarios = make_scenarios("quick")
+        mid_scenarios = make_scenarios("mid")
+        full_scenarios = make_scenarios("full")
 
         # Stage 1: fast statistical screen.
         _evaluate_pending_parallel(
@@ -1141,10 +1299,14 @@ def _run_defender_round(
             archive_signatures=archive_signatures,
             novelty_bonus=config.novelty_bonus,
         )
-        keep_quick_n = max(2, int(math.ceil(len(ranked_quick) * float(config.quick_keep_ratio))))
+        keep_quick_n = max(2, int(math.ceil(len(ranked_quick) * float(controller.quick_keep_ratio))))
         keep_quick_ids = {
             id(item[1]) for item in ranked_quick[: min(len(ranked_quick), keep_quick_n)]
         }
+        local_stage["quick_kept"] = float(len(keep_quick_ids))
+        local_stage["novelty_quick"] = float(
+            len([1 for _, _, sig in ranked_quick[: keep_quick_n] if sig not in archive_signatures])
+        ) / float(max(1, keep_quick_n))
         for _, genome, _ in ranked_quick:
             if id(genome) in keep_quick_ids:
                 genome.fitness = None
@@ -1161,6 +1323,12 @@ def _run_defender_round(
             if id(genome) in keep_quick_ids
         ]
         if not mid_pending:
+            controller.apply_feedback(local_stage)
+            stage_stats.clear()
+            stage_stats.update({
+                **local_stage,
+                "probe_win_rate": 0.0,
+            })
             return
 
         # Stage 2: medium-depth check.
@@ -1188,10 +1356,14 @@ def _run_defender_round(
             archive_signatures=archive_signatures,
             novelty_bonus=max(0.0, 0.5 * config.novelty_bonus),
         )
-        keep_mid_n = max(1, int(math.ceil(len(ranked_mid) * float(config.mid_keep_ratio))))
+        keep_mid_n = max(1, int(math.ceil(len(ranked_mid) * float(controller.mid_keep_ratio))))
         keep_mid_ids = {
             id(item[1]) for item in ranked_mid[: min(len(ranked_mid), keep_mid_n)]
         }
+        local_stage["mid_kept"] = float(len(keep_mid_ids))
+        local_stage["novelty_mid"] = float(
+            len([1 for _, _, sig in ranked_mid[: keep_mid_n] if sig not in archive_signatures])
+        ) / float(max(1, keep_mid_n))
         for _, genome, _ in ranked_mid:
             if id(genome) in keep_mid_ids:
                 genome.fitness = None
@@ -1208,6 +1380,12 @@ def _run_defender_round(
             if id(genome) in keep_mid_ids
         ]
         if not full_pending:
+            controller.apply_feedback(local_stage)
+            stage_stats.clear()
+            stage_stats.update({
+                **local_stage,
+                "probe_win_rate": 0.0,
+            })
             return
 
         # Stage 3: full-depth validation on finalists.
@@ -1225,12 +1403,63 @@ def _run_defender_round(
             attr_name="_pcpl_metrics",
         )
 
+        # Probe a small random sample from cut genomes to estimate false negatives.
+        survivor_ids = {id(genome) for _, genome in full_pending}
+        cut_candidates = [
+            (idx, genome)
+            for idx, genome in pending
+            if id(genome) not in survivor_ids
+        ]
+        probe_n = min(
+            max(0, int(math.ceil(len(cut_candidates) * 0.10))),
+            2,
+        )
+        probe_pending: List[Tuple[int, GFSLGenome]] = []
+        if probe_n > 0 and cut_candidates:
+            probe_pending = random.sample(cut_candidates, min(probe_n, len(cut_candidates)))
+            _evaluate_pending_parallel(
+                pending=probe_pending,
+                backend=resource_plan.parallel_backend,
+                workers=resource_plan.parallel_workers,
+                executor=shared_executor,
+                worker_fn=_defender_eval_worker,
+                build_task=lambda g: (
+                    g,
+                    full_scenarios,
+                    copy.deepcopy(attacker) if attacker is not None else None,
+                ),
+                attr_name="_pcpl_metrics",
+            )
+            cutoff = min(float(genome.fitness or -float("inf")) for _, genome in full_pending)
+            probe_wins = 0
+            for _, probe_genome in probe_pending:
+                probe_score = float(probe_genome.fitness or -float("inf"))
+                if probe_score > cutoff:
+                    probe_wins += 1
+                else:
+                    probe_genome.fitness = _predictive_cut_score(
+                        probe_score,
+                        "mid",
+                        float(config.predictive_penalty),
+                    )
+            local_stage["probe_samples"] = float(len(probe_pending))
+            local_stage["probe_wins"] = float(probe_wins)
+
+        controller.apply_feedback(local_stage)
+        stage_stats.clear()
+        stage_stats.update({
+            **local_stage,
+            "probe_win_rate": float(local_stage.get("probe_wins", 0.0))
+            / float(max(1.0, local_stage.get("probe_samples", 0.0))),
+        })
+
     evolver.evolve(
         config.generations,
         fitness,
         progress_callback=progress,
         batch_evaluator=batch_eval,
     )
+    evolver._predictive_controller_state = controller.to_dict()  # type: ignore[attr-defined]
     return evolver, generation_log
 
 
@@ -1268,33 +1497,35 @@ def _run_attacker_round(
         for entry in archive.get("attacker_elites", [])
         if entry.get("canonical_signature")
     }
-    full_scenarios = _build_stage_scenarios(
-        scenarios,
-        cycle_fraction=1.0,
-        key_variant_count=config.key_variant_count,
-        device_mhz=config.device_mhz,
-        provider_mhz=config.provider_mhz,
-        max_test_time_seconds=config.max_test_time_seconds,
+    controller = PredictiveStageController.from_config(config)
+    controller = _seed_controller_from_payload(
+        controller,
+        archive.get("predictive_profile", {}).get("attacker"),
     )
-    quick_scenarios = _build_stage_scenarios(
-        scenarios,
-        cycle_fraction=config.quick_cycle_fraction,
-        key_variant_count=min(2, max(1, config.key_variant_count)),
-        device_mhz=config.device_mhz,
-        provider_mhz=config.provider_mhz,
-        max_test_time_seconds=config.max_test_time_seconds,
-    )
-    mid_scenarios = _build_stage_scenarios(
-        scenarios,
-        cycle_fraction=config.mid_cycle_fraction,
-        key_variant_count=min(3, max(1, config.key_variant_count)),
-        device_mhz=config.device_mhz,
-        provider_mhz=config.provider_mhz,
-        max_test_time_seconds=config.max_test_time_seconds,
-    )
+    stage_stats: Dict[str, float] = {}
+
+    def make_scenarios(stage: str) -> List[ScenarioConfig]:
+        if stage == "quick":
+            frac = controller.quick_cycle_fraction
+            key_variants = min(2, max(1, controller.key_variant_count))
+        elif stage == "mid":
+            frac = controller.mid_cycle_fraction
+            key_variants = min(3, max(1, controller.key_variant_count))
+        else:
+            frac = 1.0
+            key_variants = max(1, controller.key_variant_count)
+        return _build_stage_scenarios(
+            scenarios,
+            cycle_fraction=frac,
+            key_variant_count=key_variants,
+            device_mhz=config.device_mhz,
+            provider_mhz=config.provider_mhz,
+            max_test_time_seconds=config.max_test_time_seconds,
+        )
 
     def fitness(attacker: GFSLGenome) -> float:
         ensure_attacker_genome_io(attacker)
+        full_scenarios = make_scenarios("full")
         _, metrics = evaluate_across_scenarios(full_scenarios, defender, attacker=attacker)
         attacker._attack_metrics = metrics  # type: ignore[attr-defined]
         attack_adv = _mean_metric(metrics, "attacker_advantage_score")
@@ -1309,6 +1540,7 @@ def _run_attacker_round(
     def progress(gen: int, best: GFSLGenome, best_fitness: float) -> None:
         metrics = getattr(best, "_attack_metrics", None)
         if metrics is None:
+            full_scenarios = make_scenarios("full")
             _, metrics = evaluate_across_scenarios(full_scenarios, defender, attacker=best)
             best._attack_metrics = metrics
         row = {
@@ -1317,14 +1549,26 @@ def _run_attacker_round(
             "lane_success": _mean_metric(metrics, "attacker_lane_success_rate"),
             "token_success": _mean_metric(metrics, "attacker_token_success_rate"),
             "attacker_adv": _mean_metric(metrics, "attacker_advantage_score"),
+            "quick_fraction": float(controller.quick_cycle_fraction),
+            "mid_fraction": float(controller.mid_cycle_fraction),
+            "quick_keep": float(controller.quick_keep_ratio),
+            "mid_keep": float(controller.mid_keep_ratio),
+            "key_variants": int(controller.key_variant_count),
+            "probe_win_rate": float(stage_stats.get("probe_win_rate", 0.0)),
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f}".format(
+            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f}".format(
                 gen=gen,
                 score=best_fitness,
                 lane=row["lane_success"],
                 token=row["token_success"],
+                qf=row["quick_fraction"],
+                qk=row["quick_keep"],
+                mf=row["mid_fraction"],
+                mk=row["mid_keep"],
+                kv=row["key_variants"],
+                probe=row["probe_win_rate"],
             )
         )
 
@@ -1337,7 +1581,18 @@ def _run_attacker_round(
         if not pending:
             return
 
+        local_stage: Dict[str, float] = {
+            "population": float(len(pending)),
+            "quick_kept": 0.0,
+            "mid_kept": 0.0,
+            "probe_samples": 0.0,
+            "probe_wins": 0.0,
+            "novelty_quick": 0.0,
+            "novelty_mid": 0.0,
+        }
+
         if not config.statistical_predictive:
+            full_scenarios = make_scenarios("full")
             _evaluate_pending_parallel(
                 pending=pending,
                 backend=resource_plan.parallel_backend,
@@ -1351,7 +1606,13 @@ def _run_attacker_round(
                 ),
                 attr_name="_attack_metrics",
             )
+            stage_stats.clear()
+            stage_stats.update(local_stage)
             return
+
+        quick_scenarios = make_scenarios("quick")
+        mid_scenarios = make_scenarios("mid")
+        full_scenarios = make_scenarios("full")
 
         _evaluate_pending_parallel(
             pending=pending,
@@ -1377,10 +1638,14 @@ def _run_attacker_round(
             archive_signatures=archive_signatures,
             novelty_bonus=config.novelty_bonus,
         )
-        keep_quick_n = max(2, int(math.ceil(len(ranked_quick) * float(config.quick_keep_ratio))))
+        keep_quick_n = max(2, int(math.ceil(len(ranked_quick) * float(controller.quick_keep_ratio))))
         keep_quick_ids = {
             id(item[1]) for item in ranked_quick[: min(len(ranked_quick), keep_quick_n)]
         }
+        local_stage["quick_kept"] = float(len(keep_quick_ids))
+        local_stage["novelty_quick"] = float(
+            len([1 for _, _, sig in ranked_quick[: keep_quick_n] if sig not in archive_signatures])
+        ) / float(max(1, keep_quick_n))
         for _, genome, _ in ranked_quick:
             if id(genome) in keep_quick_ids:
                 genome.fitness = None
@@ -1397,6 +1662,12 @@ def _run_attacker_round(
             if id(attacker_genome) in keep_quick_ids
         ]
         if not mid_pending:
+            controller.apply_feedback(local_stage)
+            stage_stats.clear()
+            stage_stats.update({
+                **local_stage,
+                "probe_win_rate": 0.0,
+            })
             return
 
         _evaluate_pending_parallel(
@@ -1423,10 +1694,14 @@ def _run_attacker_round(
             archive_signatures=archive_signatures,
             novelty_bonus=max(0.0, 0.5 * config.novelty_bonus),
         )
-        keep_mid_n = max(1, int(math.ceil(len(ranked_mid) * float(config.mid_keep_ratio))))
+        keep_mid_n = max(1, int(math.ceil(len(ranked_mid) * float(controller.mid_keep_ratio))))
         keep_mid_ids = {
             id(item[1]) for item in ranked_mid[: min(len(ranked_mid), keep_mid_n)]
         }
+        local_stage["mid_kept"] = float(len(keep_mid_ids))
+        local_stage["novelty_mid"] = float(
+            len([1 for _, _, sig in ranked_mid[: keep_mid_n] if sig not in archive_signatures])
+        ) / float(max(1, keep_mid_n))
         for _, genome, _ in ranked_mid:
             if id(genome) in keep_mid_ids:
                 genome.fitness = None
@@ -1443,6 +1718,12 @@ def _run_attacker_round(
             if id(attacker_genome) in keep_mid_ids
         ]
         if not full_pending:
+            controller.apply_feedback(local_stage)
+            stage_stats.clear()
+            stage_stats.update({
+                **local_stage,
+                "probe_win_rate": 0.0,
+            })
             return
 
         _evaluate_pending_parallel(
@@ -1459,12 +1740,62 @@ def _run_attacker_round(
             attr_name="_attack_metrics",
         )
 
+        survivor_ids = {id(genome) for _, genome in full_pending}
+        cut_candidates = [
+            (idx, genome)
+            for idx, genome in pending
+            if id(genome) not in survivor_ids
+        ]
+        probe_n = min(
+            max(0, int(math.ceil(len(cut_candidates) * 0.10))),
+            2,
+        )
+        probe_pending: List[Tuple[int, GFSLGenome]] = []
+        if probe_n > 0 and cut_candidates:
+            probe_pending = random.sample(cut_candidates, min(probe_n, len(cut_candidates)))
+            _evaluate_pending_parallel(
+                pending=probe_pending,
+                backend=resource_plan.parallel_backend,
+                workers=resource_plan.parallel_workers,
+                executor=shared_executor,
+                worker_fn=_attacker_eval_worker,
+                build_task=lambda attacker_genome: (
+                    attacker_genome,
+                    copy.deepcopy(defender),
+                    full_scenarios,
+                ),
+                attr_name="_attack_metrics",
+            )
+            cutoff = min(float(genome.fitness or -float("inf")) for _, genome in full_pending)
+            probe_wins = 0
+            for _, probe_genome in probe_pending:
+                probe_score = float(probe_genome.fitness or -float("inf"))
+                if probe_score > cutoff:
+                    probe_wins += 1
+                else:
+                    probe_genome.fitness = _predictive_cut_score(
+                        probe_score,
+                        "mid",
+                        float(config.predictive_penalty),
+                    )
+            local_stage["probe_samples"] = float(len(probe_pending))
+            local_stage["probe_wins"] = float(probe_wins)
+
+        controller.apply_feedback(local_stage)
+        stage_stats.clear()
+        stage_stats.update({
+            **local_stage,
+            "probe_win_rate": float(local_stage.get("probe_wins", 0.0))
+            / float(max(1.0, local_stage.get("probe_samples", 0.0))),
+        })
+
     evolver.evolve(
         config.attacker_generations,
         fitness,
         progress_callback=progress,
         batch_evaluator=batch_eval,
     )
+    evolver._predictive_controller_state = controller.to_dict()  # type: ignore[attr-defined]
     return evolver, generation_log
 
 
@@ -1496,14 +1827,6 @@ def run_continuous_experiment(
     archive_path = out_dir / "archive.json"
     archive = _load_archive(archive_path) if config.resume else _load_archive(Path("/dev/null"))
     baseline_rows = _baseline_rows(scenario_list)
-    selection_scenarios = _build_stage_scenarios(
-        scenario_list,
-        cycle_fraction=1.0,
-        key_variant_count=max(1, config.key_variant_count),
-        device_mhz=config.device_mhz,
-        provider_mhz=config.provider_mhz,
-        max_test_time_seconds=config.max_test_time_seconds,
-    )
 
     print(
         "[pcpl-evolvo] resources cpu={cpu} backend={backend} workers={workers} gpu={gpu} torch={torch}".format(
@@ -1563,6 +1886,31 @@ def run_continuous_experiment(
             )
             best_attacker = attacker_evolver.population[0]
             ensure_attacker_genome_io(best_attacker)
+
+            defender_profile = getattr(defender_evolver, "_predictive_controller_state", {})
+            if not isinstance(defender_profile, dict):
+                defender_profile = {}
+            attacker_profile = getattr(attacker_evolver, "_predictive_controller_state", {})
+            if not isinstance(attacker_profile, dict):
+                attacker_profile = {}
+            predictive_profile = archive.setdefault("predictive_profile", {})
+            if defender_profile:
+                predictive_profile["defender"] = defender_profile
+            if attacker_profile:
+                predictive_profile["attacker"] = attacker_profile
+            selection_key_variants = max(
+                1,
+                int(defender_profile.get("key_variant_count", config.key_variant_count)),
+                int(attacker_profile.get("key_variant_count", config.key_variant_count)),
+            )
+            selection_scenarios = _build_stage_scenarios(
+                scenario_list,
+                cycle_fraction=1.0,
+                key_variant_count=selection_key_variants,
+                device_mhz=config.device_mhz,
+                provider_mhz=config.provider_mhz,
+                max_test_time_seconds=config.max_test_time_seconds,
+            )
 
             # Select robust defender among top candidates against the new attacker.
             top_candidates = [
@@ -1639,6 +1987,11 @@ def run_continuous_experiment(
                 "defender_log": defender_log,
                 "attacker_log": attacker_log,
                 "metrics": _metrics_rows(selected_metrics),
+                "predictive_profile": {
+                    "defender": defender_profile,
+                    "attacker": attacker_profile,
+                    "selection_key_variants": selection_key_variants,
+                },
             }
             archive.setdefault("rounds", []).append(round_summary)
 
@@ -1694,6 +2047,15 @@ def run_continuous_experiment(
             archive=archive,
             baseline_rows=baseline_rows,
         )
+        predictive_profile = archive.get("predictive_profile", {})
+        if not isinstance(predictive_profile, dict):
+            predictive_profile = {}
+        defender_profile = predictive_profile.get("defender", {})
+        if not isinstance(defender_profile, dict):
+            defender_profile = {}
+        attacker_profile = predictive_profile.get("attacker", {})
+        if not isinstance(attacker_profile, dict):
+            attacker_profile = {}
 
         final_summary = {
             "config": {
@@ -1705,6 +2067,7 @@ def run_continuous_experiment(
             "rounds_completed": len(archive.get("rounds", [])),
             "best_defender": archive.get("defender_elites", [])[:1],
             "best_attacker": archive.get("attacker_elites", [])[:1],
+            "predictive_profile": predictive_profile,
             "last_round": {
                 "score": last_defender_score,
                 "signature": last_defender_signature,
@@ -1733,7 +2096,7 @@ def run_continuous_experiment(
             )
         )
         report_lines.append(
-            "- statistical: enabled={enabled} quick={quick:.2f} mid={mid:.2f} keep={keep_q:.2f}/{keep_m:.2f} key_variants={key_vars}".format(
+            "- statistical seeds: enabled={enabled} quick={quick:.2f} mid={mid:.2f} keep={keep_q:.2f}/{keep_m:.2f} key_variants={key_vars}".format(
                 enabled=config.statistical_predictive,
                 quick=float(config.quick_cycle_fraction),
                 mid=float(config.mid_cycle_fraction),
@@ -1742,6 +2105,34 @@ def run_continuous_experiment(
                 key_vars=int(config.key_variant_count),
             )
         )
+        report_lines.append(
+            "- auto statistical tuning: `{enabled}`".format(
+                enabled=(
+                    "enabled"
+                    if bool(config.statistical_predictive and config.auto_statistical_tuning)
+                    else "disabled"
+                )
+            )
+        )
+        if bool(config.statistical_predictive):
+            report_lines.append(
+                "- tuned defender: quick={quick:.2f} mid={mid:.2f} keep={keep_q:.2f}/{keep_m:.2f} key_variants={key_vars}".format(
+                    quick=float(defender_profile.get("quick_cycle_fraction", config.quick_cycle_fraction)),
+                    mid=float(defender_profile.get("mid_cycle_fraction", config.mid_cycle_fraction)),
+                    keep_q=float(defender_profile.get("quick_keep_ratio", config.quick_keep_ratio)),
+                    keep_m=float(defender_profile.get("mid_keep_ratio", config.mid_keep_ratio)),
+                    key_vars=int(defender_profile.get("key_variant_count", config.key_variant_count)),
+                )
+            )
+            report_lines.append(
+                "- tuned attacker: quick={quick:.2f} mid={mid:.2f} keep={keep_q:.2f}/{keep_m:.2f} key_variants={key_vars}".format(
+                    quick=float(attacker_profile.get("quick_cycle_fraction", config.quick_cycle_fraction)),
+                    mid=float(attacker_profile.get("mid_cycle_fraction", config.mid_cycle_fraction)),
+                    keep_q=float(attacker_profile.get("quick_keep_ratio", config.quick_keep_ratio)),
+                    keep_m=float(attacker_profile.get("mid_keep_ratio", config.mid_keep_ratio)),
+                    key_vars=int(attacker_profile.get("key_variant_count", config.key_variant_count)),
+                )
+            )
         report_lines.append(
             "- timing-horizon: max_test_s={max_s:.1f} device_mhz={dev:.1f} provider_mhz={prov:.1f}".format(
                 max_s=float(config.max_test_time_seconds),
@@ -1778,6 +2169,7 @@ def run_continuous_experiment(
             "best_attacker_signature": last_attacker_signature,
             "rounds_completed": len(archive.get("rounds", [])),
             "resource_plan": resource_plan.to_dict(),
+            "predictive_profile": predictive_profile,
             **view_paths,
         }
         return summary
