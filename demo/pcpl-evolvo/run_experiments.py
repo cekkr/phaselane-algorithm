@@ -276,31 +276,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--quick-cycle-fraction",
         type=float,
-        default=0.20,
+        default=0.14,
         help="Initial fraction of cycles used by quick stage (auto-tuned at runtime).",
     )
     parser.add_argument(
         "--mid-cycle-fraction",
         type=float,
-        default=0.55,
+        default=0.50,
         help="Initial fraction of cycles used by medium stage (auto-tuned at runtime).",
     )
     parser.add_argument(
         "--quick-keep-ratio",
         type=float,
-        default=0.65,
+        default=0.55,
         help="Initial fraction of genomes kept after quick stage (auto-tuned at runtime).",
     )
     parser.add_argument(
         "--mid-keep-ratio",
         type=float,
-        default=0.35,
+        default=0.30,
         help="Initial fraction of genomes kept after medium stage (auto-tuned at runtime).",
     )
     parser.add_argument(
         "--key-variants",
         type=int,
-        default=3,
+        default=2,
         help="Initial key generation/sharing variants per scenario (auto-tuned at runtime).",
     )
     parser.add_argument(

@@ -117,3 +117,5 @@ Notes:
 - The adaptive parent-pool + mutation schedule reduces random dispersivity and focuses search around top genomes while preserving exploration.
 - Staged statistical mode (default) evaluates all genomes quickly, then expands only novel/promising ones to deeper testing with key-generation variants.
 - Stage fractions/keep ratios/key-variants are auto-tuned from runtime statistics (probe false-negative rate, novelty rate, keep-throughput) and persisted in `archive.json` for following rounds.
+- Duplicate genomes are collapsed before stage execution and cached by canonical signature + scenario fingerprint + opponent signature, so repeated candidates are not re-executed.
+- For `--profile full`, startup tuning is automatically leaner and generation-time budgeted (target ~3s) without extra flags.

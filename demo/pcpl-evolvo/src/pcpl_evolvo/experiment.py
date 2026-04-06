@@ -11,6 +11,8 @@ import multiprocessing
 import os
 import platform
 import random
+import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,17 +58,19 @@ class ExperimentConfig:
     mutation_ceiling: float = 0.55
     mutation_step: float = 0.05
     statistical_predictive: bool = True
-    quick_cycle_fraction: float = 0.20
-    mid_cycle_fraction: float = 0.55
-    quick_keep_ratio: float = 0.65
-    mid_keep_ratio: float = 0.35
-    key_variant_count: int = 3
+    quick_cycle_fraction: float = 0.14
+    mid_cycle_fraction: float = 0.50
+    quick_keep_ratio: float = 0.55
+    mid_keep_ratio: float = 0.30
+    key_variant_count: int = 2
     novelty_bonus: float = 0.03
     predictive_penalty: float = 0.05
     auto_statistical_tuning: bool = True
     device_mhz: float = 100.0
     provider_mhz: float = 300.0
     max_test_time_seconds: float = 10.0
+    target_generation_seconds: float = 3.0
+    max_eval_cache_entries: int = 20000
 
 
 @dataclass(frozen=True)
@@ -98,7 +102,7 @@ class PredictiveStageController:
 
     @staticmethod
     def from_config(config: ExperimentConfig) -> "PredictiveStageController":
-        return PredictiveStageController(
+        controller = PredictiveStageController(
             quick_cycle_fraction=float(config.quick_cycle_fraction),
             mid_cycle_fraction=float(config.mid_cycle_fraction),
             quick_keep_ratio=float(config.quick_keep_ratio),
@@ -106,6 +110,14 @@ class PredictiveStageController:
             key_variant_count=int(config.key_variant_count),
             auto_tune=bool(config.auto_statistical_tuning),
         )
+        if str(config.profile).lower() == "full":
+            controller.quick_cycle_fraction = min(controller.quick_cycle_fraction, 0.10)
+            controller.mid_cycle_fraction = min(controller.mid_cycle_fraction, 0.45)
+            controller.quick_keep_ratio = min(controller.quick_keep_ratio, 0.35)
+            controller.mid_keep_ratio = min(controller.mid_keep_ratio, 0.20)
+            controller.key_variant_count = min(controller.key_variant_count, 1)
+        controller.clamp()
+        return controller
 
     def clamp(self) -> None:
         self.quick_cycle_fraction = clamp(self.quick_cycle_fraction, 0.08, 0.65)
@@ -135,6 +147,30 @@ class PredictiveStageController:
         novelty_quick = float(stats.get("novelty_quick", 0.0))
         novelty_mid = float(stats.get("novelty_mid", 0.0))
         novelty = 0.5 * (novelty_quick + novelty_mid)
+        batch_seconds = max(0.0, float(stats.get("batch_seconds", 0.0)))
+        target_seconds = max(0.5, float(stats.get("target_batch_seconds", 3.0)))
+
+        over_budget = batch_seconds > target_seconds
+
+        # Enforce staged selectivity: if a stage keeps almost everyone, tighten it.
+        if population >= 3.0 and quick_rate > 0.90:
+            self.quick_keep_ratio -= 0.07
+            self.quick_cycle_fraction -= 0.02
+        if quick_kept >= 2.0 and mid_over_quick > 0.88:
+            self.mid_keep_ratio -= 0.05
+            self.mid_cycle_fraction -= 0.015
+
+        if over_budget:
+            # Runtime budget has priority over deeper exploration.
+            over = min(3.0, batch_seconds / target_seconds)
+            self.quick_keep_ratio -= min(0.20, 0.045 * over)
+            self.mid_keep_ratio -= min(0.16, 0.035 * over)
+            self.quick_cycle_fraction -= min(0.16, 0.040 * over)
+            self.mid_cycle_fraction -= min(0.12, 0.030 * over)
+            if over > 1.4 and self.key_variant_count > 1:
+                self.key_variant_count -= 1
+            self.clamp()
+            return
 
         if probe_win_rate > 0.20:
             self.quick_keep_ratio += 0.08
@@ -159,13 +195,10 @@ class PredictiveStageController:
             elif novelty < 0.15:
                 self.quick_cycle_fraction -= 0.01
 
-        # Enforce staged selectivity: if a stage keeps almost everyone, tighten it.
-        if population >= 3.0 and quick_rate > 0.90:
-            self.quick_keep_ratio -= 0.07
-            self.quick_cycle_fraction -= 0.02
-        if quick_kept >= 2.0 and mid_over_quick > 0.88:
-            self.mid_keep_ratio -= 0.05
-            self.mid_cycle_fraction -= 0.015
+        if batch_seconds > 0.0 and batch_seconds < (0.55 * target_seconds) and novelty > 0.20:
+            # If we're comfortably below budget, allow a bit more exploration depth.
+            self.quick_cycle_fraction += 0.01
+            self.mid_cycle_fraction += 0.01
 
         self.clamp()
 
@@ -226,6 +259,8 @@ class SafeGFSLEvolver(GFSLEvolver):
         self.mutation_step = max(0.005, min(0.5, float(mutation_step)))
         self.best_fitness_tracker = -float("inf")
         self.stagnation_count = 0
+        self.best_signature_tracker = ""
+        self.signature_stagnation_count = 0
 
     def evolve(
         self,
@@ -259,6 +294,7 @@ class SafeGFSLEvolver(GFSLEvolver):
                 key=lambda g: g.fitness or -float("inf"), reverse=True
             )
             current_best = float(self.population[0].fitness or -float("inf")) if self.population else -float("inf")
+            current_signature = _canonical_signature(self.population[0]) if self.population else ""
             if current_best > (self.best_fitness_tracker + 1e-12):
                 self.best_fitness_tracker = current_best
                 self.stagnation_count = 0
@@ -274,6 +310,12 @@ class SafeGFSLEvolver(GFSLEvolver):
                         self.mutation_rate + self.mutation_step,
                     )
                     self.stagnation_count = 0
+
+            if current_signature == self.best_signature_tracker:
+                self.signature_stagnation_count += 1
+            else:
+                self.best_signature_tracker = current_signature
+                self.signature_stagnation_count = 0
 
             if self.supervised_guide:
                 self.supervised_guide.observe_population(self.population)
@@ -330,11 +372,56 @@ class SafeGFSLEvolver(GFSLEvolver):
                 seen.add(signature)
                 new_population.append(child)
 
+            # Inject random immigrants when the top signature is stuck for too long.
+            if self.signature_stagnation_count >= max(2, self.stagnation_patience):
+                immigrant_target = max(1, int(round(self.population_size * 0.15)))
+                injected = 0
+                inject_attempts = 0
+                while (
+                    len(new_population) < self.population_size
+                    and injected < immigrant_target
+                    and inject_attempts < (immigrant_target * 12)
+                ):
+                    inject_attempts += 1
+                    immigrant = _make_random_genome(
+                        max(4, int(self.population_size * 0.7))
+                    )
+                    immigrant.fitness = None
+                    immigrant.generation = gen + 1
+                    signature = _canonical_signature(immigrant)
+                    if signature in seen:
+                        continue
+                    seen.add(signature)
+                    new_population.append(immigrant)
+                    injected += 1
+
             while len(new_population) < self.population_size:
                 fallback = copy.deepcopy(random.choice(self.population[:elite_size]))
                 fallback.fitness = None
                 fallback.generation = gen + 1
-                new_population.append(fallback)
+                fallback_added = False
+                for _ in range(16):
+                    signature = _canonical_signature(fallback)
+                    if signature not in seen:
+                        seen.add(signature)
+                        new_population.append(fallback)
+                        fallback_added = True
+                        break
+                    fallback = self.mutate(copy.deepcopy(fallback))
+                    fallback.fitness = None
+                    fallback.generation = gen + 1
+                if fallback_added:
+                    continue
+                immigrant = _make_random_genome(
+                    max(4, int(self.population_size * 0.6))
+                )
+                immigrant.fitness = None
+                immigrant.generation = gen + 1
+                signature = _canonical_signature(immigrant)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                new_population.append(immigrant)
 
             self.population = new_population[: self.population_size]
 
@@ -445,7 +532,7 @@ def _build_stage_scenarios(
     fraction = max(0.05, min(1.0, float(cycle_fraction)))
     variants = max(1, int(key_variant_count))
     for scenario in scenarios:
-        stage_cycles = max(10, int(round(float(scenario.cycles) * fraction)))
+        stage_cycles = max(6, int(round(float(scenario.cycles) * fraction)))
         for idx in range(variants):
             var_seed, label = _variant_seed(scenario.seed, idx)
             stage_scenarios.append(
@@ -460,6 +547,41 @@ def _build_stage_scenarios(
                 )
             )
     return stage_scenarios
+
+
+def _subset_stage_scenarios(
+    scenarios: Sequence[ScenarioConfig],
+    *,
+    stage: str,
+) -> List[ScenarioConfig]:
+    scenario_list = list(scenarios)
+    total = len(scenario_list)
+    if total <= 1 or stage == "full":
+        return scenario_list
+
+    if stage == "quick":
+        keep = int(math.ceil(total * 0.34))
+    else:
+        keep = int(math.ceil(total * 0.67))
+    keep = max(1, min(total, keep))
+    if keep >= total:
+        return scenario_list
+
+    indices: List[int] = []
+    if keep == 1:
+        indices = [0]
+    else:
+        for pos in range(keep):
+            idx = int(round((pos * (total - 1)) / float(keep - 1)))
+            if idx not in indices:
+                indices.append(idx)
+    while len(indices) < keep:
+        next_idx = len(indices)
+        if next_idx >= total:
+            break
+        if next_idx not in indices:
+            indices.append(next_idx)
+    return [scenario_list[idx] for idx in indices[:keep]]
 
 
 def _predictive_cut_score(score: float, stage: str, penalty: float) -> float:
@@ -481,6 +603,98 @@ def _stage_keep_count(total: int, ratio: float, *, min_keep: int) -> int:
     if keep >= count:
         keep = count - 1
     return max(1, keep)
+
+
+def _scenario_fingerprint(scenarios: Sequence[ScenarioConfig]) -> str:
+    chunks: List[str] = []
+    for scenario in scenarios:
+        chunks.append(
+            "{name}:{seed}:{cycles}:{budget}:{abs_ms}:{dev:.3f}:{prov:.3f}:{max_s:.3f}".format(
+                name=scenario.name,
+                seed=int(scenario.seed),
+                cycles=int(scenario.cycles),
+                budget=float(scenario.cycle_budget_ms),
+                abs_ms=float(scenario.absolute_time_ms),
+                dev=float(scenario.device_mhz),
+                prov=float(scenario.provider_mhz),
+                max_s=float(scenario.max_test_time_seconds),
+            )
+        )
+    payload = "|".join(chunks).encode("utf-8")
+    return hashlib.blake2b(payload, digest_size=12).hexdigest()
+
+
+def _evaluate_pending_dedup_cache_parallel(
+    *,
+    pending: Sequence[Tuple[int, GFSLGenome]],
+    backend: str,
+    workers: int,
+    executor: Optional[concurrent.futures.Executor],
+    worker_fn,
+    build_task,
+    attr_name: str,
+    cache: "OrderedDict[str, Tuple[float, List[Dict[str, Any]]]]",
+    cache_key_fn,
+    max_cache_entries: int,
+) -> Dict[str, float]:
+    stats = {
+        "total": 0.0,
+        "unique_eval": 0.0,
+        "cache_hits": 0.0,
+        "dup_reuse": 0.0,
+    }
+    if not pending:
+        return stats
+
+    groups: Dict[str, List[GFSLGenome]] = {}
+    for _, genome in pending:
+        key = str(cache_key_fn(genome))
+        groups.setdefault(key, []).append(genome)
+    stats["total"] = float(len(pending))
+
+    unique_pending: List[Tuple[int, GFSLGenome]] = []
+    unique_keys: List[str] = []
+    for key, genomes in groups.items():
+        cached = cache.get(key)
+        if cached is not None:
+            score, rows = cached
+            cache.move_to_end(key)
+            for genome in genomes:
+                setattr(genome, attr_name, _metrics_from_rows(rows))
+                genome.fitness = float(score)
+            stats["cache_hits"] += float(len(genomes))
+            continue
+
+        unique_pending.append((0, genomes[0]))
+        unique_keys.append(key)
+        if len(genomes) > 1:
+            stats["dup_reuse"] += float(len(genomes) - 1)
+
+    if unique_pending:
+        _evaluate_pending_parallel(
+            pending=unique_pending,
+            backend=backend,
+            workers=workers,
+            executor=executor,
+            worker_fn=worker_fn,
+            build_task=build_task,
+            attr_name=attr_name,
+        )
+        stats["unique_eval"] = float(len(unique_pending))
+
+        for (_, genome), key in zip(unique_pending, unique_keys):
+            score = float(genome.fitness or -float("inf"))
+            metrics = getattr(genome, attr_name, [])
+            rows = _metrics_rows(metrics)
+            cache[key] = (score, rows)
+            while len(cache) > max_cache_entries:
+                cache.popitem(last=False)
+
+            for dup in groups[key][1:]:
+                setattr(dup, attr_name, _metrics_from_rows(rows))
+                dup.fitness = score
+
+    return stats
 
 
 def _rank_with_novelty(
@@ -649,6 +863,16 @@ def _mean_metric(metrics: Sequence[ScenarioMetrics], attr: str) -> float:
     if not metrics:
         return 0.0
     return sum(float(getattr(item, attr)) for item in metrics) / float(len(metrics))
+
+
+def _make_random_genome(initial_instructions: int, *, slot_count: Optional[int] = None) -> GFSLGenome:
+    genome = GFSLGenome("algorithm", slot_count=slot_count)
+    for _ in range(random.randint(1, max(1, int(initial_instructions)))):
+        try:
+            genome.add_instruction_interactive()
+        except RuntimeError:
+            break
+    return genome
 
 
 def _metrics_rows(metrics: Sequence[ScenarioMetrics]) -> List[Dict[str, Any]]:
@@ -860,8 +1084,28 @@ def _seed_population_from_archive(
 
     while len(seeded) < population_size:
         fallback = copy.deepcopy(random.choice(evolver.population))
-        io_initializer(fallback)
-        seeded.append(fallback)
+        if push(fallback):
+            continue
+        added = False
+        for _ in range(12):
+            try:
+                mutated = evolver.mutate(copy.deepcopy(fallback))
+                if push(mutated):
+                    added = True
+                    break
+            except Exception:
+                continue
+        if added:
+            continue
+        try:
+            random_genome = _make_random_genome(max(4, initial_instructions))
+            if not push(random_genome):
+                io_initializer(random_genome)
+                seeded.append(random_genome)
+        except Exception:
+            fallback_any = copy.deepcopy(random.choice(evolver.population))
+            io_initializer(fallback_any)
+            seeded.append(fallback_any)
 
     evolver.population = seeded[:population_size]
 
@@ -910,11 +1154,11 @@ def _build_round_report(
     lines.append("")
     lines.append("## Defender Evolution")
     lines.append("")
-    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe | eval q>m>f | keep q>m | probes |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: |")
+    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe | eval q>m>f | keep q>m | probes | uniq | cache | dup | t(s) |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |")
     for row in defender_log:
         lines.append(
-            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {stage_eval} | {stage_keep} | {probe_n} |".format(
+            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {uniq} | {cache} | {dup} | {secs:.2f} |".format(
                 generation=row["generation"],
                 best_score=row["best_score"],
                 principle=row["principle"],
@@ -931,16 +1175,20 @@ def _build_round_report(
                 stage_eval=str(row.get("stage_eval", "0>0>0")),
                 stage_keep=str(row.get("stage_keep", "0>0")),
                 probe_n=int(row.get("probe_samples", 0)),
+                uniq=int(row.get("eval_unique", 0)),
+                cache=int(row.get("cache_hits", 0)),
+                dup=int(row.get("dup_reuse", 0)),
+                secs=float(row.get("batch_seconds", 0.0)),
             )
         )
     lines.append("")
     lines.append("## Attacker Evolution")
     lines.append("")
-    lines.append("| gen | attack_score | lane_success | token_success | attacker_adv | q frac/keep | m frac/keep | key var | probe | eval q>m>f | keep q>m | probes |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: |")
+    lines.append("| gen | attack_score | lane_success | token_success | attacker_adv | q frac/keep | m frac/keep | key var | probe | eval q>m>f | keep q>m | probes | uniq | cache | dup | t(s) |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |")
     for row in attacker_log:
         lines.append(
-            "| {generation} | {attack_score:.4f} | {lane_success:.4f} | {token_success:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {stage_eval} | {stage_keep} | {probe_n} |".format(
+            "| {generation} | {attack_score:.4f} | {lane_success:.4f} | {token_success:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {uniq} | {cache} | {dup} | {secs:.2f} |".format(
                 generation=row["generation"],
                 attack_score=row["attack_score"],
                 lane_success=row["lane_success"],
@@ -955,6 +1203,10 @@ def _build_round_report(
                 stage_eval=str(row.get("stage_eval", "0>0>0")),
                 stage_keep=str(row.get("stage_keep", "0>0")),
                 probe_n=int(row.get("probe_samples", 0)),
+                uniq=int(row.get("eval_unique", 0)),
+                cache=int(row.get("cache_hits", 0)),
+                dup=int(row.get("dup_reuse", 0)),
+                secs=float(row.get("batch_seconds", 0.0)),
             )
         )
     return "\n".join(lines) + "\n"
@@ -1196,6 +1448,9 @@ def _run_defender_round(
         archive.get("predictive_profile", {}).get("defender"),
     )
     stage_stats: Dict[str, float] = {}
+    stage_cache: "OrderedDict[str, Tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
+    cache_limit = max(500, int(config.max_eval_cache_entries))
+    attacker_signature = _canonical_signature(attacker) if attacker is not None else "none"
 
     def make_scenarios(stage: str) -> List[ScenarioConfig]:
         if stage == "quick":
@@ -1205,9 +1460,9 @@ def _run_defender_round(
             frac = controller.mid_cycle_fraction
             key_variants = min(3, max(1, controller.key_variant_count))
         else:
-            frac = 1.0
+            frac = min(1.0, max(0.50, controller.mid_cycle_fraction + 0.08))
             key_variants = max(1, controller.key_variant_count)
-        return _build_stage_scenarios(
+        stage_scenarios = _build_stage_scenarios(
             scenarios,
             cycle_fraction=frac,
             key_variant_count=key_variants,
@@ -1215,6 +1470,7 @@ def _run_defender_round(
             provider_mhz=config.provider_mhz,
             max_test_time_seconds=config.max_test_time_seconds,
         )
+        return _subset_stage_scenarios(stage_scenarios, stage=stage)
 
     def fitness(genome: GFSLGenome) -> float:
         ensure_genome_io(genome)
@@ -1254,10 +1510,14 @@ def _run_defender_round(
                 m=int(stage_stats.get("mid_kept", 0.0)),
             ),
             "probe_samples": int(stage_stats.get("probe_samples", 0.0)),
+            "eval_unique": int(stage_stats.get("eval_unique", 0.0)),
+            "cache_hits": int(stage_stats.get("cache_hits", 0.0)),
+            "dup_reuse": int(stage_stats.get("dup_reuse", 0.0)),
+            "batch_seconds": float(stage_stats.get("batch_seconds", 0.0)),
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n}".format(
+            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} uniq={uniq} cache={cache} dup={dup} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 security=row["security"],
@@ -1272,6 +1532,10 @@ def _run_defender_round(
                 stage_eval=row["stage_eval"],
                 stage_keep=row["stage_keep"],
                 probe_n=row["probe_samples"],
+                uniq=row["eval_unique"],
+                cache=row["cache_hits"],
+                dup=row["dup_reuse"],
+                secs=row["batch_seconds"],
             )
         )
 
@@ -1284,6 +1548,7 @@ def _run_defender_round(
         if not pending:
             return
 
+        eval_started = time.perf_counter()
         local_stage: Dict[str, float] = {
             "population": float(len(pending)),
             "quick_eval": float(len(pending)),
@@ -1295,11 +1560,30 @@ def _run_defender_round(
             "probe_wins": 0.0,
             "novelty_quick": 0.0,
             "novelty_mid": 0.0,
+            "eval_unique": 0.0,
+            "cache_hits": 0.0,
+            "dup_reuse": 0.0,
+            "target_batch_seconds": float(config.target_generation_seconds),
+            "batch_seconds": 0.0,
         }
+
+        if config.statistical_predictive and config.auto_statistical_tuning:
+            # Preemptively tighten staged load when pending genomes outnumber workers.
+            pressure = float(len(pending)) / float(max(1, resource_plan.parallel_workers))
+            if pressure > 2.0:
+                factor = min(2.0, pressure - 2.0)
+                controller.quick_keep_ratio -= 0.06 * factor
+                controller.mid_keep_ratio -= 0.05 * factor
+                controller.quick_cycle_fraction -= 0.035 * factor
+                controller.mid_cycle_fraction -= 0.028 * factor
+                if pressure > 3.0 and controller.key_variant_count > 1:
+                    controller.key_variant_count -= 1
+                controller.clamp()
 
         if not config.statistical_predictive:
             full_scenarios = make_scenarios("full")
-            _evaluate_pending_parallel(
+            full_fp = _scenario_fingerprint(full_scenarios)
+            eval_stats = _evaluate_pending_dedup_cache_parallel(
                 pending=pending,
                 backend=resource_plan.parallel_backend,
                 workers=resource_plan.parallel_workers,
@@ -1311,10 +1595,21 @@ def _run_defender_round(
                     copy.deepcopy(attacker) if attacker is not None else None,
                 ),
                 attr_name="_pcpl_metrics",
+                cache=stage_cache,
+                cache_key_fn=lambda g, sf=full_fp: "def:full:{sf}:{att}:{sig}".format(
+                    sf=sf,
+                    att=attacker_signature,
+                    sig=_canonical_signature(g),
+                ),
+                max_cache_entries=cache_limit,
             )
-            local_stage["full_eval"] = float(len(pending))
-            local_stage["quick_kept"] = float(len(pending))
-            local_stage["mid_kept"] = float(len(pending))
+            local_stage["full_eval"] = float(eval_stats["total"])
+            local_stage["quick_kept"] = float(eval_stats["total"])
+            local_stage["mid_kept"] = float(eval_stats["total"])
+            local_stage["eval_unique"] += float(eval_stats["unique_eval"])
+            local_stage["cache_hits"] += float(eval_stats["cache_hits"])
+            local_stage["dup_reuse"] += float(eval_stats["dup_reuse"])
+            local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             stage_stats.clear()
             stage_stats.update(local_stage)
             return
@@ -1324,7 +1619,8 @@ def _run_defender_round(
         full_scenarios = make_scenarios("full")
 
         # Stage 1: fast statistical screen.
-        _evaluate_pending_parallel(
+        quick_fp = _scenario_fingerprint(quick_scenarios)
+        quick_stats = _evaluate_pending_dedup_cache_parallel(
             pending=pending,
             backend=resource_plan.parallel_backend,
             workers=resource_plan.parallel_workers,
@@ -1336,7 +1632,18 @@ def _run_defender_round(
                 copy.deepcopy(attacker) if attacker is not None else None,
             ),
             attr_name="_pcpl_metrics",
+            cache=stage_cache,
+            cache_key_fn=lambda g, sf=quick_fp: "def:quick:{sf}:{att}:{sig}".format(
+                sf=sf,
+                att=attacker_signature,
+                sig=_canonical_signature(g),
+            ),
+            max_cache_entries=cache_limit,
         )
+        local_stage["quick_eval"] = float(quick_stats["total"])
+        local_stage["eval_unique"] += float(quick_stats["unique_eval"])
+        local_stage["cache_hits"] += float(quick_stats["cache_hits"])
+        local_stage["dup_reuse"] += float(quick_stats["dup_reuse"])
         pending_genomes = [genome for _, genome in pending]
         _mark_duplicate_genomes(
             pending_genomes,
@@ -1377,6 +1684,7 @@ def _run_defender_round(
         ]
         local_stage["mid_eval"] = float(len(mid_pending))
         if not mid_pending:
+            local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             controller.apply_feedback(local_stage)
             stage_stats.clear()
             stage_stats.update({
@@ -1386,7 +1694,8 @@ def _run_defender_round(
             return
 
         # Stage 2: medium-depth check.
-        _evaluate_pending_parallel(
+        mid_fp = _scenario_fingerprint(mid_scenarios)
+        mid_stats = _evaluate_pending_dedup_cache_parallel(
             pending=mid_pending,
             backend=resource_plan.parallel_backend,
             workers=resource_plan.parallel_workers,
@@ -1398,7 +1707,18 @@ def _run_defender_round(
                 copy.deepcopy(attacker) if attacker is not None else None,
             ),
             attr_name="_pcpl_metrics",
+            cache=stage_cache,
+            cache_key_fn=lambda g, sf=mid_fp: "def:mid:{sf}:{att}:{sig}".format(
+                sf=sf,
+                att=attacker_signature,
+                sig=_canonical_signature(g),
+            ),
+            max_cache_entries=cache_limit,
         )
+        local_stage["mid_eval"] = float(mid_stats["total"])
+        local_stage["eval_unique"] += float(mid_stats["unique_eval"])
+        local_stage["cache_hits"] += float(mid_stats["cache_hits"])
+        local_stage["dup_reuse"] += float(mid_stats["dup_reuse"])
         mid_genomes = [genome for _, genome in mid_pending]
         _mark_duplicate_genomes(
             mid_genomes,
@@ -1439,6 +1759,7 @@ def _run_defender_round(
         ]
         local_stage["full_eval"] = float(len(full_pending))
         if not full_pending:
+            local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             controller.apply_feedback(local_stage)
             stage_stats.clear()
             stage_stats.update({
@@ -1448,7 +1769,8 @@ def _run_defender_round(
             return
 
         # Stage 3: full-depth validation on finalists.
-        _evaluate_pending_parallel(
+        full_fp = _scenario_fingerprint(full_scenarios)
+        full_stats = _evaluate_pending_dedup_cache_parallel(
             pending=full_pending,
             backend=resource_plan.parallel_backend,
             workers=resource_plan.parallel_workers,
@@ -1460,7 +1782,18 @@ def _run_defender_round(
                 copy.deepcopy(attacker) if attacker is not None else None,
             ),
             attr_name="_pcpl_metrics",
+            cache=stage_cache,
+            cache_key_fn=lambda g, sf=full_fp: "def:full:{sf}:{att}:{sig}".format(
+                sf=sf,
+                att=attacker_signature,
+                sig=_canonical_signature(g),
+            ),
+            max_cache_entries=cache_limit,
         )
+        local_stage["full_eval"] = float(full_stats["total"])
+        local_stage["eval_unique"] += float(full_stats["unique_eval"])
+        local_stage["cache_hits"] += float(full_stats["cache_hits"])
+        local_stage["dup_reuse"] += float(full_stats["dup_reuse"])
 
         # Probe a small random sample from cut genomes to estimate false negatives.
         survivor_ids = {id(genome) for _, genome in full_pending}
@@ -1476,7 +1809,7 @@ def _run_defender_round(
         probe_pending: List[Tuple[int, GFSLGenome]] = []
         if probe_n > 0 and cut_candidates:
             probe_pending = random.sample(cut_candidates, min(probe_n, len(cut_candidates)))
-            _evaluate_pending_parallel(
+            probe_stats = _evaluate_pending_dedup_cache_parallel(
                 pending=probe_pending,
                 backend=resource_plan.parallel_backend,
                 workers=resource_plan.parallel_workers,
@@ -1488,7 +1821,17 @@ def _run_defender_round(
                     copy.deepcopy(attacker) if attacker is not None else None,
                 ),
                 attr_name="_pcpl_metrics",
+                cache=stage_cache,
+                cache_key_fn=lambda g, sf=full_fp: "def:full:{sf}:{att}:{sig}".format(
+                    sf=sf,
+                    att=attacker_signature,
+                    sig=_canonical_signature(g),
+                ),
+                max_cache_entries=cache_limit,
             )
+            local_stage["eval_unique"] += float(probe_stats["unique_eval"])
+            local_stage["cache_hits"] += float(probe_stats["cache_hits"])
+            local_stage["dup_reuse"] += float(probe_stats["dup_reuse"])
             cutoff = min(float(genome.fitness or -float("inf")) for _, genome in full_pending)
             probe_wins = 0
             for _, probe_genome in probe_pending:
@@ -1504,6 +1847,7 @@ def _run_defender_round(
             local_stage["probe_samples"] = float(len(probe_pending))
             local_stage["probe_wins"] = float(probe_wins)
 
+        local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
         controller.apply_feedback(local_stage)
         stage_stats.clear()
         stage_stats.update({
@@ -1562,6 +1906,9 @@ def _run_attacker_round(
         archive.get("predictive_profile", {}).get("attacker"),
     )
     stage_stats: Dict[str, float] = {}
+    stage_cache: "OrderedDict[str, Tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
+    cache_limit = max(500, int(config.max_eval_cache_entries))
+    defender_signature = _canonical_signature(defender)
 
     def make_scenarios(stage: str) -> List[ScenarioConfig]:
         if stage == "quick":
@@ -1571,9 +1918,9 @@ def _run_attacker_round(
             frac = controller.mid_cycle_fraction
             key_variants = min(3, max(1, controller.key_variant_count))
         else:
-            frac = 1.0
+            frac = min(1.0, max(0.50, controller.mid_cycle_fraction + 0.08))
             key_variants = max(1, controller.key_variant_count)
-        return _build_stage_scenarios(
+        stage_scenarios = _build_stage_scenarios(
             scenarios,
             cycle_fraction=frac,
             key_variant_count=key_variants,
@@ -1581,6 +1928,7 @@ def _run_attacker_round(
             provider_mhz=config.provider_mhz,
             max_test_time_seconds=config.max_test_time_seconds,
         )
+        return _subset_stage_scenarios(stage_scenarios, stage=stage)
 
     def fitness(attacker: GFSLGenome) -> float:
         ensure_attacker_genome_io(attacker)
@@ -1624,10 +1972,14 @@ def _run_attacker_round(
                 m=int(stage_stats.get("mid_kept", 0.0)),
             ),
             "probe_samples": int(stage_stats.get("probe_samples", 0.0)),
+            "eval_unique": int(stage_stats.get("eval_unique", 0.0)),
+            "cache_hits": int(stage_stats.get("cache_hits", 0.0)),
+            "dup_reuse": int(stage_stats.get("dup_reuse", 0.0)),
+            "batch_seconds": float(stage_stats.get("batch_seconds", 0.0)),
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n}".format(
+            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} uniq={uniq} cache={cache} dup={dup} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 lane=row["lane_success"],
@@ -1641,6 +1993,10 @@ def _run_attacker_round(
                 stage_eval=row["stage_eval"],
                 stage_keep=row["stage_keep"],
                 probe_n=row["probe_samples"],
+                uniq=row["eval_unique"],
+                cache=row["cache_hits"],
+                dup=row["dup_reuse"],
+                secs=row["batch_seconds"],
             )
         )
 
@@ -1653,6 +2009,7 @@ def _run_attacker_round(
         if not pending:
             return
 
+        eval_started = time.perf_counter()
         local_stage: Dict[str, float] = {
             "population": float(len(pending)),
             "quick_eval": float(len(pending)),
@@ -1664,11 +2021,29 @@ def _run_attacker_round(
             "probe_wins": 0.0,
             "novelty_quick": 0.0,
             "novelty_mid": 0.0,
+            "eval_unique": 0.0,
+            "cache_hits": 0.0,
+            "dup_reuse": 0.0,
+            "target_batch_seconds": float(config.target_generation_seconds),
+            "batch_seconds": 0.0,
         }
+
+        if config.statistical_predictive and config.auto_statistical_tuning:
+            pressure = float(len(pending)) / float(max(1, resource_plan.parallel_workers))
+            if pressure > 2.0:
+                factor = min(2.0, pressure - 2.0)
+                controller.quick_keep_ratio -= 0.06 * factor
+                controller.mid_keep_ratio -= 0.05 * factor
+                controller.quick_cycle_fraction -= 0.035 * factor
+                controller.mid_cycle_fraction -= 0.028 * factor
+                if pressure > 3.0 and controller.key_variant_count > 1:
+                    controller.key_variant_count -= 1
+                controller.clamp()
 
         if not config.statistical_predictive:
             full_scenarios = make_scenarios("full")
-            _evaluate_pending_parallel(
+            full_fp = _scenario_fingerprint(full_scenarios)
+            eval_stats = _evaluate_pending_dedup_cache_parallel(
                 pending=pending,
                 backend=resource_plan.parallel_backend,
                 workers=resource_plan.parallel_workers,
@@ -1680,10 +2055,21 @@ def _run_attacker_round(
                     full_scenarios,
                 ),
                 attr_name="_attack_metrics",
+                cache=stage_cache,
+                cache_key_fn=lambda g, sf=full_fp: "atk:full:{sf}:{def_sig}:{sig}".format(
+                    sf=sf,
+                    def_sig=defender_signature,
+                    sig=_canonical_signature(g),
+                ),
+                max_cache_entries=cache_limit,
             )
-            local_stage["full_eval"] = float(len(pending))
-            local_stage["quick_kept"] = float(len(pending))
-            local_stage["mid_kept"] = float(len(pending))
+            local_stage["full_eval"] = float(eval_stats["total"])
+            local_stage["quick_kept"] = float(eval_stats["total"])
+            local_stage["mid_kept"] = float(eval_stats["total"])
+            local_stage["eval_unique"] += float(eval_stats["unique_eval"])
+            local_stage["cache_hits"] += float(eval_stats["cache_hits"])
+            local_stage["dup_reuse"] += float(eval_stats["dup_reuse"])
+            local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             stage_stats.clear()
             stage_stats.update(local_stage)
             return
@@ -1692,7 +2078,8 @@ def _run_attacker_round(
         mid_scenarios = make_scenarios("mid")
         full_scenarios = make_scenarios("full")
 
-        _evaluate_pending_parallel(
+        quick_fp = _scenario_fingerprint(quick_scenarios)
+        quick_stats = _evaluate_pending_dedup_cache_parallel(
             pending=pending,
             backend=resource_plan.parallel_backend,
             workers=resource_plan.parallel_workers,
@@ -1704,7 +2091,18 @@ def _run_attacker_round(
                 quick_scenarios,
             ),
             attr_name="_attack_metrics",
+            cache=stage_cache,
+            cache_key_fn=lambda g, sf=quick_fp: "atk:quick:{sf}:{def_sig}:{sig}".format(
+                sf=sf,
+                def_sig=defender_signature,
+                sig=_canonical_signature(g),
+            ),
+            max_cache_entries=cache_limit,
         )
+        local_stage["quick_eval"] = float(quick_stats["total"])
+        local_stage["eval_unique"] += float(quick_stats["unique_eval"])
+        local_stage["cache_hits"] += float(quick_stats["cache_hits"])
+        local_stage["dup_reuse"] += float(quick_stats["dup_reuse"])
         pending_genomes = [genome for _, genome in pending]
         _mark_duplicate_genomes(
             pending_genomes,
@@ -1745,6 +2143,7 @@ def _run_attacker_round(
         ]
         local_stage["mid_eval"] = float(len(mid_pending))
         if not mid_pending:
+            local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             controller.apply_feedback(local_stage)
             stage_stats.clear()
             stage_stats.update({
@@ -1753,7 +2152,8 @@ def _run_attacker_round(
             })
             return
 
-        _evaluate_pending_parallel(
+        mid_fp = _scenario_fingerprint(mid_scenarios)
+        mid_stats = _evaluate_pending_dedup_cache_parallel(
             pending=mid_pending,
             backend=resource_plan.parallel_backend,
             workers=resource_plan.parallel_workers,
@@ -1765,7 +2165,18 @@ def _run_attacker_round(
                 mid_scenarios,
             ),
             attr_name="_attack_metrics",
+            cache=stage_cache,
+            cache_key_fn=lambda g, sf=mid_fp: "atk:mid:{sf}:{def_sig}:{sig}".format(
+                sf=sf,
+                def_sig=defender_signature,
+                sig=_canonical_signature(g),
+            ),
+            max_cache_entries=cache_limit,
         )
+        local_stage["mid_eval"] = float(mid_stats["total"])
+        local_stage["eval_unique"] += float(mid_stats["unique_eval"])
+        local_stage["cache_hits"] += float(mid_stats["cache_hits"])
+        local_stage["dup_reuse"] += float(mid_stats["dup_reuse"])
         mid_genomes = [genome for _, genome in mid_pending]
         _mark_duplicate_genomes(
             mid_genomes,
@@ -1806,6 +2217,7 @@ def _run_attacker_round(
         ]
         local_stage["full_eval"] = float(len(full_pending))
         if not full_pending:
+            local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             controller.apply_feedback(local_stage)
             stage_stats.clear()
             stage_stats.update({
@@ -1814,7 +2226,8 @@ def _run_attacker_round(
             })
             return
 
-        _evaluate_pending_parallel(
+        full_fp = _scenario_fingerprint(full_scenarios)
+        full_stats = _evaluate_pending_dedup_cache_parallel(
             pending=full_pending,
             backend=resource_plan.parallel_backend,
             workers=resource_plan.parallel_workers,
@@ -1826,7 +2239,18 @@ def _run_attacker_round(
                 full_scenarios,
             ),
             attr_name="_attack_metrics",
+            cache=stage_cache,
+            cache_key_fn=lambda g, sf=full_fp: "atk:full:{sf}:{def_sig}:{sig}".format(
+                sf=sf,
+                def_sig=defender_signature,
+                sig=_canonical_signature(g),
+            ),
+            max_cache_entries=cache_limit,
         )
+        local_stage["full_eval"] = float(full_stats["total"])
+        local_stage["eval_unique"] += float(full_stats["unique_eval"])
+        local_stage["cache_hits"] += float(full_stats["cache_hits"])
+        local_stage["dup_reuse"] += float(full_stats["dup_reuse"])
 
         survivor_ids = {id(genome) for _, genome in full_pending}
         cut_candidates = [
@@ -1841,7 +2265,7 @@ def _run_attacker_round(
         probe_pending: List[Tuple[int, GFSLGenome]] = []
         if probe_n > 0 and cut_candidates:
             probe_pending = random.sample(cut_candidates, min(probe_n, len(cut_candidates)))
-            _evaluate_pending_parallel(
+            probe_stats = _evaluate_pending_dedup_cache_parallel(
                 pending=probe_pending,
                 backend=resource_plan.parallel_backend,
                 workers=resource_plan.parallel_workers,
@@ -1853,7 +2277,17 @@ def _run_attacker_round(
                     full_scenarios,
                 ),
                 attr_name="_attack_metrics",
+                cache=stage_cache,
+                cache_key_fn=lambda g, sf=full_fp: "atk:full:{sf}:{def_sig}:{sig}".format(
+                    sf=sf,
+                    def_sig=defender_signature,
+                    sig=_canonical_signature(g),
+                ),
+                max_cache_entries=cache_limit,
             )
+            local_stage["eval_unique"] += float(probe_stats["unique_eval"])
+            local_stage["cache_hits"] += float(probe_stats["cache_hits"])
+            local_stage["dup_reuse"] += float(probe_stats["dup_reuse"])
             cutoff = min(float(genome.fitness or -float("inf")) for _, genome in full_pending)
             probe_wins = 0
             for _, probe_genome in probe_pending:
@@ -1869,6 +2303,7 @@ def _run_attacker_round(
             local_stage["probe_samples"] = float(len(probe_pending))
             local_stage["probe_wins"] = float(probe_wins)
 
+        local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
         controller.apply_feedback(local_stage)
         stage_stats.clear()
         stage_stats.update({
