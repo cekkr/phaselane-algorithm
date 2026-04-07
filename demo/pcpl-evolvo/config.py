@@ -14,8 +14,8 @@ DEFAULT_MODE = "dynamic"
 
 BASE_DEFAULTS: Dict[str, Any] = {
     "seed": 94960397,
-    "population_size": 64,
-    "generations": 100,
+    "population_size": 128,
+    "generations": 500,
     "initial_instructions": 12,
     "rounds": 25,
     "attacker_population_size": 128,
