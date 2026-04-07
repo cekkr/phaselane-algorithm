@@ -15,6 +15,7 @@ It is built directly on top of the deterministic protocol reference in `demo/pcp
 - `src/pcpl_evolvo/simulation.py` - PCPL simulation + scoring model.
 - `src/pcpl_evolvo/experiment.py` - continuous co-evolution engine + archive persistence.
 - `run_experiments.py` - CLI runner.
+- `config.py` - central presets/defaults (`balanced`, `dynamic`, `explorer`).
 - `run_auto.sh` - one-command execution with timestamped logs.
 - `runs/` - generated artifacts (ignored in git, except `.gitkeep`).
 
@@ -47,10 +48,25 @@ Subsequent runs can resume from the same `--out-dir` and continue evolving from 
 
 ## Usage
 
+Default behavior is now driven by `config.py` mode presets.  
+This avoids passing many low-level flags on the CLI.
+
+### List preset modes
+
+```bash
+python3 demo/pcpl-evolvo/run_experiments.py --list-modes
+```
+
+### Print resolved config before running
+
+```bash
+python3 demo/pcpl-evolvo/run_experiments.py --mode dynamic --print-effective-config
+```
+
 ### Single round
 
 ```bash
-python3 demo/pcpl-evolvo/run_experiments.py --profile fast --rounds 1 --workers 0
+python3 demo/pcpl-evolvo/run_experiments.py --profile fast --mode dynamic --rounds 1
 ```
 
 ### Continuous/resumable rounds
@@ -58,6 +74,7 @@ python3 demo/pcpl-evolvo/run_experiments.py --profile fast --rounds 1 --workers 
 ```bash
 python3 demo/pcpl-evolvo/run_experiments.py \
   --profile fast \
+  --mode dynamic \
   --out-dir demo/pcpl-evolvo/runs/mainline \
   --rounds 5 \
   --parallel-backend process \
@@ -71,6 +88,7 @@ Run again with the same `--out-dir` to continue from archive elites.
 ```bash
 python3 demo/pcpl-evolvo/run_experiments.py \
   --profile fast \
+  --mode dynamic \
   --out-dir demo/pcpl-evolvo/runs/mainline \
   --rounds 1 \
   --continuous
@@ -98,6 +116,8 @@ python3 demo/pcpl-evolvo/run_experiments.py --continuous --continuous-max-iterat
 
 ## Main CLI options
 
+- `--mode {balanced,dynamic,explorer}` (recommended high-level tuning control from `config.py`)
+- `--list-modes`, `--print-effective-config`
 - `--population-size`, `--generations`
 - `--attacker-population-size`, `--attacker-generations`
 - `--elite-pool`, `--archive-limit`
@@ -113,6 +133,7 @@ python3 demo/pcpl-evolvo/run_experiments.py --continuous --continuous-max-iterat
 - `--no-auto-statistical-tuning` (keep stage fractions/ratios fixed to CLI values)
 
 Notes:
+- Edit `demo/pcpl-evolvo/config.py` if you want persistent defaults instead of long CLI command lines.
 - `--continuous` now runs multiple combo lanes in parallel by default (auto-planned from available CPUs), with per-lane worker splitting so `--workers 0` exploits all cores without extra flags.
 - Process workers are now reused across generations/rounds for lower spawn overhead and higher sustained CPU utilization.
 - The adaptive parent-pool + mutation schedule reduces random dispersivity and focuses search around top genomes while preserving exploration.

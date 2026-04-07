@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import sys
 
+from config import DEFAULT_MODE, available_modes, mode_summary, resolve_defaults
+
 PROJECT_DIR = Path(__file__).resolve().parent
 SRC_DIR = PROJECT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
@@ -122,14 +124,14 @@ def _build_experiment_config(
         resume=resume,
         parallel_workers=workers,
         parallel_backend=args.parallel_backend,
-        use_supervised_guide=not args.no_supervised_guide,
+        use_supervised_guide=bool(args.use_supervised_guide),
         preferred_device=args.device,
         parent_pool_ratio=args.parent_pool_ratio,
         stagnation_patience=args.stagnation_patience,
         mutation_floor=args.mutation_floor,
         mutation_ceiling=args.mutation_ceiling,
         mutation_step=args.mutation_step,
-        statistical_predictive=not args.no_statistical_predictive,
+        statistical_predictive=bool(args.statistical_predictive),
         quick_cycle_fraction=args.quick_cycle_fraction,
         mid_cycle_fraction=args.mid_cycle_fraction,
         quick_keep_ratio=args.quick_keep_ratio,
@@ -137,7 +139,7 @@ def _build_experiment_config(
         key_variant_count=args.key_variants,
         novelty_bonus=args.novelty_bonus,
         predictive_penalty=args.predictive_penalty,
-        auto_statistical_tuning=not args.no_auto_statistical_tuning,
+        auto_statistical_tuning=bool(args.auto_statistical_tuning),
         device_mhz=args.device_mhz,
         provider_mhz=args.provider_mhz,
         max_test_time_seconds=args.max_test_seconds,
@@ -190,6 +192,138 @@ def _outer_mp_context() -> Optional[str]:
     return "fork"
 
 
+def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
+    defaults = resolve_defaults(profile=str(args.profile), mode=str(args.mode))
+    key_map = {
+        "seed": "seed",
+        "population_size": "population_size",
+        "generations": "generations",
+        "initial_instructions": "initial_instructions",
+        "rounds": "rounds",
+        "attacker_population_size": "attacker_population_size",
+        "attacker_generations": "attacker_generations",
+        "elite_pool": "elite_pool",
+        "archive_limit": "archive_limit",
+        "continuous_max_iterations": "continuous_max_iterations",
+        "workers": "workers",
+        "parallel_backend": "parallel_backend",
+        "device": "preferred_device",
+        "parent_pool_ratio": "parent_pool_ratio",
+        "stagnation_patience": "stagnation_patience",
+        "mutation_floor": "mutation_floor",
+        "mutation_ceiling": "mutation_ceiling",
+        "mutation_step": "mutation_step",
+        "quick_cycle_fraction": "quick_cycle_fraction",
+        "mid_cycle_fraction": "mid_cycle_fraction",
+        "quick_keep_ratio": "quick_keep_ratio",
+        "mid_keep_ratio": "mid_keep_ratio",
+        "key_variants": "key_variants",
+        "novelty_bonus": "novelty_bonus",
+        "predictive_penalty": "predictive_penalty",
+        "device_mhz": "device_mhz",
+        "provider_mhz": "provider_mhz",
+        "max_test_seconds": "max_test_seconds",
+    }
+
+    resolved: Dict[str, Any] = {}
+    for arg_key, cfg_key in key_map.items():
+        value = getattr(args, arg_key)
+        resolved[arg_key] = defaults[cfg_key] if value is None else value
+
+    resolved["use_supervised_guide"] = bool(defaults["use_supervised_guide"]) and not bool(
+        args.no_supervised_guide
+    )
+    resolved["statistical_predictive"] = bool(defaults["statistical_predictive"]) and not bool(
+        args.no_statistical_predictive
+    )
+    resolved["auto_statistical_tuning"] = bool(defaults["auto_statistical_tuning"]) and not bool(
+        args.no_auto_statistical_tuning
+    )
+    resolved["resume"] = bool(defaults["resume"]) and not bool(args.no_resume)
+    resolved["mode"] = str(args.mode)
+    resolved["profile"] = str(args.profile)
+    resolved["mode_summary"] = mode_summary(str(args.mode))
+    return resolved
+
+
+def _apply_runtime_config(args: argparse.Namespace, resolved: Dict[str, Any]) -> None:
+    for key in (
+        "seed",
+        "population_size",
+        "generations",
+        "initial_instructions",
+        "rounds",
+        "attacker_population_size",
+        "attacker_generations",
+        "elite_pool",
+        "archive_limit",
+        "continuous_max_iterations",
+        "workers",
+        "parallel_backend",
+        "device",
+        "parent_pool_ratio",
+        "stagnation_patience",
+        "mutation_floor",
+        "mutation_ceiling",
+        "mutation_step",
+        "quick_cycle_fraction",
+        "mid_cycle_fraction",
+        "quick_keep_ratio",
+        "mid_keep_ratio",
+        "key_variants",
+        "novelty_bonus",
+        "predictive_penalty",
+        "device_mhz",
+        "provider_mhz",
+        "max_test_seconds",
+    ):
+        setattr(args, key, resolved[key])
+    setattr(args, "use_supervised_guide", bool(resolved["use_supervised_guide"]))
+    setattr(args, "statistical_predictive", bool(resolved["statistical_predictive"]))
+    setattr(args, "auto_statistical_tuning", bool(resolved["auto_statistical_tuning"]))
+    setattr(args, "resume", bool(resolved["resume"]))
+
+
+def _print_effective_config(resolved: Dict[str, Any]) -> None:
+    print(
+        "[pcpl-evolvo] config profile={profile} mode={mode} ({summary})".format(
+            profile=resolved["profile"],
+            mode=resolved["mode"],
+            summary=resolved["mode_summary"],
+        )
+    )
+    print(
+        "[pcpl-evolvo] evolve pop={pop} gen={gen} init={init} atk_pop={apop} atk_gen={agen} elite={elite}".format(
+            pop=resolved["population_size"],
+            gen=resolved["generations"],
+            init=resolved["initial_instructions"],
+            apop=resolved["attacker_population_size"],
+            agen=resolved["attacker_generations"],
+            elite=resolved["elite_pool"],
+        )
+    )
+    print(
+        "[pcpl-evolvo] dynamics parent_pool={pp:.2f} stagnation={stag} mutation={mf:.2f}..{mc:.2f} step={ms:.2f}".format(
+            pp=float(resolved["parent_pool_ratio"]),
+            stag=int(resolved["stagnation_patience"]),
+            mf=float(resolved["mutation_floor"]),
+            mc=float(resolved["mutation_ceiling"]),
+            ms=float(resolved["mutation_step"]),
+        )
+    )
+    print(
+        "[pcpl-evolvo] staged quick={qf:.2f}/{qk:.2f} mid={mf:.2f}/{mk:.2f} key_variants={kv} novelty={nov:.3f} penalty={pen:.3f}".format(
+            qf=float(resolved["quick_cycle_fraction"]),
+            qk=float(resolved["quick_keep_ratio"]),
+            mf=float(resolved["mid_cycle_fraction"]),
+            mk=float(resolved["mid_keep_ratio"]),
+            kv=int(resolved["key_variants"]),
+            nov=float(resolved["novelty_bonus"]),
+            pen=float(resolved["predictive_penalty"]),
+        )
+    )
+
+
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -230,58 +364,77 @@ def parse_args() -> argparse.Namespace:
         description="PCPL continuous empirical/evolutionary runner (Evolvo-backed)."
     )
     parser.add_argument(
+        "--mode",
+        choices=available_modes(),
+        default=DEFAULT_MODE,
+        help=(
+            "High-level evolution mode loaded from config.py. "
+            "Use this instead of tuning many low-level flags."
+        ),
+    )
+    parser.add_argument(
+        "--list-modes",
+        action="store_true",
+        help="Print available modes from config.py and exit.",
+    )
+    parser.add_argument(
+        "--print-effective-config",
+        action="store_true",
+        help="Print resolved config (mode + profile + CLI overrides) before run.",
+    )
+    parser.add_argument(
         "--profile",
         choices=("fast", "full"),
         default="fast",
         help="Scenario profile. fast is shorter; full is heavier.",
     )
-    parser.add_argument("--seed", type=int, default=1337, help="Random seed.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed.")
     parser.add_argument(
         "--population-size",
         type=int,
-        default=18,
+        default=None,
         help="Defender population size.",
     )
     parser.add_argument(
         "--generations",
         type=int,
-        default=16,
+        default=None,
         help="Defender generations per round.",
     )
     parser.add_argument(
         "--initial-instructions",
         type=int,
-        default=12,
+        default=None,
         help="Max random seed instruction count.",
     )
     parser.add_argument(
         "--rounds",
         type=int,
-        default=1,
+        default=None,
         help="Continuous rounds to run in this invocation.",
     )
     parser.add_argument(
         "--attacker-population-size",
         type=int,
-        default=12,
+        default=None,
         help="Attacker population size per round.",
     )
     parser.add_argument(
         "--attacker-generations",
         type=int,
-        default=6,
+        default=None,
         help="Attacker generations per round.",
     )
     parser.add_argument(
         "--elite-pool",
         type=int,
-        default=12,
+        default=None,
         help="Number of top archived genomes used to seed each new round.",
     )
     parser.add_argument(
         "--archive-limit",
         type=int,
-        default=64,
+        default=None,
         help="Max defender/attacker elites kept in archive.",
     )
     parser.add_argument(
@@ -309,7 +462,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--continuous-max-iterations",
         type=int,
-        default=0,
+        default=None,
         help=(
             "Optional cap for continuous mode iterations; 0 means infinite "
             "(until user stop)."
@@ -318,7 +471,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workers",
         type=int,
-        default=0,
+        default=None,
         help=(
             "Parallel fitness workers. 0 means auto (use all available CPU cores)."
         ),
@@ -326,7 +479,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--parallel-backend",
         choices=("auto", "process", "thread", "off"),
-        default="auto",
+        default=None,
         help="Parallel backend for fitness evaluation.",
     )
     parser.add_argument(
@@ -337,37 +490,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         choices=("auto", "cpu", "cuda", "mps"),
-        default="auto",
+        default=None,
         help="Preferred compute device for supervised guide.",
     )
     parser.add_argument(
         "--parent-pool-ratio",
         type=float,
-        default=0.60,
+        default=None,
         help="Fraction of top genomes used as parent pool (less random dispersivity).",
     )
     parser.add_argument(
         "--stagnation-patience",
         type=int,
-        default=4,
+        default=None,
         help="Generations without improvement before increasing mutation pressure.",
     )
     parser.add_argument(
         "--mutation-floor",
         type=float,
-        default=0.12,
+        default=None,
         help="Minimum adaptive mutation rate.",
     )
     parser.add_argument(
         "--mutation-ceiling",
         type=float,
-        default=0.55,
+        default=None,
         help="Maximum adaptive mutation rate.",
     )
     parser.add_argument(
         "--mutation-step",
         type=float,
-        default=0.05,
+        default=None,
         help="Adaptive mutation step when stagnating/improving.",
     )
     parser.add_argument(
@@ -378,31 +531,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--quick-cycle-fraction",
         type=float,
-        default=0.14,
+        default=None,
         help="Initial fraction of cycles used by quick stage (auto-tuned at runtime).",
     )
     parser.add_argument(
         "--mid-cycle-fraction",
         type=float,
-        default=0.50,
+        default=None,
         help="Initial fraction of cycles used by medium stage (auto-tuned at runtime).",
     )
     parser.add_argument(
         "--quick-keep-ratio",
         type=float,
-        default=0.55,
+        default=None,
         help="Initial fraction of genomes kept after quick stage (auto-tuned at runtime).",
     )
     parser.add_argument(
         "--mid-keep-ratio",
         type=float,
-        default=0.30,
+        default=None,
         help="Initial fraction of genomes kept after medium stage (auto-tuned at runtime).",
     )
     parser.add_argument(
         "--key-variants",
         type=int,
-        default=2,
+        default=None,
         help="Initial key generation/sharing variants per scenario (auto-tuned at runtime).",
     )
     parser.add_argument(
@@ -413,31 +566,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--novelty-bonus",
         type=float,
-        default=0.03,
+        default=None,
         help="Fitness bonus for novel non-duplicate genomes during staged ranking.",
     )
     parser.add_argument(
         "--predictive-penalty",
         type=float,
-        default=0.05,
+        default=None,
         help="Penalty applied when a genome is cut by predictive stages.",
     )
     parser.add_argument(
         "--device-mhz",
         type=float,
-        default=100.0,
+        default=None,
         help="Simulated consumer device frequency in MHz.",
     )
     parser.add_argument(
         "--provider-mhz",
         type=float,
-        default=300.0,
+        default=None,
         help="Simulated provider frequency in MHz.",
     )
     parser.add_argument(
         "--max-test-seconds",
         type=float,
-        default=10.0,
+        default=None,
         help="Long-horizon timing projection target (seconds).",
     )
     return parser.parse_args()
@@ -445,6 +598,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.list_modes:
+        print("[pcpl-evolvo] available modes:")
+        for name in available_modes():
+            print(f"- {name}: {mode_summary(name)}")
+        return
+
+    resolved = _resolve_runtime_config(args)
+    _apply_runtime_config(args, resolved)
+    _print_effective_config(resolved)
+    if args.print_effective_config:
+        return
 
     if args.out_dir:
         out_dir = Path(args.out_dir).expanduser().resolve()
@@ -465,7 +629,7 @@ def main() -> None:
             attacker_generations=args.attacker_generations,
             elite_pool=args.elite_pool,
             archive_limit=args.archive_limit,
-            resume=not args.no_resume,
+            resume=bool(args.resume),
             workers=args.workers,
         )
 
