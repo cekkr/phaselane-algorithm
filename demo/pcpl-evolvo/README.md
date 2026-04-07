@@ -17,6 +17,8 @@ It is built directly on top of the deterministic protocol reference in `demo/pcp
 - `run_experiments.py` - CLI runner.
 - `config.py` - central presets/defaults (`balanced`, `dynamic`, `explorer`).
 - `run_auto.sh` - one-command execution with timestamped logs.
+- `compile_perf.sh` - optimized bytecode compile script (macOS/Linux).
+- `compile_perf.ps1` - optimized bytecode compile script (PowerShell).
 - `runs/` - generated artifacts (ignored in git, except `.gitkeep`).
 
 ## Scoring model
@@ -112,6 +114,20 @@ python3 demo/pcpl-evolvo/run_experiments.py --continuous --continuous-max-iterat
 
 ```bash
 ./demo/pcpl-evolvo/run_auto.sh --profile fast --rounds 3
+```
+
+### Compile For Performance (Startup/Import)
+
+macOS/Linux:
+
+```bash
+./demo/pcpl-evolvo/compile_perf.sh --clean
+```
+
+PowerShell:
+
+```powershell
+./demo/pcpl-evolvo/compile_perf.ps1 -Clean
 ```
 
 ## Main CLI options
