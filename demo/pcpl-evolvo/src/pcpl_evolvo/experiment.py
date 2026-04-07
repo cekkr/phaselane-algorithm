@@ -294,7 +294,7 @@ class SafeGFSLEvolver(GFSLEvolver):
                 key=lambda g: g.fitness or -float("inf"), reverse=True
             )
             current_best = float(self.population[0].fitness or -float("inf")) if self.population else -float("inf")
-            current_signature = _canonical_signature(self.population[0]) if self.population else ""
+            current_signature = _evaluation_signature(self.population[0]) if self.population else ""
             if current_best > (self.best_fitness_tracker + 1e-12):
                 self.best_fitness_tracker = current_best
                 self.stagnation_count = 0
@@ -499,6 +499,15 @@ def _resolve_resource_plan(config: ExperimentConfig, max_population: int) -> Res
     )
 
 
+def _process_pool_context_name() -> Optional[str]:
+    if os.name == "nt":
+        return None
+    if platform.system().lower() == "darwin":
+        # Avoid unsafe fork interactions with MPS/objc runtime on macOS.
+        return "spawn"
+    return "fork"
+
+
 def _metrics_from_rows(rows: Sequence[Dict[str, Any]]) -> List[ScenarioMetrics]:
     return [ScenarioMetrics(**row) for row in rows]
 
@@ -605,6 +614,56 @@ def _stage_keep_count(total: int, ratio: float, *, min_keep: int) -> int:
     return max(1, keep)
 
 
+def _quick_eval_limit(
+    *,
+    total: int,
+    workers: int,
+    profile: str,
+) -> int:
+    if total <= 2:
+        return max(1, total)
+    eff_workers = max(1, int(workers))
+    pressure = float(total) / float(eff_workers)
+    if pressure <= 1.5:
+        return total
+
+    # Reduce first-stage load when there are too many pending genomes per worker.
+    frac = 0.88 - (0.18 * (pressure - 1.5))
+    if str(profile).lower() == "full":
+        frac -= 0.05
+    frac = clamp(frac, 0.42, 0.88)
+    target = int(math.ceil(float(total) * frac))
+    min_budget = max(4, int(math.ceil(eff_workers * 1.25)))
+    return max(min_budget, min(total, target))
+
+
+def _select_quick_pending(
+    pending: Sequence[Tuple[int, GFSLGenome]],
+    *,
+    workers: int,
+    profile: str,
+    archive_signatures: set[str],
+) -> Tuple[List[Tuple[int, GFSLGenome]], List[Tuple[int, GFSLGenome]]]:
+    total = len(pending)
+    limit = _quick_eval_limit(total=total, workers=workers, profile=profile)
+    if total <= limit:
+        return list(pending), []
+
+    ranked: List[Tuple[float, int, GFSLGenome]] = []
+    for idx, genome in pending:
+        signature = _evaluation_signature(genome)
+        novelty = 1.0 if signature not in archive_signatures else 0.0
+        # Stable jitter from signature + fresh jitter to avoid deterministic loops.
+        stable_jitter = (int(signature[:8], 16) % 1009) / 1009.0
+        jitter = (0.25 * stable_jitter) + (0.10 * random.random())
+        ranked.append((novelty + jitter, idx, genome))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    selected = [(idx, genome) for _, idx, genome in ranked[:limit]]
+    skipped = [(idx, genome) for _, idx, genome in ranked[limit:]]
+    return selected, skipped
+
+
 def _scenario_fingerprint(scenarios: Sequence[ScenarioConfig]) -> str:
     chunks: List[str] = []
     for scenario in scenarios:
@@ -702,11 +761,13 @@ def _rank_with_novelty(
     *,
     archive_signatures: set[str],
     novelty_bonus: float,
+    signature_fn=None,
 ) -> List[Tuple[float, GFSLGenome, str]]:
+    sig_fn = _evaluation_signature if signature_fn is None else signature_fn
     ranked: List[Tuple[float, GFSLGenome, str]] = []
     local_seen: set[str] = set()
     for genome in genomes:
-        signature = _canonical_signature(genome)
+        signature = sig_fn(genome)
         base = float(genome.fitness or -float("inf"))
         novel = signature not in archive_signatures and signature not in local_seen
         local_seen.add(signature)
@@ -720,11 +781,13 @@ def _mark_duplicate_genomes(
     *,
     stage: str,
     penalty: float,
+    signature_fn=None,
 ) -> None:
+    sig_fn = _evaluation_signature if signature_fn is None else signature_fn
     seen: Dict[str, GFSLGenome] = {}
     ordered = sorted(genomes, key=lambda g: float(g.fitness or -float("inf")), reverse=True)
     for genome in ordered:
-        signature = _canonical_signature(genome)
+        signature = sig_fn(genome)
         if signature not in seen:
             seen[signature] = genome
             continue
@@ -759,9 +822,10 @@ def _create_shared_executor(plan: ResourcePlan) -> Optional[concurrent.futures.E
         return None
     if plan.parallel_backend == "process":
         kwargs: Dict[str, Any] = {}
-        if os.name != "nt":
+        ctx_name = _process_pool_context_name()
+        if ctx_name is not None:
             try:
-                kwargs["mp_context"] = multiprocessing.get_context("fork")
+                kwargs["mp_context"] = multiprocessing.get_context(ctx_name)
             except Exception:
                 pass
         return concurrent.futures.ProcessPoolExecutor(
@@ -806,6 +870,42 @@ def _attacker_eval_worker(task: Tuple[GFSLGenome, GFSLGenome, Sequence[ScenarioC
     return float(score), _metrics_rows(metrics)
 
 
+def _defender_eval_worker_batch(
+    task: Tuple[List[GFSLGenome], Sequence[ScenarioConfig], Optional[GFSLGenome]]
+) -> List[Tuple[float, List[Dict[str, Any]]]]:
+    genomes, scenarios, attacker = task
+    if attacker is not None:
+        ensure_attacker_genome_io(attacker)
+    results: List[Tuple[float, List[Dict[str, Any]]]] = []
+    for genome in genomes:
+        ensure_genome_io(genome)
+        score, metrics = evaluate_across_scenarios(scenarios, genome, attacker=attacker)
+        results.append((float(score), _metrics_rows(metrics)))
+    return results
+
+
+def _attacker_eval_worker_batch(
+    task: Tuple[List[GFSLGenome], GFSLGenome, Sequence[ScenarioConfig]]
+) -> List[Tuple[float, List[Dict[str, Any]]]]:
+    attackers, defender, scenarios = task
+    ensure_genome_io(defender)
+    results: List[Tuple[float, List[Dict[str, Any]]]] = []
+    for attacker in attackers:
+        ensure_attacker_genome_io(attacker)
+        _, metrics = evaluate_across_scenarios(scenarios, defender, attacker=attacker)
+        attack_adv = _mean_metric(metrics, "attacker_advantage_score")
+        lane_success = _mean_metric(metrics, "attacker_lane_success_rate")
+        token_success = _mean_metric(metrics, "attacker_token_success_rate")
+        effective = len(attacker.extract_effective_algorithm())
+        if effective == 0:
+            score = attack_adv - 0.08
+        else:
+            complexity_penalty = min(0.10, max(0.0, (effective - 18) * 0.0025))
+            score = attack_adv + (0.04 * lane_success) + (0.02 * token_success) - complexity_penalty
+        results.append((float(score), _metrics_rows(metrics)))
+    return results
+
+
 def _evaluate_pending_parallel(
     *,
     pending: Sequence[Tuple[int, GFSLGenome]],
@@ -827,36 +927,82 @@ def _evaluate_pending_parallel(
         return
 
     tasks = [build_task(genome) for _, genome in pending]
-    chunk_size = max(1, len(tasks) // max(1, workers * 2))
+    map_chunk_size = max(1, len(tasks) // max(1, workers * 2))
 
-    def run_with_executor(exec_obj: concurrent.futures.Executor):
+    def run_with_executor(exec_obj: concurrent.futures.Executor, fn, task_list):
         if isinstance(exec_obj, concurrent.futures.ProcessPoolExecutor):
-            return list(exec_obj.map(worker_fn, tasks, chunksize=chunk_size))
-        return list(exec_obj.map(worker_fn, tasks))
+            return list(exec_obj.map(fn, task_list, chunksize=map_chunk_size))
+        return list(exec_obj.map(fn, task_list))
 
-    if executor is not None:
-        results = run_with_executor(executor)
+    def assign(results: Sequence[Tuple[float, List[Dict[str, Any]]]]) -> None:
         for (_, genome), (score, rows) in zip(pending, results):
             setattr(genome, attr_name, _metrics_from_rows(rows))
             genome.fitness = float(score)
+
+    # Process backend benefits from batch-chunked tasks to reduce pickle/IPC overhead.
+    use_batch_chunks = (
+        backend == "process"
+        and workers > 1
+        and len(tasks) >= max(6, workers)
+        and worker_fn in {_defender_eval_worker, _attacker_eval_worker}
+    )
+    if use_batch_chunks:
+        batch_worker = _defender_eval_worker_batch if worker_fn is _defender_eval_worker else _attacker_eval_worker_batch
+        batch_size = max(2, min(8, int(math.ceil(len(tasks) / float(max(1, workers * 2))))))
+        task_chunks = [tasks[pos : pos + batch_size] for pos in range(0, len(tasks), batch_size)]
+        if worker_fn is _defender_eval_worker:
+            batch_tasks = [
+                ([item[0] for item in chunk], chunk[0][1], chunk[0][2])
+                for chunk in task_chunks
+            ]
+        else:
+            batch_tasks = [
+                ([item[0] for item in chunk], chunk[0][1], chunk[0][2])
+                for chunk in task_chunks
+            ]
+
+        if executor is not None:
+            chunk_results = run_with_executor(executor, batch_worker, batch_tasks)
+            flat_results = [item for chunk in chunk_results for item in chunk]
+            assign(flat_results)
+            return
+
+        kwargs: Dict[str, Any] = {}
+        ctx_name = _process_pool_context_name()
+        if ctx_name is not None:
+            try:
+                kwargs["mp_context"] = multiprocessing.get_context(ctx_name)
+            except Exception:
+                pass
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers, **kwargs) as local_exec:
+            chunk_results = run_with_executor(local_exec, batch_worker, batch_tasks)
+        flat_results = [item for chunk in chunk_results for item in chunk]
+        assign(flat_results)
+        return
+
+    def run_standard(exec_obj: concurrent.futures.Executor):
+        return run_with_executor(exec_obj, worker_fn, tasks)
+
+    if executor is not None:
+        results = run_standard(executor)
+        assign(results)
         return
 
     if backend == "process":
         kwargs: Dict[str, Any] = {}
-        if os.name != "nt":
+        ctx_name = _process_pool_context_name()
+        if ctx_name is not None:
             try:
-                kwargs["mp_context"] = multiprocessing.get_context("fork")
+                kwargs["mp_context"] = multiprocessing.get_context(ctx_name)
             except Exception:
                 pass
         with concurrent.futures.ProcessPoolExecutor(max_workers=workers, **kwargs) as local_exec:
-            results = run_with_executor(local_exec)
+            results = run_standard(local_exec)
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as local_exec:
-            results = run_with_executor(local_exec)
+            results = run_standard(local_exec)
 
-    for (_, genome), (score, rows) in zip(pending, results):
-        setattr(genome, attr_name, _metrics_from_rows(rows))
-        genome.fitness = float(score)
+    assign(results)
 
 
 def _mean_metric(metrics: Sequence[ScenarioMetrics], attr: str) -> float:
@@ -926,6 +1072,20 @@ def _canonical_signature(genome: GFSLGenome) -> str:
     parts = [pruned.instructions[idx].get_signature() for idx in fixed_indices]
     outputs = sorted((int(cat), int(dtype), int(idx)) for cat, dtype, idx in pruned.outputs)
     payload = "|".join(parts) + "|outs=" + json.dumps(outputs, separators=(",", ":"))
+    return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def _evaluation_signature(genome: GFSLGenome) -> str:
+    """Fast fingerprint used in hot evaluation paths.
+
+    This intentionally avoids expensive canonical pruning/deep-copy so staged
+    dedup and novelty checks stay cheap during generation loops.
+    """
+    outputs = sorted((int(cat), int(dtype), int(idx)) for cat, dtype, idx in genome.outputs)
+    payload = "{sig}|outs={outs}".format(
+        sig=str(genome.get_signature()),
+        outs=json.dumps(outputs, separators=(",", ":")),
+    )
     return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
 
 
@@ -1154,11 +1314,11 @@ def _build_round_report(
     lines.append("")
     lines.append("## Defender Evolution")
     lines.append("")
-    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe | eval q>m>f | keep q>m | probes | uniq | cache | dup | t(s) |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | t(s) |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for row in defender_log:
         lines.append(
-            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {uniq} | {cache} | {dup} | {secs:.2f} |".format(
+            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {secs:.2f} |".format(
                 generation=row["generation"],
                 best_score=row["best_score"],
                 principle=row["principle"],
@@ -1175,6 +1335,7 @@ def _build_round_report(
                 stage_eval=str(row.get("stage_eval", "0>0>0")),
                 stage_keep=str(row.get("stage_keep", "0>0")),
                 probe_n=int(row.get("probe_samples", 0)),
+                qskip=int(row.get("quick_skipped", 0)),
                 uniq=int(row.get("eval_unique", 0)),
                 cache=int(row.get("cache_hits", 0)),
                 dup=int(row.get("dup_reuse", 0)),
@@ -1184,11 +1345,11 @@ def _build_round_report(
     lines.append("")
     lines.append("## Attacker Evolution")
     lines.append("")
-    lines.append("| gen | attack_score | lane_success | token_success | attacker_adv | q frac/keep | m frac/keep | key var | probe | eval q>m>f | keep q>m | probes | uniq | cache | dup | t(s) |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| gen | attack_score | lane_success | token_success | attacker_adv | q frac/keep | m frac/keep | key var | probe | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | t(s) |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for row in attacker_log:
         lines.append(
-            "| {generation} | {attack_score:.4f} | {lane_success:.4f} | {token_success:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {uniq} | {cache} | {dup} | {secs:.2f} |".format(
+            "| {generation} | {attack_score:.4f} | {lane_success:.4f} | {token_success:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {secs:.2f} |".format(
                 generation=row["generation"],
                 attack_score=row["attack_score"],
                 lane_success=row["lane_success"],
@@ -1203,6 +1364,7 @@ def _build_round_report(
                 stage_eval=str(row.get("stage_eval", "0>0>0")),
                 stage_keep=str(row.get("stage_keep", "0>0")),
                 probe_n=int(row.get("probe_samples", 0)),
+                qskip=int(row.get("quick_skipped", 0)),
                 uniq=int(row.get("eval_unique", 0)),
                 cache=int(row.get("cache_hits", 0)),
                 dup=int(row.get("dup_reuse", 0)),
@@ -1438,10 +1600,12 @@ def _run_defender_round(
 
     generation_log: List[Dict[str, Any]] = []
     archive_signatures = {
-        str(entry.get("canonical_signature"))
+        str(entry.get("signature") or entry.get("canonical_signature"))
         for entry in archive.get("defender_elites", [])
-        if entry.get("canonical_signature")
+        if (entry.get("signature") or entry.get("canonical_signature"))
     }
+    if attacker is not None:
+        ensure_attacker_genome_io(attacker)
     controller = PredictiveStageController.from_config(config)
     controller = _seed_controller_from_payload(
         controller,
@@ -1450,7 +1614,7 @@ def _run_defender_round(
     stage_stats: Dict[str, float] = {}
     stage_cache: "OrderedDict[str, Tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
     cache_limit = max(500, int(config.max_eval_cache_entries))
-    attacker_signature = _canonical_signature(attacker) if attacker is not None else "none"
+    attacker_signature = _evaluation_signature(attacker) if attacker is not None else "none"
 
     def make_scenarios(stage: str) -> List[ScenarioConfig]:
         if stage == "quick":
@@ -1510,6 +1674,7 @@ def _run_defender_round(
                 m=int(stage_stats.get("mid_kept", 0.0)),
             ),
             "probe_samples": int(stage_stats.get("probe_samples", 0.0)),
+            "quick_skipped": int(stage_stats.get("quick_skipped", 0.0)),
             "eval_unique": int(stage_stats.get("eval_unique", 0.0)),
             "cache_hits": int(stage_stats.get("cache_hits", 0.0)),
             "dup_reuse": int(stage_stats.get("dup_reuse", 0.0)),
@@ -1517,7 +1682,7 @@ def _run_defender_round(
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} uniq={uniq} cache={cache} dup={dup} t={secs:.2f}s".format(
+            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 security=row["security"],
@@ -1532,6 +1697,7 @@ def _run_defender_round(
                 stage_eval=row["stage_eval"],
                 stage_keep=row["stage_keep"],
                 probe_n=row["probe_samples"],
+                qskip=row["quick_skipped"],
                 uniq=row["eval_unique"],
                 cache=row["cache_hits"],
                 dup=row["dup_reuse"],
@@ -1592,14 +1758,14 @@ def _run_defender_round(
                 build_task=lambda g: (
                     g,
                     full_scenarios,
-                    copy.deepcopy(attacker) if attacker is not None else None,
+                    attacker,
                 ),
                 attr_name="_pcpl_metrics",
                 cache=stage_cache,
                 cache_key_fn=lambda g, sf=full_fp: "def:full:{sf}:{att}:{sig}".format(
                     sf=sf,
                     att=attacker_signature,
-                    sig=_canonical_signature(g),
+                    sig=_evaluation_signature(g),
                 ),
                 max_cache_entries=cache_limit,
             )
@@ -1618,10 +1784,27 @@ def _run_defender_round(
         mid_scenarios = make_scenarios("mid")
         full_scenarios = make_scenarios("full")
 
+        quick_pending, quick_skipped = _select_quick_pending(
+            pending,
+            workers=resource_plan.parallel_workers,
+            profile=config.profile,
+            archive_signatures=archive_signatures,
+        )
+        local_stage["quick_eval"] = float(len(quick_pending))
+        local_stage["quick_skipped"] = float(len(quick_skipped))
+        for _, skipped_genome in quick_skipped:
+            skipped_sig = _evaluation_signature(skipped_genome)
+            novelty_offset = 0.015 if skipped_sig not in archive_signatures else 0.0
+            skipped_genome.fitness = _predictive_cut_score(
+                -0.20 + novelty_offset,
+                "quick",
+                float(config.predictive_penalty) + 0.01,
+            )
+
         # Stage 1: fast statistical screen.
         quick_fp = _scenario_fingerprint(quick_scenarios)
         quick_stats = _evaluate_pending_dedup_cache_parallel(
-            pending=pending,
+            pending=quick_pending,
             backend=resource_plan.parallel_backend,
             workers=resource_plan.parallel_workers,
             executor=shared_executor,
@@ -1629,18 +1812,17 @@ def _run_defender_round(
             build_task=lambda g: (
                 g,
                 quick_scenarios,
-                copy.deepcopy(attacker) if attacker is not None else None,
+                attacker,
             ),
             attr_name="_pcpl_metrics",
             cache=stage_cache,
             cache_key_fn=lambda g, sf=quick_fp: "def:quick:{sf}:{att}:{sig}".format(
                 sf=sf,
                 att=attacker_signature,
-                sig=_canonical_signature(g),
+                sig=_evaluation_signature(g),
             ),
             max_cache_entries=cache_limit,
         )
-        local_stage["quick_eval"] = float(quick_stats["total"])
         local_stage["eval_unique"] += float(quick_stats["unique_eval"])
         local_stage["cache_hits"] += float(quick_stats["cache_hits"])
         local_stage["dup_reuse"] += float(quick_stats["dup_reuse"])
@@ -1704,14 +1886,14 @@ def _run_defender_round(
             build_task=lambda g: (
                 g,
                 mid_scenarios,
-                copy.deepcopy(attacker) if attacker is not None else None,
+                attacker,
             ),
             attr_name="_pcpl_metrics",
             cache=stage_cache,
             cache_key_fn=lambda g, sf=mid_fp: "def:mid:{sf}:{att}:{sig}".format(
                 sf=sf,
                 att=attacker_signature,
-                sig=_canonical_signature(g),
+                sig=_evaluation_signature(g),
             ),
             max_cache_entries=cache_limit,
         )
@@ -1779,14 +1961,14 @@ def _run_defender_round(
             build_task=lambda g: (
                 g,
                 full_scenarios,
-                copy.deepcopy(attacker) if attacker is not None else None,
+                attacker,
             ),
             attr_name="_pcpl_metrics",
             cache=stage_cache,
             cache_key_fn=lambda g, sf=full_fp: "def:full:{sf}:{att}:{sig}".format(
                 sf=sf,
                 att=attacker_signature,
-                sig=_canonical_signature(g),
+                sig=_evaluation_signature(g),
             ),
             max_cache_entries=cache_limit,
         )
@@ -1818,14 +2000,14 @@ def _run_defender_round(
                 build_task=lambda g: (
                     g,
                     full_scenarios,
-                    copy.deepcopy(attacker) if attacker is not None else None,
+                    attacker,
                 ),
                 attr_name="_pcpl_metrics",
                 cache=stage_cache,
                 cache_key_fn=lambda g, sf=full_fp: "def:full:{sf}:{att}:{sig}".format(
                     sf=sf,
                     att=attacker_signature,
-                    sig=_canonical_signature(g),
+                    sig=_evaluation_signature(g),
                 ),
                 max_cache_entries=cache_limit,
             )
@@ -1896,10 +2078,11 @@ def _run_attacker_round(
 
     generation_log: List[Dict[str, Any]] = []
     archive_signatures = {
-        str(entry.get("canonical_signature"))
+        str(entry.get("signature") or entry.get("canonical_signature"))
         for entry in archive.get("attacker_elites", [])
-        if entry.get("canonical_signature")
+        if (entry.get("signature") or entry.get("canonical_signature"))
     }
+    ensure_genome_io(defender)
     controller = PredictiveStageController.from_config(config)
     controller = _seed_controller_from_payload(
         controller,
@@ -1908,7 +2091,7 @@ def _run_attacker_round(
     stage_stats: Dict[str, float] = {}
     stage_cache: "OrderedDict[str, Tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
     cache_limit = max(500, int(config.max_eval_cache_entries))
-    defender_signature = _canonical_signature(defender)
+    defender_signature = _evaluation_signature(defender)
 
     def make_scenarios(stage: str) -> List[ScenarioConfig]:
         if stage == "quick":
@@ -1972,6 +2155,7 @@ def _run_attacker_round(
                 m=int(stage_stats.get("mid_kept", 0.0)),
             ),
             "probe_samples": int(stage_stats.get("probe_samples", 0.0)),
+            "quick_skipped": int(stage_stats.get("quick_skipped", 0.0)),
             "eval_unique": int(stage_stats.get("eval_unique", 0.0)),
             "cache_hits": int(stage_stats.get("cache_hits", 0.0)),
             "dup_reuse": int(stage_stats.get("dup_reuse", 0.0)),
@@ -1979,7 +2163,7 @@ def _run_attacker_round(
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} uniq={uniq} cache={cache} dup={dup} t={secs:.2f}s".format(
+            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 lane=row["lane_success"],
@@ -1993,6 +2177,7 @@ def _run_attacker_round(
                 stage_eval=row["stage_eval"],
                 stage_keep=row["stage_keep"],
                 probe_n=row["probe_samples"],
+                qskip=row["quick_skipped"],
                 uniq=row["eval_unique"],
                 cache=row["cache_hits"],
                 dup=row["dup_reuse"],
@@ -2051,7 +2236,7 @@ def _run_attacker_round(
                 worker_fn=_attacker_eval_worker,
                 build_task=lambda attacker_genome: (
                     attacker_genome,
-                    copy.deepcopy(defender),
+                    defender,
                     full_scenarios,
                 ),
                 attr_name="_attack_metrics",
@@ -2059,7 +2244,7 @@ def _run_attacker_round(
                 cache_key_fn=lambda g, sf=full_fp: "atk:full:{sf}:{def_sig}:{sig}".format(
                     sf=sf,
                     def_sig=defender_signature,
-                    sig=_canonical_signature(g),
+                    sig=_evaluation_signature(g),
                 ),
                 max_cache_entries=cache_limit,
             )
@@ -2078,16 +2263,33 @@ def _run_attacker_round(
         mid_scenarios = make_scenarios("mid")
         full_scenarios = make_scenarios("full")
 
+        quick_pending, quick_skipped = _select_quick_pending(
+            pending,
+            workers=resource_plan.parallel_workers,
+            profile=config.profile,
+            archive_signatures=archive_signatures,
+        )
+        local_stage["quick_eval"] = float(len(quick_pending))
+        local_stage["quick_skipped"] = float(len(quick_skipped))
+        for _, skipped_genome in quick_skipped:
+            skipped_sig = _evaluation_signature(skipped_genome)
+            novelty_offset = 0.015 if skipped_sig not in archive_signatures else 0.0
+            skipped_genome.fitness = _predictive_cut_score(
+                -0.22 + novelty_offset,
+                "quick",
+                float(config.predictive_penalty) + 0.01,
+            )
+
         quick_fp = _scenario_fingerprint(quick_scenarios)
         quick_stats = _evaluate_pending_dedup_cache_parallel(
-            pending=pending,
+            pending=quick_pending,
             backend=resource_plan.parallel_backend,
             workers=resource_plan.parallel_workers,
             executor=shared_executor,
             worker_fn=_attacker_eval_worker,
             build_task=lambda attacker_genome: (
                 attacker_genome,
-                copy.deepcopy(defender),
+                defender,
                 quick_scenarios,
             ),
             attr_name="_attack_metrics",
@@ -2095,11 +2297,10 @@ def _run_attacker_round(
             cache_key_fn=lambda g, sf=quick_fp: "atk:quick:{sf}:{def_sig}:{sig}".format(
                 sf=sf,
                 def_sig=defender_signature,
-                sig=_canonical_signature(g),
+                sig=_evaluation_signature(g),
             ),
             max_cache_entries=cache_limit,
         )
-        local_stage["quick_eval"] = float(quick_stats["total"])
         local_stage["eval_unique"] += float(quick_stats["unique_eval"])
         local_stage["cache_hits"] += float(quick_stats["cache_hits"])
         local_stage["dup_reuse"] += float(quick_stats["dup_reuse"])
@@ -2161,7 +2362,7 @@ def _run_attacker_round(
             worker_fn=_attacker_eval_worker,
             build_task=lambda attacker_genome: (
                 attacker_genome,
-                copy.deepcopy(defender),
+                defender,
                 mid_scenarios,
             ),
             attr_name="_attack_metrics",
@@ -2169,7 +2370,7 @@ def _run_attacker_round(
             cache_key_fn=lambda g, sf=mid_fp: "atk:mid:{sf}:{def_sig}:{sig}".format(
                 sf=sf,
                 def_sig=defender_signature,
-                sig=_canonical_signature(g),
+                sig=_evaluation_signature(g),
             ),
             max_cache_entries=cache_limit,
         )
@@ -2235,7 +2436,7 @@ def _run_attacker_round(
             worker_fn=_attacker_eval_worker,
             build_task=lambda attacker_genome: (
                 attacker_genome,
-                copy.deepcopy(defender),
+                defender,
                 full_scenarios,
             ),
             attr_name="_attack_metrics",
@@ -2243,7 +2444,7 @@ def _run_attacker_round(
             cache_key_fn=lambda g, sf=full_fp: "atk:full:{sf}:{def_sig}:{sig}".format(
                 sf=sf,
                 def_sig=defender_signature,
-                sig=_canonical_signature(g),
+                sig=_evaluation_signature(g),
             ),
             max_cache_entries=cache_limit,
         )
@@ -2273,7 +2474,7 @@ def _run_attacker_round(
                 worker_fn=_attacker_eval_worker,
                 build_task=lambda attacker_genome: (
                     attacker_genome,
-                    copy.deepcopy(defender),
+                    defender,
                     full_scenarios,
                 ),
                 attr_name="_attack_metrics",
@@ -2281,7 +2482,7 @@ def _run_attacker_round(
                 cache_key_fn=lambda g, sf=full_fp: "atk:full:{sf}:{def_sig}:{sig}".format(
                     sf=sf,
                     def_sig=defender_signature,
-                    sig=_canonical_signature(g),
+                    sig=_evaluation_signature(g),
                 ),
                 max_cache_entries=cache_limit,
             )

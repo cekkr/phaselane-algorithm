@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import itertools
 import json
+import multiprocessing
+import os
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import sys
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -86,6 +89,105 @@ def _build_continuous_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
     for combo in combos:
         dedup[_combo_label(combo)] = combo
     return list(dedup.values())
+
+
+def _build_experiment_config(
+    args: argparse.Namespace,
+    *,
+    out_dir: Path,
+    seed: int,
+    population_size: int,
+    generations: int,
+    initial_instructions: int,
+    rounds: int,
+    attacker_population_size: int,
+    attacker_generations: int,
+    elite_pool: int,
+    archive_limit: int,
+    resume: bool,
+    workers: int,
+) -> ExperimentConfig:
+    return ExperimentConfig(
+        out_dir=out_dir,
+        profile=args.profile,
+        seed=seed,
+        population_size=population_size,
+        generations=generations,
+        initial_instructions=initial_instructions,
+        rounds=rounds,
+        attacker_population_size=attacker_population_size,
+        attacker_generations=attacker_generations,
+        elite_pool=elite_pool,
+        archive_limit=archive_limit,
+        resume=resume,
+        parallel_workers=workers,
+        parallel_backend=args.parallel_backend,
+        use_supervised_guide=not args.no_supervised_guide,
+        preferred_device=args.device,
+        parent_pool_ratio=args.parent_pool_ratio,
+        stagnation_patience=args.stagnation_patience,
+        mutation_floor=args.mutation_floor,
+        mutation_ceiling=args.mutation_ceiling,
+        mutation_step=args.mutation_step,
+        statistical_predictive=not args.no_statistical_predictive,
+        quick_cycle_fraction=args.quick_cycle_fraction,
+        mid_cycle_fraction=args.mid_cycle_fraction,
+        quick_keep_ratio=args.quick_keep_ratio,
+        mid_keep_ratio=args.mid_keep_ratio,
+        key_variant_count=args.key_variants,
+        novelty_bonus=args.novelty_bonus,
+        predictive_penalty=args.predictive_penalty,
+        auto_statistical_tuning=not args.no_auto_statistical_tuning,
+        device_mhz=args.device_mhz,
+        provider_mhz=args.provider_mhz,
+        max_test_time_seconds=args.max_test_seconds,
+    )
+
+
+def _resolve_continuous_lane_plan(
+    *,
+    grid_size: int,
+    workers_arg: int,
+    parallel_backend: str,
+) -> Dict[str, int]:
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    total_workers = max(1, int(workers_arg)) if int(workers_arg) > 0 else cpu_count
+    backend = str(parallel_backend).lower()
+    if backend not in {"auto", "process", "thread", "off"}:
+        backend = "auto"
+
+    if backend == "off" or grid_size <= 1 or total_workers <= 1:
+        return {
+            "cpu_count": cpu_count,
+            "total_workers": total_workers,
+            "lanes": 1,
+            "workers_per_lane": max(1, total_workers),
+        }
+
+    if total_workers >= 24:
+        lanes = 4
+    elif total_workers >= 12:
+        lanes = 3
+    elif total_workers >= 8:
+        lanes = 2
+    else:
+        lanes = 1
+    lanes = max(1, min(lanes, grid_size))
+    workers_per_lane = max(1, total_workers // lanes)
+    return {
+        "cpu_count": cpu_count,
+        "total_workers": total_workers,
+        "lanes": lanes,
+        "workers_per_lane": workers_per_lane,
+    }
+
+
+def _outer_mp_context() -> Optional[str]:
+    if os.name == "nt":
+        return None
+    if sys.platform == "darwin":
+        return "spawn"
+    return "fork"
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -351,9 +453,9 @@ def main() -> None:
         out_dir = (PROJECT_DIR / "runs" / f"{stamp}-{args.profile}").resolve()
 
     if not args.continuous:
-        config = ExperimentConfig(
+        config = _build_experiment_config(
+            args,
             out_dir=out_dir,
-            profile=args.profile,
             seed=args.seed,
             population_size=args.population_size,
             generations=args.generations,
@@ -364,27 +466,7 @@ def main() -> None:
             elite_pool=args.elite_pool,
             archive_limit=args.archive_limit,
             resume=not args.no_resume,
-            parallel_workers=args.workers,
-            parallel_backend=args.parallel_backend,
-            use_supervised_guide=not args.no_supervised_guide,
-            preferred_device=args.device,
-            parent_pool_ratio=args.parent_pool_ratio,
-            stagnation_patience=args.stagnation_patience,
-            mutation_floor=args.mutation_floor,
-            mutation_ceiling=args.mutation_ceiling,
-            mutation_step=args.mutation_step,
-            statistical_predictive=not args.no_statistical_predictive,
-            quick_cycle_fraction=args.quick_cycle_fraction,
-            mid_cycle_fraction=args.mid_cycle_fraction,
-            quick_keep_ratio=args.quick_keep_ratio,
-            mid_keep_ratio=args.mid_keep_ratio,
-            key_variant_count=args.key_variants,
-            novelty_bonus=args.novelty_bonus,
-            predictive_penalty=args.predictive_penalty,
-            auto_statistical_tuning=not args.no_auto_statistical_tuning,
-            device_mhz=args.device_mhz,
-            provider_mhz=args.provider_mhz,
-            max_test_time_seconds=args.max_test_seconds,
+            workers=args.workers,
         )
 
         summary = _run_once(config)
@@ -413,129 +495,215 @@ def main() -> None:
     leaderboard: Dict[str, Dict[str, Any]] = {}
     total_iterations = 0
     total_sweeps = 0
+    lane_plan = _resolve_continuous_lane_plan(
+        grid_size=len(grid),
+        workers_arg=int(args.workers),
+        parallel_backend=str(args.parallel_backend),
+    )
+    lane_count = int(lane_plan["lanes"])
+    workers_per_lane = int(lane_plan["workers_per_lane"])
 
     print(
-        "[pcpl-evolvo] continuous mode: combos={count} rounds-per-iteration={rounds} output={out}".format(
+        "[pcpl-evolvo] continuous mode: combos={count} rounds-per-iteration={rounds} output={out} lanes={lanes} workers-per-lane={lane_workers} total-workers={total_workers}".format(
             count=len(grid),
             rounds=max(1, args.rounds),
             out=out_dir,
+            lanes=lane_count,
+            lane_workers=workers_per_lane,
+            total_workers=int(lane_plan["total_workers"]),
         )
     )
 
     try:
         while True:
-            for slot, combo_idx in enumerate(order):
-                combo = grid[combo_idx]
-                combo_name = _combo_label(combo)
-                combo_dir = runs_root / combo_name
-                combo_dir.mkdir(parents=True, exist_ok=True)
+            outer_kwargs: Dict[str, Any] = {}
+            mp_ctx_name = _outer_mp_context()
+            if mp_ctx_name is not None:
+                try:
+                    outer_kwargs["mp_context"] = multiprocessing.get_context(mp_ctx_name)
+                except Exception:
+                    pass
 
-                run_seed = args.seed + (total_iterations * 7_919) + slot
-                config = ExperimentConfig(
-                    out_dir=combo_dir,
-                    profile=args.profile,
-                    seed=run_seed,
-                    population_size=combo["population_size"],
-                    generations=combo["generations"],
-                    initial_instructions=combo["initial_instructions"],
-                    rounds=max(1, args.rounds),
-                    attacker_population_size=combo["attacker_population_size"],
-                    attacker_generations=combo["attacker_generations"],
-                    elite_pool=combo["elite_pool"],
-                    archive_limit=combo["archive_limit"],
-                    resume=True,
-                    parallel_workers=args.workers,
-                    parallel_backend=args.parallel_backend,
-                    use_supervised_guide=not args.no_supervised_guide,
-                    preferred_device=args.device,
-                    parent_pool_ratio=args.parent_pool_ratio,
-                    stagnation_patience=args.stagnation_patience,
-                    mutation_floor=args.mutation_floor,
-                    mutation_ceiling=args.mutation_ceiling,
-                    mutation_step=args.mutation_step,
-                    statistical_predictive=not args.no_statistical_predictive,
-                    quick_cycle_fraction=args.quick_cycle_fraction,
-                    mid_cycle_fraction=args.mid_cycle_fraction,
-                    quick_keep_ratio=args.quick_keep_ratio,
-                    mid_keep_ratio=args.mid_keep_ratio,
-                    key_variant_count=args.key_variants,
-                    novelty_bonus=args.novelty_bonus,
-                    predictive_penalty=args.predictive_penalty,
-                    auto_statistical_tuning=not args.no_auto_statistical_tuning,
-                    device_mhz=args.device_mhz,
-                    provider_mhz=args.provider_mhz,
-                    max_test_time_seconds=args.max_test_seconds,
-                )
+            stop_requested = False
+            next_slot = 0
+            launched_in_sweep = 0
+            pending: Dict[concurrent.futures.Future, Dict[str, Any]] = {}
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=lane_count,
+                **outer_kwargs,
+            ) as combo_pool:
+                while next_slot < len(order) or pending:
+                    while next_slot < len(order) and len(pending) < lane_count:
+                        if (
+                            args.continuous_max_iterations > 0
+                            and (total_iterations + launched_in_sweep)
+                            >= args.continuous_max_iterations
+                        ):
+                            break
+                        combo_idx = order[next_slot]
+                        combo = grid[combo_idx]
+                        combo_name = _combo_label(combo)
+                        combo_dir = runs_root / combo_name
+                        combo_dir.mkdir(parents=True, exist_ok=True)
 
-                print(
-                    "[pcpl-evolvo] iter={iter} sweep={sweep} combo={combo} seed={seed}".format(
-                        iter=total_iterations,
-                        sweep=total_sweeps,
-                        combo=combo_name,
-                        seed=run_seed,
-                    )
-                )
-                summary = _run_once(config)
-                leaderboard[combo_name] = {
-                    "combo": combo,
-                    "best_score": summary["best_score"],
-                    "best_signature": summary["best_signature"],
-                    "best_attacker_score": summary["best_attacker_score"],
-                    "best_attacker_signature": summary["best_attacker_signature"],
-                    "rounds_completed": summary["rounds_completed"],
-                    "archive_path": summary["archive_path"],
-                    "updated_at": datetime.now().isoformat(),
-                }
-
-                top = sorted(
-                    leaderboard.values(),
-                    key=lambda item: float(item["best_score"]),
-                    reverse=True,
-                )[:20]
-                state_payload = {
-                    "continuous": True,
-                    "profile": args.profile,
-                    "iterations_completed": total_iterations + 1,
-                    "sweeps_completed": total_sweeps,
-                    "grid_size": len(grid),
-                    "latest_combo": combo_name,
-                    "latest_summary": summary,
-                    "updated_at": datetime.now().isoformat(),
-                }
-                _write_json(state_path, state_payload)
-                _write_json(
-                    leaderboard_path,
-                    {
-                        "updated_at": datetime.now().isoformat(),
-                        "leaders": top,
-                    },
-                )
-
-                with log_path.open("a", encoding="utf-8") as handle:
-                    handle.write(
-                        "{ts} iter={iter} sweep={sweep} combo={combo} score={score:.6f} attacker={attack:.6f} rounds={rounds}\n".format(
-                            ts=datetime.now().isoformat(),
-                            iter=total_iterations,
-                            sweep=total_sweeps,
-                            combo=combo_name,
-                            score=float(summary["best_score"]),
-                            attack=float(summary["best_attacker_score"]),
-                            rounds=int(summary["rounds_completed"]),
+                        iteration_index = total_iterations + launched_in_sweep
+                        run_seed = args.seed + (iteration_index * 7_919) + next_slot
+                        config = _build_experiment_config(
+                            args,
+                            out_dir=combo_dir,
+                            seed=run_seed,
+                            population_size=combo["population_size"],
+                            generations=combo["generations"],
+                            initial_instructions=combo["initial_instructions"],
+                            rounds=max(1, args.rounds),
+                            attacker_population_size=combo["attacker_population_size"],
+                            attacker_generations=combo["attacker_generations"],
+                            elite_pool=combo["elite_pool"],
+                            archive_limit=combo["archive_limit"],
+                            resume=True,
+                            workers=workers_per_lane,
                         )
-                    )
 
-                _print_summary(summary)
-                total_iterations += 1
+                        print(
+                            "[pcpl-evolvo] launch iter={iter} sweep={sweep} combo={combo} seed={seed} lane={lane}/{lanes} lane-workers={lane_workers}".format(
+                                iter=iteration_index,
+                                sweep=total_sweeps,
+                                combo=combo_name,
+                                seed=run_seed,
+                                lane=len(pending) + 1,
+                                lanes=lane_count,
+                                lane_workers=workers_per_lane,
+                            )
+                        )
+                        future = combo_pool.submit(_run_once, config)
+                        pending[future] = {
+                            "combo": combo,
+                            "combo_name": combo_name,
+                            "combo_dir": str(combo_dir),
+                        }
+                        next_slot += 1
+                        launched_in_sweep += 1
 
-                if (
-                    args.continuous_max_iterations > 0
-                    and total_iterations >= args.continuous_max_iterations
-                ):
-                    print(
-                        "[pcpl-evolvo] continuous stop: reached --continuous-max-iterations="
-                        f"{args.continuous_max_iterations}"
+                    if (
+                        args.continuous_max_iterations > 0
+                        and (total_iterations + launched_in_sweep)
+                        >= args.continuous_max_iterations
+                        and not pending
+                    ):
+                        stop_requested = True
+                        break
+
+                    if not pending:
+                        break
+
+                    done, _ = concurrent.futures.wait(
+                        list(pending.keys()),
+                        return_when=concurrent.futures.FIRST_COMPLETED,
                     )
-                    return
+                    for future in done:
+                        meta = pending.pop(future)
+                        combo = meta["combo"]
+                        combo_name = meta["combo_name"]
+                        success = True
+                        try:
+                            summary = future.result()
+                        except Exception as exc:
+                            success = False
+                            summary = {
+                                "out_dir": meta["combo_dir"],
+                                "error": str(exc),
+                                "best_score": float("-inf"),
+                                "best_attacker_score": float("-inf"),
+                                "rounds_completed": 0,
+                            }
+                            print(
+                                "[pcpl-evolvo] combo failed combo={combo} error={error}".format(
+                                    combo=combo_name,
+                                    error=exc,
+                                )
+                            )
+
+                        if success:
+                            leaderboard[combo_name] = {
+                                "combo": combo,
+                                "best_score": summary["best_score"],
+                                "best_signature": summary["best_signature"],
+                                "best_attacker_score": summary["best_attacker_score"],
+                                "best_attacker_signature": summary["best_attacker_signature"],
+                                "rounds_completed": summary["rounds_completed"],
+                                "archive_path": summary["archive_path"],
+                                "updated_at": datetime.now().isoformat(),
+                            }
+
+                        top = sorted(
+                            leaderboard.values(),
+                            key=lambda item: float(item["best_score"]),
+                            reverse=True,
+                        )[:20]
+                        state_payload = {
+                            "continuous": True,
+                            "profile": args.profile,
+                            "iterations_completed": total_iterations + 1,
+                            "sweeps_completed": total_sweeps,
+                            "grid_size": len(grid),
+                            "latest_combo": combo_name,
+                            "latest_summary": summary,
+                            "updated_at": datetime.now().isoformat(),
+                        }
+                        _write_json(state_path, state_payload)
+                        _write_json(
+                            leaderboard_path,
+                            {
+                                "updated_at": datetime.now().isoformat(),
+                                "leaders": top,
+                            },
+                        )
+
+                        with log_path.open("a", encoding="utf-8") as handle:
+                            if success:
+                                handle.write(
+                                    "{ts} iter={iter} sweep={sweep} combo={combo} score={score:.6f} attacker={attack:.6f} rounds={rounds}\n".format(
+                                        ts=datetime.now().isoformat(),
+                                        iter=total_iterations,
+                                        sweep=total_sweeps,
+                                        combo=combo_name,
+                                        score=float(summary["best_score"]),
+                                        attack=float(summary["best_attacker_score"]),
+                                        rounds=int(summary["rounds_completed"]),
+                                    )
+                                )
+                            else:
+                                handle.write(
+                                    "{ts} iter={iter} sweep={sweep} combo={combo} status=error\n".format(
+                                        ts=datetime.now().isoformat(),
+                                        iter=total_iterations,
+                                        sweep=total_sweeps,
+                                        combo=combo_name,
+                                    )
+                                )
+
+                        if success:
+                            _print_summary(summary)
+                        total_iterations += 1
+
+                        if (
+                            args.continuous_max_iterations > 0
+                            and total_iterations >= args.continuous_max_iterations
+                        ):
+                            print(
+                                "[pcpl-evolvo] continuous stop: reached --continuous-max-iterations="
+                                f"{args.continuous_max_iterations}"
+                            )
+                            stop_requested = True
+                            break
+
+                    if stop_requested:
+                        for pending_future in list(pending.keys()):
+                            pending_future.cancel()
+                        break
+
+            if stop_requested:
+                return
 
             total_sweeps += 1
             rng.shuffle(order)

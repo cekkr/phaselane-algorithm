@@ -113,9 +113,11 @@ python3 demo/pcpl-evolvo/run_experiments.py --continuous --continuous-max-iterat
 - `--no-auto-statistical-tuning` (keep stage fractions/ratios fixed to CLI values)
 
 Notes:
+- `--continuous` now runs multiple combo lanes in parallel by default (auto-planned from available CPUs), with per-lane worker splitting so `--workers 0` exploits all cores without extra flags.
 - Process workers are now reused across generations/rounds for lower spawn overhead and higher sustained CPU utilization.
 - The adaptive parent-pool + mutation schedule reduces random dispersivity and focuses search around top genomes while preserving exploration.
-- Staged statistical mode (default) evaluates all genomes quickly, then expands only novel/promising ones to deeper testing with key-generation variants.
+- Staged statistical mode (default) now applies dynamic quick-stage budgeting under pressure (see `qskip=` in logs), so only the most novel/promising genomes proceed when populations are large.
 - Stage fractions/keep ratios/key-variants are auto-tuned from runtime statistics (probe false-negative rate, novelty rate, keep-throughput) and persisted in `archive.json` for following rounds.
-- Duplicate genomes are collapsed before stage execution and cached by canonical signature + scenario fingerprint + opponent signature, so repeated candidates are not re-executed.
+- Duplicate genomes are collapsed before stage execution and cached by fast evaluation signature + scenario fingerprint + opponent signature, so repeated candidates are not re-executed.
+- Process evaluation dispatch uses chunked batch workers to reduce per-genome IPC/pickling overhead in `process` backend.
 - For `--profile full`, startup tuning is automatically leaner and generation-time budgeted (target ~3s) without extra flags.
