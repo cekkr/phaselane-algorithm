@@ -15,7 +15,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import sys
 
-from config import DEFAULT_MODE, available_modes, mode_summary, resolve_defaults
+from config import (
+    DEFAULT_MODE,
+    DEFAULT_PROFILE,
+    available_modes,
+    mode_summary,
+    resolve_defaults,
+)
 
 PROJECT_DIR = Path(__file__).resolve().parent
 SRC_DIR = PROJECT_DIR / "src"
@@ -166,15 +172,16 @@ def _resolve_continuous_lane_plan(
             "workers_per_lane": max(1, total_workers),
         }
 
-    if total_workers >= 24:
-        lanes = 4
-    elif total_workers >= 12:
-        lanes = 3
-    elif total_workers >= 8:
-        lanes = 2
+    # More aggressive lane fan-out to keep all cores busy, especially on >=24-core desktops.
+    if backend == "process":
+        min_workers_per_lane = 3
     else:
-        lanes = 1
-    lanes = max(1, min(lanes, grid_size))
+        min_workers_per_lane = 2
+    lanes = max(1, total_workers // max(1, min_workers_per_lane))
+    lanes = min(lanes, grid_size, 16)
+    lanes = max(1, lanes)
+    while lanes > 1 and (total_workers // lanes) < 2:
+        lanes -= 1
     workers_per_lane = max(1, total_workers // lanes)
     return {
         "cpu_count": cpu_count,
@@ -385,8 +392,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--profile",
         choices=("fast", "full"),
-        default="fast",
-        help="Scenario profile. fast is shorter; full is heavier.",
+        default=DEFAULT_PROFILE,
+        help=(
+            "Scenario profile loaded from config.py default. "
+            "full is preferred for robust conclusions."
+        ),
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
     parser.add_argument(

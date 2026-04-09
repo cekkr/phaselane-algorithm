@@ -15,7 +15,7 @@ It is built directly on top of the deterministic protocol reference in `demo/pcp
 - `src/pcpl_evolvo/simulation.py` - PCPL simulation + scoring model.
 - `src/pcpl_evolvo/experiment.py` - continuous co-evolution engine + archive persistence.
 - `run_experiments.py` - CLI runner.
-- `config.py` - central presets/defaults (`balanced`, `dynamic`, `explorer`).
+- `config.py` - central presets/defaults (`balanced`, `conclusion`, `dynamic`, `explorer`).
 - `run_auto.sh` - one-command execution with timestamped logs.
 - `compile_perf.sh` - optimized bytecode compile script (macOS/Linux).
 - `compile_perf.ps1` - optimized bytecode compile script (PowerShell).
@@ -52,6 +52,16 @@ Subsequent runs can resume from the same `--out-dir` and continue evolving from 
 
 Default behavior is now driven by `config.py` mode presets.  
 This avoids passing many low-level flags on the CLI.
+
+Current default preset:
+
+- profile: `full`
+- mode: `conclusion`
+- workers: `0` (auto, uses all available CPU cores)
+- parallel backend: `process`
+- rounds per execution: `12` (`conclusion/full`)
+
+This default is tuned for generating evidence suitable for conclusions/improvement work (not just quick smoke tests).
 
 ### List preset modes
 
@@ -132,7 +142,7 @@ PowerShell:
 
 ## Main CLI options
 
-- `--mode {balanced,dynamic,explorer}` (recommended high-level tuning control from `config.py`)
+- `--mode {balanced,conclusion,dynamic,explorer}` (recommended high-level tuning control from `config.py`)
 - `--list-modes`, `--print-effective-config`
 - `--population-size`, `--generations`
 - `--attacker-population-size`, `--attacker-generations`

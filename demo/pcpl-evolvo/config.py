@@ -9,35 +9,36 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 
-DEFAULT_MODE = "dynamic"
+DEFAULT_PROFILE = "full"
+DEFAULT_MODE = "conclusion"
 
 
 BASE_DEFAULTS: Dict[str, Any] = {
     "seed": 94960397,
-    "population_size": 128,
-    "generations": 500,
-    "initial_instructions": 12,
-    "rounds": 25,
-    "attacker_population_size": 128,
-    "attacker_generations": 6,
-    "elite_pool": 64,
-    "archive_limit": 128,
+    "population_size": 96,
+    "generations": 72,
+    "initial_instructions": 16,
+    "rounds": 8,
+    "attacker_population_size": 64,
+    "attacker_generations": 24,
+    "elite_pool": 48,
+    "archive_limit": 256,
     "continuous_max_iterations": 0,
     "workers": 0,
-    "parallel_backend": "auto",
+    "parallel_backend": "process",
     "preferred_device": "auto",
-    "parent_pool_ratio": 0.60,
-    "stagnation_patience": 4,
-    "mutation_floor": 0.25,
-    "mutation_ceiling": 0.75,
-    "mutation_step": 0.20,
-    "quick_cycle_fraction": 0.01,
-    "mid_cycle_fraction": 0.05,
-    "quick_keep_ratio": 0.55,
-    "mid_keep_ratio": 0.30,
-    "key_variants": 2,
-    "novelty_bonus": 0.03,
-    "predictive_penalty": 0.05,
+    "parent_pool_ratio": 0.50,
+    "stagnation_patience": 2,
+    "mutation_floor": 0.18,
+    "mutation_ceiling": 0.90,
+    "mutation_step": 0.10,
+    "quick_cycle_fraction": 0.10,
+    "mid_cycle_fraction": 0.35,
+    "quick_keep_ratio": 0.42,
+    "mid_keep_ratio": 0.16,
+    "key_variants": 4,
+    "novelty_bonus": 0.10,
+    "predictive_penalty": 0.08,
     "device_mhz": 100.0,
     "provider_mhz": 300.0,
     "max_test_seconds": 10.0,
@@ -50,6 +51,28 @@ BASE_DEFAULTS: Dict[str, Any] = {
 
 MODE_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "balanced": {},
+    # Default mode for publishing empirical conclusions.
+    "conclusion": {
+        "population_size": 128,
+        "generations": 96,
+        "rounds": 12,
+        "attacker_population_size": 96,
+        "attacker_generations": 32,
+        "elite_pool": 64,
+        "archive_limit": 384,
+        "parent_pool_ratio": 0.42,
+        "stagnation_patience": 2,
+        "mutation_floor": 0.20,
+        "mutation_ceiling": 0.95,
+        "mutation_step": 0.12,
+        "quick_cycle_fraction": 0.10,
+        "mid_cycle_fraction": 0.34,
+        "quick_keep_ratio": 0.40,
+        "mid_keep_ratio": 0.15,
+        "key_variants": 4,
+        "novelty_bonus": 0.12,
+        "predictive_penalty": 0.07,
+    },
     # More aggressive adaptation and novelty pressure; designed to avoid score plateaus.
     "dynamic": {
         "parent_pool_ratio": 0.45,
@@ -90,8 +113,14 @@ MODE_OVERRIDES: Dict[str, Dict[str, Any]] = {
 
 PROFILE_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "fast": {
-        "generations": 12,
-        "attacker_generations": 5,
+        "population_size": 64,
+        "generations": 40,
+        "rounds": 6,
+        "attacker_population_size": 48,
+        "attacker_generations": 16,
+        "elite_pool": 32,
+        "archive_limit": 192,
+        "key_variants": 3,
     },
     "full": {},
 }
@@ -99,23 +128,56 @@ PROFILE_OVERRIDES: Dict[str, Dict[str, Any]] = {
 
 PROFILE_MODE_OVERRIDES: Dict[str, Dict[str, Dict[str, Any]]] = {
     "fast": {
+        "conclusion": {
+            "population_size": 72,
+            "generations": 48,
+            "rounds": 8,
+            "attacker_population_size": 56,
+            "attacker_generations": 18,
+            "elite_pool": 36,
+            "archive_limit": 224,
+        },
         "dynamic": {
-            "generations": 14,
-            "attacker_generations": 6,
+            "population_size": 64,
+            "generations": 44,
+            "rounds": 6,
+            "attacker_population_size": 48,
+            "attacker_generations": 18,
         },
         "explorer": {
-            "generations": 16,
-            "attacker_generations": 7,
+            "population_size": 80,
+            "generations": 56,
+            "rounds": 6,
+            "attacker_population_size": 56,
+            "attacker_generations": 22,
+            "archive_limit": 256,
         },
     },
     "full": {
+        "conclusion": {
+            "population_size": 128,
+            "generations": 96,
+            "rounds": 12,
+            "attacker_population_size": 96,
+            "attacker_generations": 32,
+            "elite_pool": 64,
+            "archive_limit": 384,
+        },
         "dynamic": {
-            "generations": 16,
-            "attacker_generations": 8,
+            "population_size": 104,
+            "generations": 80,
+            "rounds": 8,
+            "attacker_population_size": 72,
+            "attacker_generations": 26,
+            "elite_pool": 52,
         },
         "explorer": {
-            "generations": 18,
-            "attacker_generations": 10,
+            "population_size": 112,
+            "generations": 84,
+            "rounds": 8,
+            "attacker_population_size": 80,
+            "attacker_generations": 30,
+            "archive_limit": 320,
         },
     },
 }
@@ -141,9 +203,10 @@ def resolve_defaults(*, profile: str, mode: str) -> Dict[str, Any]:
 def mode_summary(mode: str) -> str:
     if mode == "balanced":
         return "Balanced exploitation/exploration."
+    if mode == "conclusion":
+        return "Strong default for full empirical conclusions and improvement discovery."
     if mode == "dynamic":
         return "Aggressive anti-stagnation and novelty pressure."
     if mode == "explorer":
         return "Maximum exploration to escape stable local optima."
     return "Custom mode."
-
