@@ -10,7 +10,7 @@ from typing import Any, Dict, List
 
 
 DEFAULT_PROFILE = "full"
-DEFAULT_MODE = "conclusion"
+DEFAULT_MODE = "paper"
 
 
 BASE_DEFAULTS: Dict[str, Any] = {
@@ -51,6 +51,28 @@ BASE_DEFAULTS: Dict[str, Any] = {
 
 MODE_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "balanced": {},
+    # Paper-grade default: high parallel throughput with dynamic/explorer-compatible settings.
+    "paper": {
+        "population_size": 160,
+        "generations": 120,
+        "rounds": 16,
+        "attacker_population_size": 112,
+        "attacker_generations": 40,
+        "elite_pool": 80,
+        "archive_limit": 512,
+        "parent_pool_ratio": 0.40,
+        "stagnation_patience": 1,
+        "mutation_floor": 0.22,
+        "mutation_ceiling": 0.98,
+        "mutation_step": 0.14,
+        "quick_cycle_fraction": 0.10,
+        "mid_cycle_fraction": 0.36,
+        "quick_keep_ratio": 0.40,
+        "mid_keep_ratio": 0.15,
+        "key_variants": 5,
+        "novelty_bonus": 0.14,
+        "predictive_penalty": 0.09,
+    },
     # Default mode for publishing empirical conclusions.
     "conclusion": {
         "population_size": 128,
@@ -128,6 +150,15 @@ PROFILE_OVERRIDES: Dict[str, Dict[str, Any]] = {
 
 PROFILE_MODE_OVERRIDES: Dict[str, Dict[str, Dict[str, Any]]] = {
     "fast": {
+        "paper": {
+            "population_size": 96,
+            "generations": 68,
+            "rounds": 10,
+            "attacker_population_size": 72,
+            "attacker_generations": 24,
+            "elite_pool": 52,
+            "archive_limit": 352,
+        },
         "conclusion": {
             "population_size": 72,
             "generations": 48,
@@ -154,6 +185,15 @@ PROFILE_MODE_OVERRIDES: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
     },
     "full": {
+        "paper": {
+            "population_size": 160,
+            "generations": 120,
+            "rounds": 16,
+            "attacker_population_size": 112,
+            "attacker_generations": 40,
+            "elite_pool": 80,
+            "archive_limit": 512,
+        },
         "conclusion": {
             "population_size": 128,
             "generations": 96,
@@ -203,6 +243,8 @@ def resolve_defaults(*, profile: str, mode: str) -> Dict[str, Any]:
 def mode_summary(mode: str) -> str:
     if mode == "balanced":
         return "Balanced exploitation/exploration."
+    if mode == "paper":
+        return "Paper-grade default: high parallel throughput with dynamic + explorer strategy sweeps."
     if mode == "conclusion":
         return "Strong default for full empirical conclusions and improvement discovery."
     if mode == "dynamic":

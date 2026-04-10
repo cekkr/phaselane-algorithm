@@ -44,13 +44,73 @@ def _param_choices(base: int, *, minimum: int = 1, high_factor: float = 1.5) -> 
     return [base, high]
 
 
+def _clamp_float(value: float, low: float, high: float) -> float:
+    return max(float(low), min(float(high), float(value)))
+
+
+def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    mode = str(getattr(args, "mode", "")).lower()
+    base = {
+        "strategy": "base",
+        "parent_pool_ratio": float(args.parent_pool_ratio),
+        "stagnation_patience": int(args.stagnation_patience),
+        "mutation_floor": float(args.mutation_floor),
+        "mutation_ceiling": float(args.mutation_ceiling),
+        "mutation_step": float(args.mutation_step),
+        "quick_cycle_fraction": float(args.quick_cycle_fraction),
+        "mid_cycle_fraction": float(args.mid_cycle_fraction),
+        "quick_keep_ratio": float(args.quick_keep_ratio),
+        "mid_keep_ratio": float(args.mid_keep_ratio),
+        "key_variants": int(args.key_variants),
+        "novelty_bonus": float(args.novelty_bonus),
+        "predictive_penalty": float(args.predictive_penalty),
+    }
+    if mode != "paper":
+        return [base]
+
+    dynamic = {
+        "strategy": "dynamic",
+        "parent_pool_ratio": _clamp_float(base["parent_pool_ratio"], 0.35, 0.65),
+        "stagnation_patience": max(1, base["stagnation_patience"]),
+        "mutation_floor": _clamp_float(max(0.18, base["mutation_floor"]), 0.10, 0.90),
+        "mutation_ceiling": _clamp_float(max(base["mutation_ceiling"], base["mutation_floor"] + 0.18), 0.55, 0.99),
+        "mutation_step": _clamp_float(max(0.10, base["mutation_step"]), 0.03, 0.30),
+        "quick_cycle_fraction": _clamp_float(base["quick_cycle_fraction"] + 0.01, 0.08, 0.35),
+        "mid_cycle_fraction": _clamp_float(base["mid_cycle_fraction"] + 0.03, 0.25, 0.75),
+        "quick_keep_ratio": _clamp_float(base["quick_keep_ratio"] + 0.03, 0.35, 0.82),
+        "mid_keep_ratio": _clamp_float(base["mid_keep_ratio"] + 0.02, 0.12, 0.50),
+        "key_variants": max(3, base["key_variants"]),
+        "novelty_bonus": _clamp_float(max(0.10, base["novelty_bonus"]), 0.03, 0.30),
+        "predictive_penalty": _clamp_float(max(0.06, base["predictive_penalty"]), 0.03, 0.22),
+    }
+    explorer = {
+        "strategy": "explorer",
+        "parent_pool_ratio": _clamp_float(min(base["parent_pool_ratio"], 0.36), 0.25, 0.55),
+        "stagnation_patience": 1,
+        "mutation_floor": _clamp_float(max(0.26, base["mutation_floor"]), 0.18, 0.95),
+        "mutation_ceiling": _clamp_float(max(0.94, base["mutation_ceiling"]), 0.70, 0.99),
+        "mutation_step": _clamp_float(max(0.14, base["mutation_step"]), 0.05, 0.35),
+        "quick_cycle_fraction": _clamp_float(min(base["quick_cycle_fraction"], 0.10), 0.08, 0.30),
+        "mid_cycle_fraction": _clamp_float(min(base["mid_cycle_fraction"], 0.36), 0.24, 0.70),
+        "quick_keep_ratio": _clamp_float(min(base["quick_keep_ratio"], 0.42), 0.35, 0.75),
+        "mid_keep_ratio": _clamp_float(min(base["mid_keep_ratio"], 0.16), 0.12, 0.40),
+        "key_variants": max(4, base["key_variants"]),
+        "novelty_bonus": _clamp_float(max(0.14, base["novelty_bonus"]), 0.05, 0.35),
+        "predictive_penalty": _clamp_float(max(0.10, base["predictive_penalty"]), 0.04, 0.25),
+    }
+    return [dynamic, explorer]
+
+
 def _combo_label(combo: Dict[str, Any]) -> str:
+    strategy = str(combo.get("strategy", "")).strip()
+    strategy_suffix = f"-s{strategy}" if strategy else ""
     return (
         f"p{combo['population_size']}-g{combo['generations']}"
         f"-i{combo['initial_instructions']}"
         f"-ap{combo['attacker_population_size']}"
         f"-ag{combo['attacker_generations']}"
         f"-e{combo['elite_pool']}"
+        f"{strategy_suffix}"
     )
 
 
@@ -70,6 +130,7 @@ def _build_continuous_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
         high_factor=1.6,
     )
     elites = _param_choices(args.elite_pool, minimum=4, high_factor=1.4)
+    strategies = _continuous_strategy_profiles(args)
 
     combos: List[Dict[str, Any]] = []
     for values in itertools.product(
@@ -81,17 +142,31 @@ def _build_continuous_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
         elites,
     ):
         pop, gen, instr, apop, agen, elite = values
-        combos.append(
-            {
-                "population_size": pop,
-                "generations": gen,
-                "initial_instructions": instr,
-                "attacker_population_size": apop,
-                "attacker_generations": agen,
-                "elite_pool": min(pop, elite),
-                "archive_limit": max(args.archive_limit, min(pop * 6, args.archive_limit * 2)),
-            }
-        )
+        for strategy in strategies:
+            combos.append(
+                {
+                    "population_size": pop,
+                    "generations": gen,
+                    "initial_instructions": instr,
+                    "attacker_population_size": apop,
+                    "attacker_generations": agen,
+                    "elite_pool": min(pop, elite),
+                    "archive_limit": max(args.archive_limit, min(pop * 6, args.archive_limit * 2)),
+                    "strategy": str(strategy.get("strategy", "base")),
+                    "parent_pool_ratio": float(strategy["parent_pool_ratio"]),
+                    "stagnation_patience": int(strategy["stagnation_patience"]),
+                    "mutation_floor": float(strategy["mutation_floor"]),
+                    "mutation_ceiling": float(strategy["mutation_ceiling"]),
+                    "mutation_step": float(strategy["mutation_step"]),
+                    "quick_cycle_fraction": float(strategy["quick_cycle_fraction"]),
+                    "mid_cycle_fraction": float(strategy["mid_cycle_fraction"]),
+                    "quick_keep_ratio": float(strategy["quick_keep_ratio"]),
+                    "mid_keep_ratio": float(strategy["mid_keep_ratio"]),
+                    "key_variants": int(strategy["key_variants"]),
+                    "novelty_bonus": float(strategy["novelty_bonus"]),
+                    "predictive_penalty": float(strategy["predictive_penalty"]),
+                }
+            )
 
     dedup: Dict[str, Dict[str, Any]] = {}
     for combo in combos:
@@ -114,6 +189,18 @@ def _build_experiment_config(
     archive_limit: int,
     resume: bool,
     workers: int,
+    parent_pool_ratio: Optional[float] = None,
+    stagnation_patience: Optional[int] = None,
+    mutation_floor: Optional[float] = None,
+    mutation_ceiling: Optional[float] = None,
+    mutation_step: Optional[float] = None,
+    quick_cycle_fraction: Optional[float] = None,
+    mid_cycle_fraction: Optional[float] = None,
+    quick_keep_ratio: Optional[float] = None,
+    mid_keep_ratio: Optional[float] = None,
+    key_variants: Optional[int] = None,
+    novelty_bonus: Optional[float] = None,
+    predictive_penalty: Optional[float] = None,
 ) -> ExperimentConfig:
     return ExperimentConfig(
         out_dir=out_dir,
@@ -132,19 +219,19 @@ def _build_experiment_config(
         parallel_backend=args.parallel_backend,
         use_supervised_guide=bool(args.use_supervised_guide),
         preferred_device=args.device,
-        parent_pool_ratio=args.parent_pool_ratio,
-        stagnation_patience=args.stagnation_patience,
-        mutation_floor=args.mutation_floor,
-        mutation_ceiling=args.mutation_ceiling,
-        mutation_step=args.mutation_step,
+        parent_pool_ratio=args.parent_pool_ratio if parent_pool_ratio is None else float(parent_pool_ratio),
+        stagnation_patience=args.stagnation_patience if stagnation_patience is None else int(stagnation_patience),
+        mutation_floor=args.mutation_floor if mutation_floor is None else float(mutation_floor),
+        mutation_ceiling=args.mutation_ceiling if mutation_ceiling is None else float(mutation_ceiling),
+        mutation_step=args.mutation_step if mutation_step is None else float(mutation_step),
         statistical_predictive=bool(args.statistical_predictive),
-        quick_cycle_fraction=args.quick_cycle_fraction,
-        mid_cycle_fraction=args.mid_cycle_fraction,
-        quick_keep_ratio=args.quick_keep_ratio,
-        mid_keep_ratio=args.mid_keep_ratio,
-        key_variant_count=args.key_variants,
-        novelty_bonus=args.novelty_bonus,
-        predictive_penalty=args.predictive_penalty,
+        quick_cycle_fraction=args.quick_cycle_fraction if quick_cycle_fraction is None else float(quick_cycle_fraction),
+        mid_cycle_fraction=args.mid_cycle_fraction if mid_cycle_fraction is None else float(mid_cycle_fraction),
+        quick_keep_ratio=args.quick_keep_ratio if quick_keep_ratio is None else float(quick_keep_ratio),
+        mid_keep_ratio=args.mid_keep_ratio if mid_keep_ratio is None else float(mid_keep_ratio),
+        key_variant_count=args.key_variants if key_variants is None else int(key_variants),
+        novelty_bonus=args.novelty_bonus if novelty_bonus is None else float(novelty_bonus),
+        predictive_penalty=args.predictive_penalty if predictive_penalty is None else float(predictive_penalty),
         auto_statistical_tuning=bool(args.auto_statistical_tuning),
         device_mhz=args.device_mhz,
         provider_mhz=args.provider_mhz,
@@ -174,7 +261,7 @@ def _resolve_continuous_lane_plan(
 
     # More aggressive lane fan-out to keep all cores busy, especially on >=24-core desktops.
     if backend == "process":
-        min_workers_per_lane = 3
+        min_workers_per_lane = 2
     else:
         min_workers_per_lane = 2
     lanes = max(1, total_workers // max(1, min_workers_per_lane))
@@ -657,6 +744,10 @@ def main() -> None:
     grid = _build_continuous_grid(args)
     if not grid:
         raise RuntimeError("Continuous grid is empty")
+    strategy_counts: Dict[str, int] = {}
+    for combo in grid:
+        strategy = str(combo.get("strategy", "base"))
+        strategy_counts[strategy] = strategy_counts.get(strategy, 0) + 1
 
     state_path = out_dir / "continuous-state.json"
     leaderboard_path = out_dir / "continuous-leaderboard.json"
@@ -687,6 +778,11 @@ def main() -> None:
             total_workers=int(lane_plan["total_workers"]),
         )
     )
+    if len(strategy_counts) > 1:
+        details = ", ".join(
+            f"{name}={count}" for name, count in sorted(strategy_counts.items())
+        )
+        print(f"[pcpl-evolvo] continuous strategies: {details}")
 
     outer_kwargs: Dict[str, Any] = {}
     mp_ctx_name = _outer_mp_context()
@@ -735,13 +831,26 @@ def main() -> None:
                             archive_limit=combo["archive_limit"],
                             resume=True,
                             workers=workers_per_lane,
+                            parent_pool_ratio=combo.get("parent_pool_ratio"),
+                            stagnation_patience=combo.get("stagnation_patience"),
+                            mutation_floor=combo.get("mutation_floor"),
+                            mutation_ceiling=combo.get("mutation_ceiling"),
+                            mutation_step=combo.get("mutation_step"),
+                            quick_cycle_fraction=combo.get("quick_cycle_fraction"),
+                            mid_cycle_fraction=combo.get("mid_cycle_fraction"),
+                            quick_keep_ratio=combo.get("quick_keep_ratio"),
+                            mid_keep_ratio=combo.get("mid_keep_ratio"),
+                            key_variants=combo.get("key_variants"),
+                            novelty_bonus=combo.get("novelty_bonus"),
+                            predictive_penalty=combo.get("predictive_penalty"),
                         )
 
                         print(
-                            "[pcpl-evolvo] launch iter={iter} sweep={sweep} combo={combo} seed={seed} lane={lane}/{lanes} lane-workers={lane_workers}".format(
+                            "[pcpl-evolvo] launch iter={iter} sweep={sweep} combo={combo} strategy={strategy} seed={seed} lane={lane}/{lanes} lane-workers={lane_workers}".format(
                                 iter=iteration_index,
                                 sweep=total_sweeps,
                                 combo=combo_name,
+                                strategy=str(combo.get("strategy", "base")),
                                 seed=run_seed,
                                 lane=len(pending) + 1,
                                 lanes=lane_count,
@@ -797,6 +906,7 @@ def main() -> None:
                         if success:
                             leaderboard[combo_name] = {
                                 "combo": combo,
+                                "strategy": str(combo.get("strategy", "base")),
                                 "best_score": summary["best_score"],
                                 "best_signature": summary["best_signature"],
                                 "best_attacker_score": summary["best_attacker_score"],
