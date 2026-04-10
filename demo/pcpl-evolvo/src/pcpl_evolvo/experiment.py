@@ -91,6 +91,44 @@ def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, float(value)))
 
 
+def _invalidate_genome_caches(genome: GFSLGenome) -> None:
+    genome._signature = None
+    genome._effective_instructions = None
+    if hasattr(genome, "_pcpl_eval_sig"):
+        delattr(genome, "_pcpl_eval_sig")
+    if hasattr(genome, "_pcpl_eval_sig_key"):
+        delattr(genome, "_pcpl_eval_sig_key")
+
+
+def _append_random_instruction_fast(
+    genome: GFSLGenome,
+    *,
+    max_attempts: int = 8,
+) -> bool:
+    """Add one valid random instruction without expensive probability trees."""
+    slot_count = max(1, int(genome.validator.slot_count))
+    for _ in range(max(1, int(max_attempts))):
+        instruction = GFSLInstruction(slot_count=slot_count)
+        valid = True
+        for slot_idx in range(slot_count):
+            options = genome.validator.get_valid_options(instruction, slot_idx)
+            if not options:
+                valid = False
+                break
+            instruction.slots[slot_idx] = random.choice(options)
+        if not valid:
+            continue
+        genome.instructions.append(instruction)
+        genome.validator.update_state(instruction)
+        try:
+            genome._ensure_activity_size()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        _invalidate_genome_caches(genome)
+        return True
+    return False
+
+
 @dataclass
 class PredictiveStageController:
     quick_cycle_fraction: float
@@ -262,6 +300,195 @@ class SafeGFSLEvolver(GFSLEvolver):
         self.best_signature_tracker = ""
         self.signature_stagnation_count = 0
 
+    def initialize_population(
+        self,
+        genome_type: str = "algorithm",
+        initial_instructions: int = 10,
+    ) -> None:
+        """Create an initial diverse population with a faster random builder."""
+        self.population = []
+        self.diversity_cache = set()
+        attempts = 0
+        max_attempts = max(self.population_size * 8, self.population_size)
+
+        while len(self.population) < self.population_size and attempts < max_attempts:
+            attempts += 1
+            genome = GFSLGenome(genome_type)
+            target_count = random.randint(1, max(1, int(initial_instructions)))
+            for _ in range(target_count):
+                if not _append_random_instruction_fast(genome, max_attempts=6):
+                    break
+            genome.rebuild_validator_state()
+            _invalidate_genome_caches(genome)
+            signature = _evaluation_signature(genome)
+            if signature in self.diversity_cache:
+                continue
+            self.diversity_cache.add(signature)
+            self.population.append(genome)
+
+        while len(self.population) < self.population_size:
+            genome = GFSLGenome(genome_type)
+            if not _append_random_instruction_fast(genome, max_attempts=10):
+                try:
+                    genome.add_instruction_interactive(max_attempts=8)
+                except Exception:
+                    pass
+            genome.rebuild_validator_state()
+            _invalidate_genome_caches(genome)
+            self.population.append(genome)
+
+    def _stagnation_pressure(self) -> float:
+        fitness_pressure = float(self.stagnation_count) / float(
+            max(1, self.stagnation_patience)
+        )
+        signature_pressure = float(self.signature_stagnation_count) / float(
+            max(1, self.stagnation_patience * 2)
+        )
+        return clamp(max(fitness_pressure, signature_pressure), 0.0, 1.0)
+
+    def _mutate_slot_fast(
+        self,
+        genome: GFSLGenome,
+        *,
+        diversification: float,
+    ) -> bool:
+        if not genome.instructions:
+            return False
+        instr_idx = random.randrange(len(genome.instructions))
+        base_instruction = genome.instructions[instr_idx]
+        slot_count = len(base_instruction.slots)
+        if slot_count <= 0:
+            return False
+
+        max_trials = max(3, min(10, slot_count * 2))
+        for _ in range(max_trials):
+            candidate = base_instruction.copy()
+            slot_idx = random.randrange(slot_count)
+            valid_options = genome.validator.get_valid_options(candidate, slot_idx)
+            if not valid_options:
+                continue
+
+            current_val = candidate.slots[slot_idx]
+            alternatives = [opt for opt in valid_options if opt != current_val]
+            if alternatives:
+                candidate.slots[slot_idx] = random.choice(alternatives)
+                changed = True
+            else:
+                changed = False
+                if random.random() >= diversification:
+                    continue
+
+            valid_suffix = True
+            for next_slot in range(slot_idx + 1, slot_count):
+                next_valid = genome.validator.get_valid_options(candidate, next_slot)
+                if not next_valid:
+                    valid_suffix = False
+                    break
+                next_current = candidate.slots[next_slot]
+                if next_current not in next_valid:
+                    candidate.slots[next_slot] = random.choice(next_valid)
+                    changed = True
+                    continue
+                if random.random() < diversification and len(next_valid) > 1:
+                    next_alternatives = [opt for opt in next_valid if opt != next_current]
+                    if next_alternatives:
+                        candidate.slots[next_slot] = random.choice(next_alternatives)
+                        changed = True
+
+            if not valid_suffix or not changed:
+                continue
+            genome.instructions[instr_idx] = candidate
+            return True
+        return False
+
+    def _pick_mutation_operation(self, *, instruction_count: int, pressure: float) -> str:
+        operations: List[str] = ["slot", "add", "swap"]
+        slot_weight = max(0.10, 0.46 - (0.16 * pressure))
+        add_weight = 0.24 + (0.22 * pressure)
+        swap_weight = 0.10 + (0.10 * pressure)
+        weights: List[float] = [slot_weight, add_weight, swap_weight]
+        if instruction_count > 1:
+            operations.append("remove")
+            weights.append(0.14 + (0.06 * pressure))
+        return random.choices(operations, weights=weights, k=1)[0]
+
+    def mutate(self, genome: GFSLGenome) -> GFSLGenome:
+        """Faster, higher-entropy mutation operator for large experiment sweeps."""
+        mutated = copy.deepcopy(genome)
+        if not mutated.instructions:
+            _append_random_instruction_fast(mutated, max_attempts=12)
+
+        pressure = self._stagnation_pressure()
+        diversification = clamp(0.20 + (0.55 * pressure), 0.20, 0.85)
+        passes = 1
+        if random.random() < (0.35 + (0.45 * pressure)):
+            passes += 1
+        if pressure > 0.65 and random.random() < 0.80:
+            passes += 1
+
+        changed = False
+        validator_synced = True
+        for _ in range(passes):
+            op = self._pick_mutation_operation(
+                instruction_count=len(mutated.instructions),
+                pressure=pressure,
+            )
+            if op in {"slot", "add"} and not validator_synced:
+                mutated.rebuild_validator_state()
+                validator_synced = True
+
+            if op == "slot":
+                changed = self._mutate_slot_fast(
+                    mutated,
+                    diversification=diversification,
+                ) or changed
+            elif op == "add":
+                changed = (
+                    _append_random_instruction_fast(
+                        mutated,
+                        max_attempts=max(6, 10 + int(6 * pressure)),
+                    )
+                    or changed
+                )
+            elif op == "swap" and len(mutated.instructions) > 1:
+                a, b = random.sample(range(len(mutated.instructions)), 2)
+                mutated.instructions[a], mutated.instructions[b] = (
+                    mutated.instructions[b],
+                    mutated.instructions[a],
+                )
+                if len(mutated.instruction_activity) > max(a, b):
+                    mutated.instruction_activity[a], mutated.instruction_activity[b] = (
+                        mutated.instruction_activity[b],
+                        mutated.instruction_activity[a],
+                    )
+                changed = True
+                validator_synced = False
+            elif op == "remove" and len(mutated.instructions) > 1:
+                idx = random.randrange(len(mutated.instructions))
+                mutated.instructions.pop(idx)
+                if idx < len(mutated.instruction_activity):
+                    mutated.instruction_activity.pop(idx)
+                changed = True
+                validator_synced = False
+
+        if not changed:
+            if validator_synced:
+                changed = self._mutate_slot_fast(
+                    mutated,
+                    diversification=max(diversification, 0.45),
+                )
+            if not changed:
+                changed = _append_random_instruction_fast(
+                    mutated,
+                    max_attempts=14,
+                )
+
+        mutated.rebuild_validator_state()
+        _invalidate_genome_caches(mutated)
+        mutated.fitness = None
+        mutated.generation = genome.generation
+        return mutated
+
     def evolve(
         self,
         generations: int,
@@ -317,6 +544,7 @@ class SafeGFSLEvolver(GFSLEvolver):
                 self.best_signature_tracker = current_signature
                 self.signature_stagnation_count = 0
 
+            stagnation_pressure = self._stagnation_pressure()
             if self.supervised_guide:
                 self.supervised_guide.observe_population(self.population)
 
@@ -327,11 +555,12 @@ class SafeGFSLEvolver(GFSLEvolver):
             elite_size = max(1, int(self.population_size * self.elite_ratio))
             new_population = self.population[:elite_size]
 
-            seen = {_canonical_signature(genome) for genome in new_population}
+            seen = {_evaluation_signature(genome) for genome in new_population}
             attempts = 0
-            max_attempts = max(self.population_size * 80, 200)
+            max_attempts = max(self.population_size * 90, 240)
             parent_pool_size = max(2, int(len(self.population) * self.parent_pool_ratio))
             parent_pool = self.population[: parent_pool_size]
+            local_refine_chance = 0.28 + (0.47 * stagnation_pressure)
 
             def tournament_from(pool: Sequence[GFSLGenome], size: int = 3) -> GFSLGenome:
                 tournament = random.sample(list(pool), min(size, len(pool)))
@@ -339,7 +568,7 @@ class SafeGFSLEvolver(GFSLEvolver):
 
             while len(new_population) < self.population_size and attempts < max_attempts:
                 attempts += 1
-                if self.stagnation_count > 0 and random.random() < 0.45:
+                if stagnation_pressure > 0.0 and random.random() < local_refine_chance:
                     # Focused local refinement around high-performing parents.
                     parent = parent_pool[attempts % len(parent_pool)]
                     child = copy.deepcopy(parent)
@@ -356,9 +585,8 @@ class SafeGFSLEvolver(GFSLEvolver):
                 child.fitness = None
                 child.generation = gen + 1
 
-                if random.random() < self.mutation_rate and not (
-                    self.stagnation_count > 0 and random.random() < 0.45
-                ):
+                force_mutation = stagnation_pressure >= 0.55 and random.random() < 0.70
+                if force_mutation or random.random() < self.mutation_rate:
                     if self.supervised_guide:
                         child = self.supervised_guide.propose_mutation(self, child)
                     else:
@@ -366,15 +594,16 @@ class SafeGFSLEvolver(GFSLEvolver):
                     child.fitness = None
                     child.generation = gen + 1
 
-                signature = _canonical_signature(child)
+                signature = _evaluation_signature(child)
                 if signature in seen:
                     continue
                 seen.add(signature)
                 new_population.append(child)
 
             # Inject random immigrants when the top signature is stuck for too long.
-            if self.signature_stagnation_count >= max(2, self.stagnation_patience):
-                immigrant_target = max(1, int(round(self.population_size * 0.15)))
+            if self.signature_stagnation_count >= max(1, self.stagnation_patience):
+                immigrant_ratio = 0.15 + (0.20 * stagnation_pressure)
+                immigrant_target = max(1, int(round(self.population_size * immigrant_ratio)))
                 injected = 0
                 inject_attempts = 0
                 while (
@@ -388,7 +617,7 @@ class SafeGFSLEvolver(GFSLEvolver):
                     )
                     immigrant.fitness = None
                     immigrant.generation = gen + 1
-                    signature = _canonical_signature(immigrant)
+                    signature = _evaluation_signature(immigrant)
                     if signature in seen:
                         continue
                     seen.add(signature)
@@ -401,7 +630,7 @@ class SafeGFSLEvolver(GFSLEvolver):
                 fallback.generation = gen + 1
                 fallback_added = False
                 for _ in range(16):
-                    signature = _canonical_signature(fallback)
+                    signature = _evaluation_signature(fallback)
                     if signature not in seen:
                         seen.add(signature)
                         new_population.append(fallback)
@@ -417,7 +646,7 @@ class SafeGFSLEvolver(GFSLEvolver):
                 )
                 immigrant.fitness = None
                 immigrant.generation = gen + 1
-                signature = _canonical_signature(immigrant)
+                signature = _evaluation_signature(immigrant)
                 if signature in seen:
                     continue
                 seen.add(signature)
@@ -948,7 +1177,8 @@ def _evaluate_pending_parallel(
     )
     if use_batch_chunks:
         batch_worker = _defender_eval_worker_batch if worker_fn is _defender_eval_worker else _attacker_eval_worker_batch
-        batch_size = max(2, min(8, int(math.ceil(len(tasks) / float(max(1, workers * 2))))))
+        batch_size = max(4, int(math.ceil(len(tasks) / float(max(1, workers)))))
+        batch_size = min(32, batch_size)
         task_chunks = [tasks[pos : pos + batch_size] for pos in range(0, len(tasks), batch_size)]
         if worker_fn is _defender_eval_worker:
             batch_tasks = [
@@ -1014,10 +1244,14 @@ def _mean_metric(metrics: Sequence[ScenarioMetrics], attr: str) -> float:
 def _make_random_genome(initial_instructions: int, *, slot_count: Optional[int] = None) -> GFSLGenome:
     genome = GFSLGenome("algorithm", slot_count=slot_count)
     for _ in range(random.randint(1, max(1, int(initial_instructions)))):
+        if _append_random_instruction_fast(genome, max_attempts=6):
+            continue
         try:
-            genome.add_instruction_interactive()
+            genome.add_instruction_interactive(max_attempts=8)
         except RuntimeError:
             break
+    genome.rebuild_validator_state()
+    _invalidate_genome_caches(genome)
     return genome
 
 
@@ -1081,12 +1315,28 @@ def _evaluation_signature(genome: GFSLGenome) -> str:
     This intentionally avoids expensive canonical pruning/deep-copy so staged
     dedup and novelty checks stay cheap during generation loops.
     """
-    outputs = sorted((int(cat), int(dtype), int(idx)) for cat, dtype, idx in genome.outputs)
-    payload = "{sig}|outs={outs}".format(
-        sig=str(genome.get_signature()),
-        outs=json.dumps(outputs, separators=(",", ":")),
+    base_sig = str(genome.get_signature())
+    outputs_key = tuple(
+        sorted((int(cat), int(dtype), int(idx)) for cat, dtype, idx in genome.outputs)
     )
-    return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+    cache_key = (base_sig, outputs_key)
+    cached_key = getattr(genome, "_pcpl_eval_sig_key", None)
+    if cached_key == cache_key:
+        cached = getattr(genome, "_pcpl_eval_sig", None)
+        if isinstance(cached, str):
+            return cached
+
+    if outputs_key:
+        outs_blob = ";".join(
+            f"{cat}:{dtype}:{idx}" for cat, dtype, idx in outputs_key
+        )
+    else:
+        outs_blob = ""
+    payload = f"{base_sig}|outs={outs_blob}"
+    digest = hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+    genome._pcpl_eval_sig_key = cache_key  # type: ignore[attr-defined]
+    genome._pcpl_eval_sig = digest  # type: ignore[attr-defined]
+    return digest
 
 
 def _serialize_genome(genome: GFSLGenome, *, role: str) -> Dict[str, Any]:
@@ -1212,7 +1462,7 @@ def _seed_population_from_archive(
 
     def push(genome: GFSLGenome) -> bool:
         io_initializer(genome)
-        signature = _canonical_signature(genome)
+        signature = _evaluation_signature(genome)
         if signature in seen:
             return False
         seen.add(signature)

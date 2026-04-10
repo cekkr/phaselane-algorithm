@@ -688,29 +688,28 @@ def main() -> None:
         )
     )
 
-    try:
-        while True:
-            outer_kwargs: Dict[str, Any] = {}
-            mp_ctx_name = _outer_mp_context()
-            if mp_ctx_name is not None:
-                try:
-                    outer_kwargs["mp_context"] = multiprocessing.get_context(mp_ctx_name)
-                except Exception:
-                    pass
+    outer_kwargs: Dict[str, Any] = {}
+    mp_ctx_name = _outer_mp_context()
+    if mp_ctx_name is not None:
+        try:
+            outer_kwargs["mp_context"] = multiprocessing.get_context(mp_ctx_name)
+        except Exception:
+            pass
 
-            stop_requested = False
-            next_slot = 0
-            launched_in_sweep = 0
-            pending: Dict[concurrent.futures.Future, Dict[str, Any]] = {}
-            with concurrent.futures.ProcessPoolExecutor(
-                max_workers=lane_count,
-                **outer_kwargs,
-            ) as combo_pool:
+    try:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=lane_count,
+            **outer_kwargs,
+        ) as combo_pool:
+            while True:
+                stop_requested = False
+                next_slot = 0
+                pending: Dict[concurrent.futures.Future, Dict[str, Any]] = {}
                 while next_slot < len(order) or pending:
                     while next_slot < len(order) and len(pending) < lane_count:
                         if (
                             args.continuous_max_iterations > 0
-                            and (total_iterations + launched_in_sweep)
+                            and (total_iterations + len(pending))
                             >= args.continuous_max_iterations
                         ):
                             break
@@ -720,7 +719,7 @@ def main() -> None:
                         combo_dir = runs_root / combo_name
                         combo_dir.mkdir(parents=True, exist_ok=True)
 
-                        iteration_index = total_iterations + launched_in_sweep
+                        iteration_index = total_iterations + len(pending)
                         run_seed = args.seed + (iteration_index * 7_919) + next_slot
                         config = _build_experiment_config(
                             args,
@@ -756,12 +755,10 @@ def main() -> None:
                             "combo_dir": str(combo_dir),
                         }
                         next_slot += 1
-                        launched_in_sweep += 1
 
                     if (
                         args.continuous_max_iterations > 0
-                        and (total_iterations + launched_in_sweep)
-                        >= args.continuous_max_iterations
+                        and total_iterations >= args.continuous_max_iterations
                         and not pending
                     ):
                         stop_requested = True
@@ -876,17 +873,17 @@ def main() -> None:
                             pending_future.cancel()
                         break
 
-            if stop_requested:
-                return
+                if stop_requested:
+                    return
 
-            total_sweeps += 1
-            rng.shuffle(order)
-            print(
-                "[pcpl-evolvo] sweep complete: sweeps={sweeps} iterations={iters}".format(
-                    sweeps=total_sweeps,
-                    iters=total_iterations,
+                total_sweeps += 1
+                rng.shuffle(order)
+                print(
+                    "[pcpl-evolvo] sweep complete: sweeps={sweeps} iterations={iters}".format(
+                        sweeps=total_sweeps,
+                        iters=total_iterations,
+                    )
                 )
-            )
     except KeyboardInterrupt:
         print("[pcpl-evolvo] continuous mode stopped by user (Ctrl+C)")
         print(f"[pcpl-evolvo] state={state_path}")
