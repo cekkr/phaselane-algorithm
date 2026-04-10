@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import random
 import time
@@ -20,14 +21,38 @@ from evolvo import (
     GFSLGenome,
     GFSLInstruction,
     Operation,
+    custom_operations,
     pack_type_index,
+    register_custom_operation,
 )
 
 
-OUTPUT_INDICES = (20, 21, 22)
+DEFENDER_OUTPUT_ACTIVE_IDX = 20
+DEFENDER_OUTPUT_KERNEL_IDX = 21
+DEFENDER_OUTPUT_STATE_MIX_IDX = 22
+DEFENDER_OUTPUT_EXP_MIX_IDX = 23
+DEFENDER_OUTPUT_HASH_ROUNDS_IDX = 24
+DEFENDER_OUTPUT_BOUQUET_SPREAD_IDX = 25
+DEFENDER_OUTPUT_STATE_CHURN_IDX = 26
+DEFENDER_OUTPUT_LANE_SALT_IDX = 27
+DEFENDER_OUTPUT_TOKEN_SCRAMBLE_IDX = 28
+DEFENDER_OUTPUT_PHASE_JITTER_IDX = 29
+
+OUTPUT_INDICES = (
+    DEFENDER_OUTPUT_ACTIVE_IDX,
+    DEFENDER_OUTPUT_KERNEL_IDX,
+    DEFENDER_OUTPUT_STATE_MIX_IDX,
+    DEFENDER_OUTPUT_EXP_MIX_IDX,
+    DEFENDER_OUTPUT_HASH_ROUNDS_IDX,
+    DEFENDER_OUTPUT_BOUQUET_SPREAD_IDX,
+    DEFENDER_OUTPUT_STATE_CHURN_IDX,
+    DEFENDER_OUTPUT_LANE_SALT_IDX,
+    DEFENDER_OUTPUT_TOKEN_SCRAMBLE_IDX,
+    DEFENDER_OUTPUT_PHASE_JITTER_IDX,
+)
 ATTACK_OUTPUT_INDICES = (40, 41, 42)
-INPUT_DECIMAL_COUNT = 12
-ATTACK_INPUT_DECIMAL_COUNT = 12
+INPUT_DECIMAL_COUNT = 18
+ATTACK_INPUT_DECIMAL_COUNT = 16
 
 
 OPERATION_COST_UNITS = {
@@ -77,6 +102,7 @@ OPERATION_COST_UNITS = {
     int(Operation.CONCAT): 1.2,
 }
 DEFAULT_OPERATION_COST = 1.0
+PCPL_CUSTOM_OP_CODES: Dict[str, int] = {}
 
 
 @dataclass(frozen=True)
@@ -108,6 +134,72 @@ class ScenarioConfig:
     max_test_time_seconds: float = 10.0
 
 
+def _quantize_decimal(value: float) -> int:
+    clipped = clamp(float(value), -1_000_000.0, 1_000_000.0)
+    return int(round(clipped * 1_000_000.0))
+
+
+def _hash_to_unit(*parts: object) -> float:
+    payload = "|".join(str(part) for part in parts).encode("utf-8")
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    raw = int.from_bytes(digest, "big")
+    return float(raw) / float((1 << 64) - 1)
+
+
+def _pcpl_hashmix_op(a: float, b: float) -> float:
+    qa = _quantize_decimal(a)
+    qb = _quantize_decimal(b)
+    unit = _hash_to_unit("PCPL_HASHMIX", qa, qb)
+    return (2.0 * unit) - 1.0
+
+
+def _pcpl_phasemix_op(a: float, b: float) -> float:
+    qa = _quantize_decimal(a)
+    qb = _quantize_decimal(b)
+    folded = ((qa * 31) ^ (qb * 17)) & 0xFFFFFFFF
+    unit = _hash_to_unit("PCPL_PHASEMIX", folded, qa - qb)
+    return (2.0 * unit) - 1.0
+
+
+def _pcpl_modhash_op(a: float, b: float) -> float:
+    qa = _quantize_decimal(a)
+    qb = _quantize_decimal(b)
+    base = abs(qa) + 1
+    mod = (abs(qb) % 1_000_003) + 97
+    mixed = pow(base, 3, mod)
+    unit = _hash_to_unit("PCPL_MODHASH", mixed, mod)
+    return (2.0 * unit) - 1.0
+
+
+def _register_pcpl_custom_operations() -> None:
+    specs = [
+        ("PCPL_HASHMIX", _pcpl_hashmix_op, 2.2),
+        ("PCPL_PHASEMIX", _pcpl_phasemix_op, 1.9),
+        ("PCPL_MODHASH", _pcpl_modhash_op, 2.0),
+    ]
+    for name, function, cost in specs:
+        existing = custom_operations.get_code_by_name(name)
+        code = existing
+        if code is None:
+            try:
+                code = register_custom_operation(
+                    name=name,
+                    target_type=DataType.DECIMAL,
+                    function=function,
+                    arity=2,
+                    source_types=(DataType.DECIMAL, DataType.DECIMAL),
+                    doc="PCPL-specific decimal hash mixer",
+                )
+            except Exception:
+                code = custom_operations.get_code_by_name(name)
+        if code is not None:
+            PCPL_CUSTOM_OP_CODES[name] = int(code)
+            OPERATION_COST_UNITS[int(code)] = float(cost)
+
+
+_register_pcpl_custom_operations()
+
+
 @dataclass(frozen=True)
 class PolicyDecision:
     """Control outputs produced by an evolved GFSL circuit."""
@@ -116,6 +208,13 @@ class PolicyDecision:
     kernel: int
     stride_seed: int
     state_mix: float
+    exponent_mix: float
+    hash_rounds: int
+    bouquet_spread: float
+    state_churn: float
+    lane_salt: int
+    token_scramble: float
+    phase_jitter: float
 
 
 @dataclass(frozen=True)
@@ -123,6 +222,7 @@ class LaneTokenResult:
     token: int
     active_count: int
     pow_ops: int
+    hash_ops: int
 
 
 @dataclass
@@ -255,7 +355,8 @@ def ensure_genome_io(genome: GFSLGenome) -> None:
         if marker not in existing_outputs:
             genome.mark_output(DataType.DECIMAL, idx)
 
-    if len(genome.extract_effective_algorithm()) == 0:
+    injected = bool(getattr(genome, "_pcpl_scaffold_injected", False))
+    if len(genome.extract_effective_algorithm()) == 0 or (not injected and not _has_pcpl_control_path(genome)):
         _inject_defender_output_path(genome)
 
 
@@ -279,18 +380,31 @@ def ensure_attacker_genome_io(genome: GFSLGenome) -> None:
         _inject_attacker_output_path(genome)
 
 
+def _has_pcpl_control_path(genome: GFSLGenome) -> bool:
+    targeted = set()
+    for instruction in genome.instructions:
+        if int(instruction.target_cat) != int(Category.VARIABLE):
+            continue
+        if int(instruction.target_type) != int(DataType.DECIMAL):
+            continue
+        targeted.add(int(instruction.target_index))
+    return len(targeted.intersection(set(OUTPUT_INDICES))) >= max(3, len(OUTPUT_INDICES) // 2)
+
+
 def _inject_instruction(
     genome: GFSLGenome,
     *,
     target_idx: int,
     source_a_idx: int,
     source_b_idx: int,
+    op_code: Optional[int] = None,
 ) -> bool:
     slot_count = int(max(7, genome.validator.slot_count))
+    operation = int(Operation.ADD) if op_code is None else int(op_code)
     base_slots = [
         int(Category.VARIABLE),
         int(pack_type_index(DataType.DECIMAL, target_idx)),
-        int(Operation.ADD),
+        operation,
         int(Category.VARIABLE),
         int(pack_type_index(DataType.DECIMAL, source_a_idx)),
         int(Category.VARIABLE),
@@ -303,11 +417,29 @@ def _inject_instruction(
 
 
 def _inject_defender_output_path(genome: GFSLGenome) -> None:
-    # Deterministic fallback to avoid degenerate no-op circuits.
-    _inject_instruction(genome, target_idx=OUTPUT_INDICES[0], source_a_idx=0, source_b_idx=1)
-    _inject_instruction(genome, target_idx=OUTPUT_INDICES[1], source_a_idx=2, source_b_idx=3)
-    _inject_instruction(genome, target_idx=OUTPUT_INDICES[2], source_a_idx=4, source_b_idx=5)
+    # Deterministic PCPL scaffold so genomes always expose protocol-relevant controls.
+    scaffold = [
+        (DEFENDER_OUTPUT_ACTIVE_IDX, 0, 1, int(Operation.ADD)),
+        (DEFENDER_OUTPUT_KERNEL_IDX, 2, 3, int(Operation.MOD)),
+        (DEFENDER_OUTPUT_STATE_MIX_IDX, 4, 5, int(Operation.MUL)),
+        (DEFENDER_OUTPUT_EXP_MIX_IDX, 6, 7, PCPL_CUSTOM_OP_CODES.get("PCPL_HASHMIX", int(Operation.ADD))),
+        (DEFENDER_OUTPUT_HASH_ROUNDS_IDX, 8, 9, PCPL_CUSTOM_OP_CODES.get("PCPL_PHASEMIX", int(Operation.ADD))),
+        (DEFENDER_OUTPUT_BOUQUET_SPREAD_IDX, 10, 6, int(Operation.SUB)),
+        (DEFENDER_OUTPUT_STATE_CHURN_IDX, 3, 11, PCPL_CUSTOM_OP_CODES.get("PCPL_MODHASH", int(Operation.MUL))),
+        (DEFENDER_OUTPUT_LANE_SALT_IDX, 1, 8, int(Operation.ADD)),
+        (DEFENDER_OUTPUT_TOKEN_SCRAMBLE_IDX, 2, 9, PCPL_CUSTOM_OP_CODES.get("PCPL_HASHMIX", int(Operation.SUB))),
+        (DEFENDER_OUTPUT_PHASE_JITTER_IDX, 5, 10, int(Operation.MOD)),
+    ]
+    for target_idx, src_a, src_b, op_code in scaffold:
+        _inject_instruction(
+            genome,
+            target_idx=target_idx,
+            source_a_idx=src_a,
+            source_b_idx=src_b,
+            op_code=op_code,
+        )
     genome.rebuild_validator_state()
+    genome._pcpl_scaffold_injected = True  # type: ignore[attr-defined]
 
 
 def _inject_attacker_output_path(genome: GFSLGenome) -> None:
@@ -334,16 +466,32 @@ def estimate_operation_units(genome: Optional[GFSLGenome]) -> float:
 
 
 def _policy_from_outputs(outputs: Dict[str, object]) -> PolicyDecision:
-    raw_active = safe_float(outputs.get(f"d${OUTPUT_INDICES[0]}", 0.0))
-    raw_kernel = safe_float(outputs.get(f"d${OUTPUT_INDICES[1]}", 0.0))
-    raw_mix = safe_float(outputs.get(f"d${OUTPUT_INDICES[2]}", 0.0))
+    raw_active = safe_float(outputs.get(f"d${DEFENDER_OUTPUT_ACTIVE_IDX}", 0.0))
+    raw_kernel = safe_float(outputs.get(f"d${DEFENDER_OUTPUT_KERNEL_IDX}", 0.0))
+    raw_mix = safe_float(outputs.get(f"d${DEFENDER_OUTPUT_STATE_MIX_IDX}", 0.0))
+    raw_exp_mix = safe_float(outputs.get(f"d${DEFENDER_OUTPUT_EXP_MIX_IDX}", 0.0))
+    raw_hash_rounds = safe_float(outputs.get(f"d${DEFENDER_OUTPUT_HASH_ROUNDS_IDX}", 0.0))
+    raw_spread = safe_float(outputs.get(f"d${DEFENDER_OUTPUT_BOUQUET_SPREAD_IDX}", 0.0))
+    raw_churn = safe_float(outputs.get(f"d${DEFENDER_OUTPUT_STATE_CHURN_IDX}", 0.0))
+    raw_salt = safe_float(outputs.get(f"d${DEFENDER_OUTPUT_LANE_SALT_IDX}", 0.0))
+    raw_scramble = safe_float(outputs.get(f"d${DEFENDER_OUTPUT_TOKEN_SCRAMBLE_IDX}", 0.0))
+    raw_phase = safe_float(outputs.get(f"d${DEFENDER_OUTPUT_PHASE_JITTER_IDX}", 0.0))
 
-    selector = abs(int(raw_kernel * 1_000_000.0))
+    selector = abs(int(raw_kernel * 1_000_003.0))
+    lane_salt = abs(int(raw_salt * 1_000_033.0))
+    hash_rounds = 1 + (abs(int(raw_hash_rounds * 1_000_007.0)) % 4)
     return PolicyDecision(
         active_ratio=sigmoid(raw_active),
-        kernel=selector % 3,
-        stride_seed=selector,
+        kernel=selector % 5,
+        stride_seed=selector ^ lane_salt,
         state_mix=sigmoid(raw_mix),
+        exponent_mix=sigmoid(raw_exp_mix),
+        hash_rounds=hash_rounds,
+        bouquet_spread=sigmoid(raw_spread),
+        state_churn=sigmoid(raw_churn),
+        lane_salt=lane_salt,
+        token_scramble=sigmoid(raw_scramble),
+        phase_jitter=sigmoid(raw_phase),
     )
 
 
@@ -385,13 +533,22 @@ def _eval_selected_bouquet(
     params: object,
     h_bytes: Callable[..., bytes],
     indices: Sequence[int],
+    *,
+    exponent_bias: int = 0,
+    lane_salt: int = 0,
+    phase_jitter: int = 0,
 ) -> int:
     acc = 1 % params.M
     for idx in indices:
         base = bouquet[idx] % params.M
         if base == 0:
             continue
-        exponent = int.from_bytes(h_bytes(xres, u, idx, "EXP", out_len=32), "big") % (params.M - 1)
+        exponent_seed = int.from_bytes(
+            h_bytes(xres, u, idx, lane_salt, phase_jitter, "EXP", out_len=32),
+            "big",
+        )
+        exponent = (exponent_seed + exponent_bias + (phase_jitter * (idx + 1))) % (params.M - 1)
+        exponent = max(1, exponent)
         acc = (acc * pow(base, exponent, params.M)) % params.M
     return acc
 
@@ -406,6 +563,8 @@ def _build_inputs(
 ) -> Dict[str, float]:
     lane_den = float(max(1, x - 1))
     token_hint = float(last_token_hint & ((1 << 24) - 1)) / float(1 << 24)
+    phi_low = float(int.from_bytes(phase.phi[:4], "big") & ((1 << 24) - 1)) / float(1 << 24)
+    phase_mix = float((phase.u1 ^ phase.u2 ^ phase.u3) & ((1 << 24) - 1)) / float(1 << 24)
     return {
         "d$0": float(phase.a) / float(params.P),
         "d$1": float(phase.b) / float(params.Q),
@@ -419,6 +578,12 @@ def _build_inputs(
         "d$9": token_hint,
         "d$10": float((t // max(1, x)) % 29) / 29.0,
         "d$11": 1.0,
+        "d$12": phi_low,
+        "d$13": phase_mix,
+        "d$14": float((phase.a + phase.c + lane_idx) % 97) / 97.0,
+        "d$15": float((last_token_hint ^ int.from_bytes(phase.phi[-4:], "big")) & ((1 << 24) - 1)) / float(1 << 24),
+        "d$16": float((lane_idx * (1 + (phase.b % 7))) % max(2, x + 1)) / float(max(2, x + 1)),
+        "d$17": float((t + 1) % 113) / 113.0,
     }
 
 
@@ -434,6 +599,7 @@ def _build_attacker_inputs(
     x_norm = float(x) / 16.0
     lane_den = float(max(1, x - 1))
     token_hint = float(prev_token & ((1 << 24) - 1)) / float(1 << 24)
+    phi_low = float(int.from_bytes(phase.phi[:4], "big") & ((1 << 24) - 1)) / float(1 << 24)
     return {
         "d$0": float(phase.a) / float(params.P),
         "d$1": float(phase.b) / float(params.Q),
@@ -447,6 +613,10 @@ def _build_attacker_inputs(
         "d$9": x_norm,
         "d$10": absolute_phase,
         "d$11": 1.0,
+        "d$12": phi_low,
+        "d$13": float((phase.u1 ^ phase.u2) & ((1 << 24) - 1)) / float(1 << 24),
+        "d$14": float((phase.u3 + prev_idx + t) % 127) / 127.0,
+        "d$15": float((prev_token ^ int.from_bytes(phase.phi[-4:], "big")) & ((1 << 24) - 1)) / float(1 << 24),
     }
 
 
@@ -462,31 +632,148 @@ def _lane_token(
     trunc_bits: Callable[..., int],
 ) -> LaneTokenResult:
     total = len(secrets.bouquetA)
-    active_count = 1 + int(decision.active_ratio * max(0, total - 1))
+    spread = 0.55 + (0.45 * decision.bouquet_spread)
+    active_ratio = clamp(decision.active_ratio * spread, 0.0, 1.0)
+    active_count = 1 + int(active_ratio * max(0, total - 1))
     active_count = max(1, min(total, active_count))
 
-    idx_a = _choose_indices(total, active_count, decision.stride_seed)
-    idx_b = _choose_indices(total, active_count, decision.stride_seed + 7)
-    idx_c = _choose_indices(total, active_count, decision.stride_seed + 13)
+    phase_jitter = int(
+        decision.phase_jitter
+        * float((phase.u1 ^ phase.u2 ^ phase.u3) % 65_537)
+    )
+    seed_base = int(decision.stride_seed) + int(decision.lane_salt) + (lane_idx * 17)
+    idx_a = _choose_indices(total, active_count, seed_base + phase_jitter)
+    idx_b = _choose_indices(total, active_count, seed_base + 7 + (phase_jitter // 3))
+    idx_c = _choose_indices(total, active_count, seed_base + 13 + (phase_jitter // 5))
 
-    ea = _eval_selected_bouquet(secrets.bouquetA, phase.a, phase.u1, params, h_bytes, idx_a)
-    eb = _eval_selected_bouquet(secrets.bouquetB, phase.b, phase.u2, params, h_bytes, idx_b)
-    ec = _eval_selected_bouquet(secrets.bouquetC, phase.c, phase.u3, params, h_bytes, idx_c)
+    exponent_bias = int(decision.exponent_mix * 4096.0)
+
+    ea = _eval_selected_bouquet(
+        secrets.bouquetA,
+        phase.a,
+        phase.u1,
+        params,
+        h_bytes,
+        idx_a,
+        exponent_bias=exponent_bias,
+        lane_salt=decision.lane_salt,
+        phase_jitter=phase_jitter,
+    )
+    eb = _eval_selected_bouquet(
+        secrets.bouquetB,
+        phase.b,
+        phase.u2,
+        params,
+        h_bytes,
+        idx_b,
+        exponent_bias=exponent_bias // 2,
+        lane_salt=decision.lane_salt + 3,
+        phase_jitter=phase_jitter // 2,
+    )
+    ec = _eval_selected_bouquet(
+        secrets.bouquetC,
+        phase.c,
+        phase.u3,
+        params,
+        h_bytes,
+        idx_c,
+        exponent_bias=exponent_bias // 3,
+        lane_salt=decision.lane_salt + 7,
+        phase_jitter=phase_jitter // 3,
+    )
 
     state_term = 1 + int(decision.state_mix * (params.M - 2))
     if decision.kernel == 0:
         mix = (ea + eb + ec + state_term) % params.M
     elif decision.kernel == 1:
         mix = (ea * ((eb + state_term) % params.M) + ec) % params.M
-    else:
+    elif decision.kernel == 2:
         mix = (pow((ea + state_term) % params.M, 2, params.M) + (eb * ec)) % params.M
+    elif decision.kernel == 3:
+        mix = int.from_bytes(
+            h_bytes(
+                lane_idx,
+                t,
+                ea,
+                eb,
+                ec,
+                state_term,
+                decision.lane_salt,
+                phase.phi,
+                "KERNEL3",
+                out_len=32,
+            ),
+            "big",
+        ) % params.M
+    else:
+        mix = ((ea ^ eb) + (ec * (1 + (decision.lane_salt % 1021))) + state_term) % params.M
 
-    kdf = h_bytes(lane_idx, ea, eb, ec, mix, phase.phi, "KDF", out_len=32)
-    tok_hash = h_bytes(kdf, t, phase.phi, "TOK", out_len=max(32, params.token_bytes))
+    hash_rounds = max(1, int(decision.hash_rounds))
+    dynamic_mix = mix
+    for round_idx in range(hash_rounds):
+        dynamic_mix = int.from_bytes(
+            h_bytes(
+                dynamic_mix,
+                lane_idx,
+                t,
+                phase.phi,
+                decision.lane_salt,
+                round_idx,
+                "PCPL-MIX",
+                out_len=32,
+            ),
+            "big",
+        ) % params.M
+    mix = (mix + dynamic_mix + state_term) % params.M
+
+    kdf = h_bytes(
+        lane_idx,
+        ea,
+        eb,
+        ec,
+        mix,
+        phase.phi,
+        decision.lane_salt,
+        "KDF",
+        out_len=32,
+    )
+    for round_idx in range(max(0, hash_rounds - 1)):
+        kdf = h_bytes(kdf, mix, round_idx, phase.phi, "KDFR", out_len=32)
+    tok_hash = h_bytes(
+        kdf,
+        t,
+        phase.phi,
+        decision.lane_salt,
+        int(decision.token_scramble * 1_000_000.0),
+        "TOK",
+        out_len=max(32, params.token_bytes),
+    )
+    for round_idx in range(max(0, hash_rounds - 1)):
+        tok_hash = h_bytes(tok_hash, dynamic_mix, round_idx, "TOKR", out_len=max(32, params.token_bytes))
     token = trunc_bits(tok_hash, params.token_bits)
+    if decision.token_scramble > 0.02:
+        scramble = trunc_bits(
+            h_bytes(
+                dynamic_mix,
+                phase.phi,
+                lane_idx,
+                t,
+                decision.lane_salt,
+                "SCRAMBLE",
+                out_len=max(32, params.token_bytes),
+            ),
+            params.token_bits,
+        )
+        token = (token ^ scramble) & ((1 << params.token_bits) - 1)
 
     pow_ops = len(idx_a) + len(idx_b) + len(idx_c)
-    return LaneTokenResult(token=token, active_count=active_count, pow_ops=pow_ops)
+    hash_ops = (2 * hash_rounds) + 4
+    return LaneTokenResult(
+        token=token,
+        active_count=active_count,
+        pow_ops=pow_ops,
+        hash_ops=hash_ops,
+    )
 
 
 def _update_device_state(
@@ -497,15 +784,22 @@ def _update_device_state(
     phase: object,
     h_bytes: Callable[..., bytes],
     int_to_bytes_fixed: Callable[..., bytes],
+    *,
+    state_churn: float = 0.5,
+    lane_salt: int = 0,
 ) -> None:
     state.W[idx] = token
+    churn_int = 1 + int(clamp(state_churn, 0.0, 1.0) * 7.0)
     chain_products = [
-        (state.W[i] * state.W[i + 1]) % params.M for i in range(params.x - 1)
+        ((state.W[i] * state.W[i + 1]) + (churn_int * (i + 1))) % params.M
+        for i in range(params.x - 1)
     ]
     state.S = h_bytes(
         state.S,
         *[int_to_bytes_fixed(w, params.token_bytes) for w in state.W],
         *[int_to_bytes_fixed(m, params.mod_bytes) for m in chain_products],
+        churn_int,
+        lane_salt,
         phase.phi,
         "EVOLVE",
         out_len=params.seed_bytes,
@@ -630,6 +924,7 @@ def evaluate_scenario(
 
         lane_tokens: List[int] = []
         lane_actives: List[int] = []
+        lane_hash_ops: List[int] = []
         lane_decisions: List[PolicyDecision] = []
 
         for lane in range(params.x):
@@ -649,7 +944,19 @@ def evaluate_scenario(
                     decision = _policy_from_outputs(outputs)
                 except Exception:
                     controller_fails += 1
-                    decision = PolicyDecision(active_ratio=1.0, kernel=0, stride_seed=0, state_mix=0.5)
+                    decision = PolicyDecision(
+                        active_ratio=1.0,
+                        kernel=0,
+                        stride_seed=0,
+                        state_mix=0.5,
+                        exponent_mix=0.5,
+                        hash_rounds=1,
+                        bouquet_spread=0.5,
+                        state_churn=0.5,
+                        lane_salt=0,
+                        token_scramble=0.0,
+                        phase_jitter=0.0,
+                    )
 
             token_info = _lane_token(
                 lane_idx=lane,
@@ -663,6 +970,7 @@ def evaluate_scenario(
             )
             lane_tokens.append(token_info.token)
             lane_actives.append(token_info.active_count)
+            lane_hash_ops.append(token_info.hash_ops)
             lane_decisions.append(decision)
 
         emitted = lane_tokens[idx]
@@ -714,9 +1022,11 @@ def evaluate_scenario(
         # Timing / sync drift model with absolute time reference.
         lane_pow_selected = 3 * lane_actives[idx]
         provider_pow_max = 3 * max(lane_actives) if lane_actives else 0
+        lane_hash_selected = lane_hash_ops[idx] if lane_hash_ops else 0
+        provider_hash_max = max(lane_hash_ops) if lane_hash_ops else 0
 
-        device_cycle_ms = controller_ms + (lane_pow_selected * pow_cost_ms) + (3.0 * hash_cost_ms)
-        provider_cycle_ms = controller_ms + (provider_pow_max * pow_cost_ms) + (3.0 * hash_cost_ms)
+        device_cycle_ms = controller_ms + (lane_pow_selected * pow_cost_ms) + (lane_hash_selected * hash_cost_ms)
+        provider_cycle_ms = controller_ms + (provider_pow_max * pow_cost_ms) + (provider_hash_max * hash_cost_ms)
         device_cycle_ms *= device_freq_scale
         provider_cycle_ms *= provider_freq_scale
         device_cycle_ms += 0.004
@@ -749,7 +1059,17 @@ def evaluate_scenario(
             next_resync_checkpoint += float(scenario.absolute_time_ms)
 
         # Keep deterministic evolving state for synchronization checks.
-        _update_device_state(state, idx, emitted, params, phase, h_bytes, int_to_bytes_fixed)
+        _update_device_state(
+            state,
+            idx,
+            emitted,
+            params,
+            phase,
+            h_bytes,
+            int_to_bytes_fixed,
+            state_churn=lane_decisions[idx].state_churn,
+            lane_salt=lane_decisions[idx].lane_salt,
+        )
 
         idx_twin = perm[slot]
         token_twin = lane_tokens[idx_twin]
@@ -761,6 +1081,8 @@ def evaluate_scenario(
             phase,
             h_bytes,
             int_to_bytes_fixed,
+            state_churn=lane_decisions[idx_twin].state_churn,
+            lane_salt=lane_decisions[idx_twin].lane_salt,
         )
 
         # Optional evolved attacker benchmark.

@@ -285,15 +285,17 @@ def _resolve_continuous_lane_plan(
             "workers_per_lane": max(1, total_workers),
         }
 
-    # More aggressive lane fan-out to keep all cores busy, especially on >=24-core desktops.
+    # Keep parallel lanes wide enough to saturate CPUs inside each experiment lane.
     if backend == "process":
-        min_workers_per_lane = 2
+        min_workers_per_lane = 4 if total_workers >= 8 else 2
+        max_lanes = 8
     else:
-        min_workers_per_lane = 2
+        min_workers_per_lane = 3 if total_workers >= 6 else 2
+        max_lanes = 12
     lanes = max(1, total_workers // max(1, min_workers_per_lane))
-    lanes = min(lanes, grid_size, 16)
+    lanes = min(lanes, grid_size, max_lanes)
     lanes = max(1, lanes)
-    while lanes > 1 and (total_workers // lanes) < 2:
+    while lanes > 1 and (total_workers // lanes) < min_workers_per_lane:
         lanes -= 1
     workers_per_lane = max(1, total_workers // lanes)
     return {

@@ -781,15 +781,83 @@ def _mix_seed(seed: int, label: str) -> int:
     return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "big")
 
 
-def _variant_seed(base_seed: int, variant_index: int) -> Tuple[int, str]:
+def _variant_seed(
+    base_seed: int,
+    variant_index: int,
+    *,
+    complexity: str = "mid",
+) -> Tuple[int, str]:
+    level = str(complexity).strip().lower()
     if variant_index <= 0:
+        if level == "quick":
+            return int((base_seed % 8192) + 17), "quick-base"
+        if level == "hard":
+            return _mix_seed(base_seed, "hard-base"), "hard-base"
         return int(base_seed), "base"
     if variant_index == 1:
-        # Deliberately low-entropy shared seed to test weak/shared provisioning.
+        if level == "quick":
+            return int((base_seed % 2048) + 33), "quick-shared-low-entropy"
+        if level == "hard":
+            return _mix_seed(base_seed, "hard-rotating-derived"), "hard-rotating-derived"
         return int((base_seed % 4096) + 17), "shared-low-entropy"
     if variant_index == 2:
+        if level == "quick":
+            return int((base_seed % 16384) + 97), "quick-mid-entropy"
+        if level == "hard":
+            return _mix_seed(base_seed, "hard-lineage-derived"), "hard-lineage-derived"
         return _mix_seed(base_seed, "rotating-derived"), "rotating-derived"
+    if level == "hard":
+        return _mix_seed(base_seed, f"hard-lineage-xor:{variant_index}"), f"hard-lineage-{variant_index}"
+    if level == "quick":
+        return int((base_seed % 65536) + (17 * variant_index)), f"quick-lineage-{variant_index}"
     return _mix_seed(base_seed, f"lineage-xor:{variant_index}"), f"lineage-{variant_index}"
+
+
+def _stage_complexity_profile(
+    scenario: ScenarioConfig,
+    *,
+    complexity: str,
+    variant_index: int,
+) -> Dict[str, Any]:
+    level = str(complexity).strip().lower()
+    if level == "quick":
+        return {
+            "prime_mode": "fixed",
+            "prime_bits": max(12, int(scenario.prime_bits) - 2),
+            "modulus_bits": max(47, int(scenario.modulus_bits) - 4),
+            "compound_mode": "semiprime" if (variant_index % 2 == 0) else "prime-power",
+            "compound_count": max(2, int(math.ceil(float(scenario.compound_count) * 0.55))),
+            "compound_primes": max(2, min(3, int(scenario.compound_primes))),
+            "compound_offset": 0,
+            "compound_prime_bits": 0,
+            "compound_pool_size": max(12, int(math.ceil(float(scenario.compound_pool_size) * 0.65))),
+            "attack_token_bits": max(10, int(scenario.attack_token_bits) - 4),
+        }
+    if level == "hard":
+        return {
+            "prime_mode": "generated",
+            "prime_bits": max(int(scenario.prime_bits), 20) + min(2, variant_index // 2),
+            "modulus_bits": max(int(scenario.modulus_bits), 53) + min(2, variant_index // 3),
+            "compound_mode": "blend",
+            "compound_count": max(int(scenario.compound_count) + 2, int(math.ceil(float(scenario.compound_count) * 1.25))),
+            "compound_primes": max(3, int(scenario.compound_primes) + 1),
+            "compound_offset": max(int(scenario.compound_offset), 5 + variant_index),
+            "compound_prime_bits": max(int(scenario.compound_prime_bits), 11),
+            "compound_pool_size": max(int(scenario.compound_pool_size), 24 + (2 * variant_index)),
+            "attack_token_bits": min(24, int(scenario.attack_token_bits) + 4),
+        }
+    return {
+        "prime_mode": str(scenario.prime_mode),
+        "prime_bits": int(scenario.prime_bits),
+        "modulus_bits": int(scenario.modulus_bits),
+        "compound_mode": "blend" if (variant_index > 0 and str(scenario.compound_mode) != "blend") else str(scenario.compound_mode),
+        "compound_count": max(3, int(math.ceil(float(scenario.compound_count) * 0.85))),
+        "compound_primes": max(2, int(scenario.compound_primes)),
+        "compound_offset": max(0, int(scenario.compound_offset)),
+        "compound_prime_bits": max(0, int(scenario.compound_prime_bits)),
+        "compound_pool_size": max(14, int(math.ceil(float(scenario.compound_pool_size) * 0.85))),
+        "attack_token_bits": int(scenario.attack_token_bits),
+    }
 
 
 def _build_stage_scenarios(
@@ -797,6 +865,7 @@ def _build_stage_scenarios(
     *,
     cycle_fraction: float,
     key_variant_count: int,
+    complexity: str,
     device_mhz: float,
     provider_mhz: float,
     max_test_time_seconds: float,
@@ -807,13 +876,35 @@ def _build_stage_scenarios(
     for scenario in scenarios:
         stage_cycles = max(6, int(round(float(scenario.cycles) * fraction)))
         for idx in range(variants):
-            var_seed, label = _variant_seed(scenario.seed, idx)
+            var_seed, label = _variant_seed(
+                scenario.seed,
+                idx,
+                complexity=complexity,
+            )
+            complexity_cfg = _stage_complexity_profile(
+                scenario,
+                complexity=complexity,
+                variant_index=idx,
+            )
             stage_scenarios.append(
                 replace(
                     scenario,
-                    name=f"{scenario.name}:{label}:f{int(round(fraction * 100.0))}",
+                    name=(
+                        f"{scenario.name}:{complexity}:{label}:"
+                        f"f{int(round(fraction * 100.0))}"
+                    ),
                     seed=var_seed,
                     cycles=stage_cycles,
+                    prime_mode=str(complexity_cfg["prime_mode"]),
+                    prime_bits=int(complexity_cfg["prime_bits"]),
+                    modulus_bits=int(complexity_cfg["modulus_bits"]),
+                    compound_mode=str(complexity_cfg["compound_mode"]),
+                    compound_count=int(complexity_cfg["compound_count"]),
+                    compound_primes=int(complexity_cfg["compound_primes"]),
+                    compound_offset=int(complexity_cfg["compound_offset"]),
+                    compound_prime_bits=int(complexity_cfg["compound_prime_bits"]),
+                    compound_pool_size=int(complexity_cfg["compound_pool_size"]),
+                    attack_token_bits=int(complexity_cfg["attack_token_bits"]),
                     device_mhz=float(device_mhz),
                     provider_mhz=float(provider_mhz),
                     max_test_time_seconds=float(max_test_time_seconds),
@@ -897,7 +988,7 @@ def _quick_eval_limit(
         frac -= 0.05
     frac = clamp(frac, 0.42, 0.88)
     target = int(math.ceil(float(total) * frac))
-    min_budget = max(4, int(math.ceil(eff_workers * 1.25)))
+    min_budget = max(4, int(math.ceil(eff_workers * 1.80)))
     return max(min_budget, min(total, target))
 
 
@@ -1201,6 +1292,53 @@ def _should_stop_by_runtime_stats(
     top_unique_ratio = float(
         len({_evaluation_signature(genome) for genome in top_slice})
     ) / float(max(1, len(top_slice)))
+
+    identical_floor = max(8, int(math.ceil(float(total_generations) * 0.20)))
+    if len(generation_log) >= identical_floor:
+        ident_window = min(
+            len(generation_log),
+            max(5, int(math.ceil(float(total_generations) * 0.12))),
+        )
+        recent_ident = list(generation_log[-ident_window:])
+        fingerprints = {
+            (
+                round(float(row.get(score_key, 0.0)), 8),
+                round(float(row.get("principle", row.get("lane_success", 0.0))), 8),
+                round(float(row.get("security", row.get("token_success", 0.0))), 8),
+                round(float(row.get("cost", row.get("attacker_adv", 0.0))), 8),
+                round(float(row.get("attacker_adv", 0.0)), 8),
+                str(row.get("stage_eval", "")),
+                str(row.get("stage_keep", "")),
+                round(float(row.get("quick_fraction", 0.0)), 4),
+                round(float(row.get("mid_fraction", 0.0)), 4),
+                round(float(row.get("quick_keep", 0.0)), 4),
+                round(float(row.get("mid_keep", 0.0)), 4),
+                int(row.get("key_variants", 0)),
+                str(row.get("best_signature", "")),
+            )
+            for row in recent_ident
+        }
+        if len(fingerprints) == 1 and probe_win_rate <= 0.08:
+            return True, "identical-generations"
+
+    signature_floor = max(10, int(math.ceil(float(total_generations) * 0.25)))
+    if len(generation_log) >= signature_floor:
+        sig_window = min(
+            len(generation_log),
+            max(6, int(math.ceil(float(total_generations) * 0.18))),
+        )
+        recent_sig = list(generation_log[-sig_window:])
+        score_levels = {
+            round(float(row.get(score_key, 0.0)), 8)
+            for row in recent_sig
+        }
+        signatures = {
+            str(row.get("best_signature", ""))
+            for row in recent_sig
+            if str(row.get("best_signature", ""))
+        }
+        if len(score_levels) == 1 and len(signatures) == 1 and probe_win_rate <= 0.08:
+            return True, "same-signature-stall"
 
     if (
         score_gain <= float(min_gain)
@@ -1886,9 +2024,54 @@ def _build_round_report(
 
 def _baseline_rows(scenarios: Sequence[ScenarioConfig]) -> List[Dict[str, Any]]:
     baselines = [
-        ("reference-full", PolicyDecision(active_ratio=1.0, kernel=0, stride_seed=0, state_mix=0.5)),
-        ("balanced", PolicyDecision(active_ratio=0.65, kernel=1, stride_seed=19, state_mix=0.5)),
-        ("minimal-cost", PolicyDecision(active_ratio=0.25, kernel=2, stride_seed=31, state_mix=0.5)),
+        (
+            "reference-full",
+            PolicyDecision(
+                active_ratio=1.0,
+                kernel=0,
+                stride_seed=0,
+                state_mix=0.5,
+                exponent_mix=0.5,
+                hash_rounds=2,
+                bouquet_spread=0.5,
+                state_churn=0.5,
+                lane_salt=0,
+                token_scramble=0.25,
+                phase_jitter=0.25,
+            ),
+        ),
+        (
+            "balanced",
+            PolicyDecision(
+                active_ratio=0.65,
+                kernel=1,
+                stride_seed=19,
+                state_mix=0.5,
+                exponent_mix=0.5,
+                hash_rounds=2,
+                bouquet_spread=0.6,
+                state_churn=0.45,
+                lane_salt=23,
+                token_scramble=0.20,
+                phase_jitter=0.20,
+            ),
+        ),
+        (
+            "minimal-cost",
+            PolicyDecision(
+                active_ratio=0.25,
+                kernel=2,
+                stride_seed=31,
+                state_mix=0.45,
+                exponent_mix=0.35,
+                hash_rounds=1,
+                bouquet_spread=0.3,
+                state_churn=0.25,
+                lane_salt=7,
+                token_scramble=0.10,
+                phase_jitter=0.10,
+            ),
+        ),
     ]
     rows: List[Dict[str, Any]] = []
     for name, policy in baselines:
@@ -2130,16 +2313,20 @@ def _run_defender_round(
         if stage == "quick":
             frac = controller.quick_cycle_fraction
             key_variants = min(2, max(1, controller.key_variant_count))
+            complexity = "quick"
         elif stage == "mid":
             frac = controller.mid_cycle_fraction
             key_variants = min(3, max(1, controller.key_variant_count))
+            complexity = "mid"
         else:
             frac = min(1.0, max(0.50, controller.mid_cycle_fraction + 0.08))
             key_variants = max(1, controller.key_variant_count)
+            complexity = "hard"
         stage_scenarios = _build_stage_scenarios(
             scenarios,
             cycle_fraction=frac,
             key_variant_count=key_variants,
+            complexity=complexity,
             device_mhz=config.device_mhz,
             provider_mhz=config.provider_mhz,
             max_test_time_seconds=config.max_test_time_seconds,
@@ -2163,6 +2350,7 @@ def _run_defender_round(
         row = {
             "generation": int(gen),
             "best_score": float(best_fitness),
+            "best_signature": _evaluation_signature(best),
             "principle": _mean_metric(metrics, "principle_score"),
             "security": _mean_metric(metrics, "security_score"),
             "cost": _mean_metric(metrics, "cost_score"),
@@ -2639,16 +2827,20 @@ def _run_attacker_round(
         if stage == "quick":
             frac = controller.quick_cycle_fraction
             key_variants = min(2, max(1, controller.key_variant_count))
+            complexity = "quick"
         elif stage == "mid":
             frac = controller.mid_cycle_fraction
             key_variants = min(3, max(1, controller.key_variant_count))
+            complexity = "mid"
         else:
             frac = min(1.0, max(0.50, controller.mid_cycle_fraction + 0.08))
             key_variants = max(1, controller.key_variant_count)
+            complexity = "hard"
         stage_scenarios = _build_stage_scenarios(
             scenarios,
             cycle_fraction=frac,
             key_variant_count=key_variants,
+            complexity=complexity,
             device_mhz=config.device_mhz,
             provider_mhz=config.provider_mhz,
             max_test_time_seconds=config.max_test_time_seconds,
@@ -2678,6 +2870,7 @@ def _run_attacker_round(
         row = {
             "generation": int(gen),
             "attack_score": float(best_fitness),
+            "best_signature": _evaluation_signature(best),
             "lane_success": _mean_metric(metrics, "attacker_lane_success_rate"),
             "token_success": _mean_metric(metrics, "attacker_token_success_rate"),
             "attacker_adv": _mean_metric(metrics, "attacker_advantage_score"),
@@ -3221,6 +3414,7 @@ def run_continuous_experiment(
                 scenario_list,
                 cycle_fraction=1.0,
                 key_variant_count=selection_key_variants,
+                complexity="hard",
                 device_mhz=config.device_mhz,
                 provider_mhz=config.provider_mhz,
                 max_test_time_seconds=config.max_test_time_seconds,
