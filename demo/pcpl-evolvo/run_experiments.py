@@ -27,6 +27,12 @@ PROJECT_DIR = Path(__file__).resolve().parent
 SRC_DIR = PROJECT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+try:
+    # Ensure child-process progress logs flush line-by-line in continuous runs.
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+except Exception:
+    pass
 
 from pcpl_evolvo.experiment import ExperimentConfig, run_experiment
 
@@ -387,9 +393,10 @@ def _print_effective_config(resolved: Dict[str, Any]) -> None:
         )
     )
     print(
-        "[pcpl-evolvo] evolve pop={pop} gen={gen} init={init} atk_pop={apop} atk_gen={agen} elite={elite}".format(
+        "[pcpl-evolvo] evolve pop={pop} gen={gen} rounds={rounds} init={init} atk_pop={apop} atk_gen={agen} elite={elite}".format(
             pop=resolved["population_size"],
             gen=resolved["generations"],
+            rounds=resolved["rounds"],
             init=resolved["initial_instructions"],
             apop=resolved["attacker_population_size"],
             agen=resolved["attacker_generations"],
@@ -695,6 +702,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    rounds_explicit = args.rounds is not None
     if args.list_modes:
         print("[pcpl-evolvo] available modes:")
         for name in available_modes():
@@ -703,6 +711,13 @@ def main() -> None:
 
     resolved = _resolve_runtime_config(args)
     _apply_runtime_config(args, resolved)
+    if args.continuous and str(args.mode).lower() == "paper" and not rounds_explicit:
+        # In continuous paper sweeps, prioritize cadence across many combos/strategies.
+        args.rounds = 1
+        resolved["rounds"] = 1
+        print(
+            "[pcpl-evolvo] paper continuous default: using rounds=1 per iteration for faster signal cadence (set --rounds to override)."
+        )
     _print_effective_config(resolved)
     if args.print_effective_config:
         return
