@@ -39,6 +39,8 @@ BASE_DEFAULTS: Dict[str, Any] = {
     "key_variants": 4,
     "novelty_bonus": 0.10,
     "predictive_penalty": 0.08,
+    "target_generation_seconds": 2.4,
+    "max_eval_cache_entries": 25000,
     "device_mhz": 100.0,
     "provider_mhz": 300.0,
     "max_test_seconds": 10.0,
@@ -72,6 +74,8 @@ MODE_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "key_variants": 5,
         "novelty_bonus": 0.14,
         "predictive_penalty": 0.09,
+        "target_generation_seconds": 1.6,
+        "max_eval_cache_entries": 45000,
     },
     # Default mode for publishing empirical conclusions.
     "conclusion": {
@@ -94,6 +98,8 @@ MODE_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "key_variants": 4,
         "novelty_bonus": 0.12,
         "predictive_penalty": 0.07,
+        "target_generation_seconds": 1.9,
+        "max_eval_cache_entries": 36000,
     },
     # More aggressive adaptation and novelty pressure; designed to avoid score plateaus.
     "dynamic": {
@@ -109,6 +115,8 @@ MODE_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "key_variants": 3,
         "novelty_bonus": 0.09,
         "predictive_penalty": 0.08,
+        "target_generation_seconds": 1.8,
+        "max_eval_cache_entries": 30000,
         "initial_instructions": 14,
         "attacker_generations": 8,
     },
@@ -126,6 +134,8 @@ MODE_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "key_variants": 4,
         "novelty_bonus": 0.12,
         "predictive_penalty": 0.10,
+        "target_generation_seconds": 1.6,
+        "max_eval_cache_entries": 32000,
         "initial_instructions": 16,
         "attacker_generations": 10,
         "attacker_population_size": 14,
@@ -143,6 +153,8 @@ PROFILE_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "elite_pool": 32,
         "archive_limit": 192,
         "key_variants": 3,
+        "target_generation_seconds": 1.4,
+        "max_eval_cache_entries": 22000,
     },
     "full": {},
 }

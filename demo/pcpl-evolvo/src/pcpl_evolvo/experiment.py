@@ -69,8 +69,8 @@ class ExperimentConfig:
     device_mhz: float = 100.0
     provider_mhz: float = 300.0
     max_test_time_seconds: float = 10.0
-    target_generation_seconds: float = 3.0
-    max_eval_cache_entries: int = 20000
+    target_generation_seconds: float = 2.4
+    max_eval_cache_entries: int = 25000
 
 
 @dataclass(frozen=True)
@@ -495,7 +495,10 @@ class SafeGFSLEvolver(GFSLEvolver):
         evaluator,
         progress_callback=None,
         batch_evaluator=None,
+        should_stop=None,
     ):
+        self._early_stop_generation = None  # type: ignore[attr-defined]
+        self._early_stop_reason = None  # type: ignore[attr-defined]
         for gen in range(generations):
             self.generation = gen
 
@@ -551,6 +554,38 @@ class SafeGFSLEvolver(GFSLEvolver):
             if progress_callback and self.population:
                 best = self.population[0]
                 progress_callback(gen, best, best.fitness or -float("inf"))
+            if should_stop is not None and self.population:
+                stop = False
+                stop_reason = "adaptive-stagnation"
+                try:
+                    decision = should_stop(
+                        gen,
+                        self.population[0],
+                        float(self.population[0].fitness or -float("inf")),
+                        self.population,
+                    )
+                    if isinstance(decision, tuple):
+                        stop = bool(decision[0]) if len(decision) > 0 else False
+                        if len(decision) > 1 and str(decision[1]).strip():
+                            stop_reason = str(decision[1]).strip()
+                    elif isinstance(decision, str):
+                        stop = bool(decision)
+                        if decision.strip():
+                            stop_reason = decision.strip()
+                    else:
+                        stop = bool(decision)
+                except Exception:
+                    stop = False
+                if stop:
+                    self._early_stop_generation = int(gen)  # type: ignore[attr-defined]
+                    self._early_stop_reason = str(stop_reason)  # type: ignore[attr-defined]
+                    print(
+                        "[pcpl-evolvo][evolver] early-stop gen={gen:03d} reason={reason}".format(
+                            gen=gen,
+                            reason=stop_reason,
+                        )
+                    )
+                    break
 
             elite_size = max(1, int(self.population_size * self.elite_ratio))
             new_population = self.population[:elite_size]
@@ -893,6 +928,54 @@ def _select_quick_pending(
     return selected, skipped
 
 
+def _throttle_quick_pending_from_previous_stats(
+    *,
+    quick_pending: Sequence[Tuple[int, GFSLGenome]],
+    quick_skipped: Sequence[Tuple[int, GFSLGenome]],
+    previous_stats: Optional[Dict[str, float]],
+    workers: int,
+) -> Tuple[List[Tuple[int, GFSLGenome]], List[Tuple[int, GFSLGenome]], float]:
+    selected = list(quick_pending)
+    skipped = list(quick_skipped)
+    if not selected:
+        return selected, skipped, 1.0
+    if not isinstance(previous_stats, dict) or not previous_stats:
+        return selected, skipped, 1.0
+
+    prev_total_eval = (
+        float(previous_stats.get("quick_eval", 0.0))
+        + float(previous_stats.get("mid_eval", 0.0))
+        + float(previous_stats.get("full_eval", 0.0))
+        + float(previous_stats.get("probe_samples", 0.0))
+    )
+    prev_unique = float(previous_stats.get("eval_unique", 0.0))
+    prev_cache_dup = float(previous_stats.get("cache_hits", 0.0)) + float(
+        previous_stats.get("dup_reuse", 0.0)
+    )
+    prev_probe = float(previous_stats.get("probe_win_rate", 0.0))
+
+    reuse_ratio = prev_cache_dup / max(1.0, prev_unique)
+    uniqueness_ratio = prev_unique / max(1.0, prev_total_eval)
+    if prev_probe > 0.08 or reuse_ratio < 0.75:
+        return selected, skipped, 1.0
+
+    throttle = 0.74
+    if reuse_ratio >= 1.00 and uniqueness_ratio <= 0.55:
+        throttle = 0.62
+    if reuse_ratio >= 1.30 and uniqueness_ratio <= 0.45:
+        throttle = 0.50
+
+    min_keep = max(4, min(len(selected), int(math.ceil(max(1, int(workers)) * 1.20))))
+    target = max(min_keep, int(math.ceil(float(len(selected)) * throttle)))
+    if target >= len(selected):
+        return selected, skipped, 1.0
+
+    skipped.extend(selected[target:])
+    throttled = selected[:target]
+    applied_ratio = float(len(throttled)) / float(max(1, len(selected)))
+    return throttled, skipped, applied_ratio
+
+
 def _scenario_fingerprint(scenarios: Sequence[ScenarioConfig]) -> str:
     chunks: List[str] = []
     for scenario in scenarios:
@@ -1021,6 +1104,181 @@ def _mark_duplicate_genomes(
             seen[signature] = genome
             continue
         genome.fitness = _predictive_cut_score(float(genome.fitness or -float("inf")), stage, penalty + 0.015)
+
+
+def _runtime_window_stats(
+    *,
+    generation_log: Sequence[Dict[str, Any]],
+    total_generations: int,
+    score_key: str,
+    target_generation_seconds: float,
+) -> Optional[Dict[str, float]]:
+    if not generation_log:
+        return None
+
+    total_gens = max(1, int(total_generations))
+    min_gens = min(total_gens, max(6, int(math.ceil(total_gens * 0.22))))
+    if len(generation_log) < min_gens:
+        return None
+
+    window = min(
+        len(generation_log),
+        max(4, int(math.ceil(total_gens * 0.14))),
+    )
+    recent = list(generation_log[-window:])
+    if len(recent) < window:
+        return None
+
+    scores = [float(row.get(score_key, -float("inf"))) for row in recent]
+    if not scores:
+        return None
+
+    stage_eval_total = sum(
+        float(row.get("quick_eval", 0.0))
+        + float(row.get("mid_eval", 0.0))
+        + float(row.get("full_eval", 0.0))
+        + float(row.get("probe_samples", 0.0))
+        for row in recent
+    )
+    eval_unique_total = sum(float(row.get("eval_unique", 0.0)) for row in recent)
+    cache_dup_total = sum(
+        float(row.get("cache_hits", 0.0)) + float(row.get("dup_reuse", 0.0))
+        for row in recent
+    )
+    probe_win_rate = sum(float(row.get("probe_win_rate", 0.0)) for row in recent) / float(
+        max(1, len(recent))
+    )
+    target_secs = max(0.25, float(target_generation_seconds))
+    batch_seconds = [float(row.get("batch_seconds", 0.0)) for row in recent]
+    slow_batches = sum(1 for seconds in batch_seconds if seconds > target_secs)
+
+    return {
+        "window": float(window),
+        "score_gain": float(max(scores) - min(scores)),
+        "probe_win_rate": float(probe_win_rate),
+        "target_seconds": float(target_secs),
+        "avg_batch_seconds": float(sum(batch_seconds) / max(1, len(batch_seconds))),
+        "slow_batches": float(slow_batches),
+        "stage_eval_total": float(stage_eval_total),
+        "eval_unique_total": float(eval_unique_total),
+        "cache_dup_total": float(cache_dup_total),
+        "reuse_ratio": float(cache_dup_total / max(1.0, eval_unique_total)),
+        "uniqueness_ratio": float(eval_unique_total / max(1.0, stage_eval_total)),
+    }
+
+
+def _should_stop_by_runtime_stats(
+    *,
+    generation_log: Sequence[Dict[str, Any]],
+    population: Sequence[GFSLGenome],
+    total_generations: int,
+    score_key: str,
+    min_gain: float,
+    target_generation_seconds: float,
+) -> Tuple[bool, str]:
+    stats = _runtime_window_stats(
+        generation_log=generation_log,
+        total_generations=total_generations,
+        score_key=score_key,
+        target_generation_seconds=target_generation_seconds,
+    )
+    if stats is None:
+        return False, ""
+
+    score_gain = float(stats["score_gain"])
+    probe_win_rate = float(stats["probe_win_rate"])
+    reuse_ratio = float(stats["reuse_ratio"])
+    uniqueness_ratio = float(stats["uniqueness_ratio"])
+    avg_batch_seconds = float(stats["avg_batch_seconds"])
+    target_secs = float(stats["target_seconds"])
+    slow_batches = float(stats["slow_batches"])
+    plateau_floor = max(10, int(math.ceil(float(total_generations) * 0.35)))
+
+    top_n = max(4, min(len(population), int(math.ceil(len(population) * 0.20))))
+    top_slice = list(population[:top_n])
+    if not top_slice:
+        return False, ""
+    top_unique_ratio = float(
+        len({_evaluation_signature(genome) for genome in top_slice})
+    ) / float(max(1, len(top_slice)))
+
+    if (
+        score_gain <= float(min_gain)
+        and probe_win_rate <= 0.05
+        and reuse_ratio >= 0.90
+        and uniqueness_ratio <= 0.55
+        and top_unique_ratio <= 0.68
+    ):
+        return True, "plateau-reuse"
+
+    if (
+        score_gain <= (0.45 * float(min_gain))
+        and probe_win_rate <= 0.03
+        and reuse_ratio >= 1.10
+        and len(generation_log) >= plateau_floor
+    ):
+        return True, "deep-plateau-reuse"
+
+    if (
+        score_gain <= (0.50 * float(min_gain))
+        and slow_batches >= max(2.0, float(stats["window"]) - 1.0)
+        and reuse_ratio >= 0.75
+        and avg_batch_seconds > (0.95 * target_secs)
+        and len(generation_log) >= plateau_floor
+    ):
+        return True, "runtime-budget-pressure"
+
+    return False, ""
+
+
+def _adaptive_attacker_config_from_defender_log(
+    *,
+    base_config: ExperimentConfig,
+    defender_log: Sequence[Dict[str, Any]],
+) -> Tuple[ExperimentConfig, Dict[str, Any]]:
+    stats = _runtime_window_stats(
+        generation_log=defender_log,
+        total_generations=int(base_config.generations),
+        score_key="best_score",
+        target_generation_seconds=float(base_config.target_generation_seconds),
+    )
+    if stats is None:
+        return base_config, {}
+
+    plateau = (
+        float(stats["score_gain"]) <= 0.00050
+        and float(stats["probe_win_rate"]) <= 0.05
+    )
+    repetition = (
+        float(stats["reuse_ratio"]) >= 0.85
+        and float(stats["uniqueness_ratio"]) <= 0.60
+    )
+    if not (plateau and repetition):
+        return base_config, {}
+
+    new_population = max(10, int(math.ceil(float(base_config.attacker_population_size) * 0.65)))
+    new_generations = max(6, int(math.ceil(float(base_config.attacker_generations) * 0.62)))
+    if (
+        new_population >= int(base_config.attacker_population_size)
+        and new_generations >= int(base_config.attacker_generations)
+    ):
+        return base_config, {}
+
+    adjusted = replace(
+        base_config,
+        attacker_population_size=min(int(base_config.attacker_population_size), int(new_population)),
+        attacker_generations=min(int(base_config.attacker_generations), int(new_generations)),
+    )
+    return adjusted, {
+        "active": True,
+        "reason": "defender-plateau-repetition",
+        "reuse_ratio": float(stats["reuse_ratio"]),
+        "uniqueness_ratio": float(stats["uniqueness_ratio"]),
+        "score_gain": float(stats["score_gain"]),
+        "probe_win_rate": float(stats["probe_win_rate"]),
+        "population": int(adjusted.attacker_population_size),
+        "generations": int(adjusted.attacker_generations),
+    }
 
 
 def _build_supervised_guide_if_available(
@@ -1564,11 +1822,11 @@ def _build_round_report(
     lines.append("")
     lines.append("## Defender Evolution")
     lines.append("")
-    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | t(s) |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe | q-thr | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | t(s) |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for row in defender_log:
         lines.append(
-            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {secs:.2f} |".format(
+            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {qthr:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {secs:.2f} |".format(
                 generation=row["generation"],
                 best_score=row["best_score"],
                 principle=row["principle"],
@@ -1582,6 +1840,7 @@ def _build_round_report(
                 mk=float(row.get("mid_keep", 0.0)),
                 kv=int(row.get("key_variants", 0)),
                 probe=float(row.get("probe_win_rate", 0.0)),
+                qthr=float(row.get("quick_throttle", 1.0)),
                 stage_eval=str(row.get("stage_eval", "0>0>0")),
                 stage_keep=str(row.get("stage_keep", "0>0")),
                 probe_n=int(row.get("probe_samples", 0)),
@@ -1595,11 +1854,11 @@ def _build_round_report(
     lines.append("")
     lines.append("## Attacker Evolution")
     lines.append("")
-    lines.append("| gen | attack_score | lane_success | token_success | attacker_adv | q frac/keep | m frac/keep | key var | probe | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | t(s) |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| gen | attack_score | lane_success | token_success | attacker_adv | q frac/keep | m frac/keep | key var | probe | q-thr | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | t(s) |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for row in attacker_log:
         lines.append(
-            "| {generation} | {attack_score:.4f} | {lane_success:.4f} | {token_success:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {secs:.2f} |".format(
+            "| {generation} | {attack_score:.4f} | {lane_success:.4f} | {token_success:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {qthr:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {secs:.2f} |".format(
                 generation=row["generation"],
                 attack_score=row["attack_score"],
                 lane_success=row["lane_success"],
@@ -1611,6 +1870,7 @@ def _build_round_report(
                 mk=float(row.get("mid_keep", 0.0)),
                 kv=int(row.get("key_variants", 0)),
                 probe=float(row.get("probe_win_rate", 0.0)),
+                qthr=float(row.get("quick_throttle", 1.0)),
                 stage_eval=str(row.get("stage_eval", "0>0>0")),
                 stage_keep=str(row.get("stage_keep", "0>0")),
                 probe_n=int(row.get("probe_samples", 0)),
@@ -1914,6 +2174,7 @@ def _run_defender_round(
             "mid_keep": float(controller.mid_keep_ratio),
             "key_variants": int(controller.key_variant_count),
             "probe_win_rate": float(stage_stats.get("probe_win_rate", 0.0)),
+            "quick_throttle": float(stage_stats.get("quick_throttle", 1.0)),
             "stage_eval": "{q}>{m}>{f}".format(
                 q=int(stage_stats.get("quick_eval", 0.0)),
                 m=int(stage_stats.get("mid_eval", 0.0)),
@@ -1923,6 +2184,11 @@ def _run_defender_round(
                 q=int(stage_stats.get("quick_kept", 0.0)),
                 m=int(stage_stats.get("mid_kept", 0.0)),
             ),
+            "quick_eval": int(stage_stats.get("quick_eval", 0.0)),
+            "mid_eval": int(stage_stats.get("mid_eval", 0.0)),
+            "full_eval": int(stage_stats.get("full_eval", 0.0)),
+            "quick_kept_count": int(stage_stats.get("quick_kept", 0.0)),
+            "mid_kept_count": int(stage_stats.get("mid_kept", 0.0)),
             "probe_samples": int(stage_stats.get("probe_samples", 0.0)),
             "quick_skipped": int(stage_stats.get("quick_skipped", 0.0)),
             "eval_unique": int(stage_stats.get("eval_unique", 0.0)),
@@ -1932,7 +2198,7 @@ def _run_defender_round(
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} t={secs:.2f}s".format(
+            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 security=row["security"],
@@ -1944,6 +2210,7 @@ def _run_defender_round(
                 mk=row["mid_keep"],
                 kv=row["key_variants"],
                 probe=row["probe_win_rate"],
+                qt=row["quick_throttle"],
                 stage_eval=row["stage_eval"],
                 stage_keep=row["stage_keep"],
                 probe_n=row["probe_samples"],
@@ -1953,6 +2220,22 @@ def _run_defender_round(
                 dup=row["dup_reuse"],
                 secs=row["batch_seconds"],
             )
+        )
+
+    def should_stop(
+        gen: int,
+        best: GFSLGenome,
+        best_fitness: float,
+        population: Sequence[GFSLGenome],
+    ) -> Tuple[bool, str]:
+        _ = (gen, best, best_fitness)
+        return _should_stop_by_runtime_stats(
+            generation_log=generation_log,
+            population=population,
+            total_generations=int(config.generations),
+            score_key="best_score",
+            min_gain=0.00035,
+            target_generation_seconds=float(config.target_generation_seconds),
         )
 
     def batch_eval(population: List[GFSLGenome]) -> None:
@@ -1979,6 +2262,7 @@ def _run_defender_round(
             "eval_unique": 0.0,
             "cache_hits": 0.0,
             "dup_reuse": 0.0,
+            "quick_throttle": 1.0,
             "target_batch_seconds": float(config.target_generation_seconds),
             "batch_seconds": 0.0,
         }
@@ -2040,6 +2324,13 @@ def _run_defender_round(
             profile=config.profile,
             archive_signatures=archive_signatures,
         )
+        quick_pending, quick_skipped, quick_throttle = _throttle_quick_pending_from_previous_stats(
+            quick_pending=quick_pending,
+            quick_skipped=quick_skipped,
+            previous_stats=stage_stats if stage_stats else None,
+            workers=resource_plan.parallel_workers,
+        )
+        local_stage["quick_throttle"] = float(quick_throttle)
         local_stage["quick_eval"] = float(len(quick_pending))
         local_stage["quick_skipped"] = float(len(quick_skipped))
         for _, skipped_genome in quick_skipped:
@@ -2293,6 +2584,7 @@ def _run_defender_round(
         fitness,
         progress_callback=progress,
         batch_evaluator=batch_eval,
+        should_stop=should_stop,
     )
     evolver._predictive_controller_state = controller.to_dict()  # type: ignore[attr-defined]
     return evolver, generation_log
@@ -2395,6 +2687,7 @@ def _run_attacker_round(
             "mid_keep": float(controller.mid_keep_ratio),
             "key_variants": int(controller.key_variant_count),
             "probe_win_rate": float(stage_stats.get("probe_win_rate", 0.0)),
+            "quick_throttle": float(stage_stats.get("quick_throttle", 1.0)),
             "stage_eval": "{q}>{m}>{f}".format(
                 q=int(stage_stats.get("quick_eval", 0.0)),
                 m=int(stage_stats.get("mid_eval", 0.0)),
@@ -2404,6 +2697,11 @@ def _run_attacker_round(
                 q=int(stage_stats.get("quick_kept", 0.0)),
                 m=int(stage_stats.get("mid_kept", 0.0)),
             ),
+            "quick_eval": int(stage_stats.get("quick_eval", 0.0)),
+            "mid_eval": int(stage_stats.get("mid_eval", 0.0)),
+            "full_eval": int(stage_stats.get("full_eval", 0.0)),
+            "quick_kept_count": int(stage_stats.get("quick_kept", 0.0)),
+            "mid_kept_count": int(stage_stats.get("mid_kept", 0.0)),
             "probe_samples": int(stage_stats.get("probe_samples", 0.0)),
             "quick_skipped": int(stage_stats.get("quick_skipped", 0.0)),
             "eval_unique": int(stage_stats.get("eval_unique", 0.0)),
@@ -2413,7 +2711,7 @@ def _run_attacker_round(
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} t={secs:.2f}s".format(
+            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 lane=row["lane_success"],
@@ -2424,6 +2722,7 @@ def _run_attacker_round(
                 mk=row["mid_keep"],
                 kv=row["key_variants"],
                 probe=row["probe_win_rate"],
+                qt=row["quick_throttle"],
                 stage_eval=row["stage_eval"],
                 stage_keep=row["stage_keep"],
                 probe_n=row["probe_samples"],
@@ -2433,6 +2732,22 @@ def _run_attacker_round(
                 dup=row["dup_reuse"],
                 secs=row["batch_seconds"],
             )
+        )
+
+    def should_stop(
+        gen: int,
+        best: GFSLGenome,
+        best_fitness: float,
+        population: Sequence[GFSLGenome],
+    ) -> Tuple[bool, str]:
+        _ = (gen, best, best_fitness)
+        return _should_stop_by_runtime_stats(
+            generation_log=generation_log,
+            population=population,
+            total_generations=int(config.attacker_generations),
+            score_key="attack_score",
+            min_gain=0.00045,
+            target_generation_seconds=float(config.target_generation_seconds),
         )
 
     def batch_eval(population: List[GFSLGenome]) -> None:
@@ -2459,6 +2774,7 @@ def _run_attacker_round(
             "eval_unique": 0.0,
             "cache_hits": 0.0,
             "dup_reuse": 0.0,
+            "quick_throttle": 1.0,
             "target_batch_seconds": float(config.target_generation_seconds),
             "batch_seconds": 0.0,
         }
@@ -2519,6 +2835,13 @@ def _run_attacker_round(
             profile=config.profile,
             archive_signatures=archive_signatures,
         )
+        quick_pending, quick_skipped, quick_throttle = _throttle_quick_pending_from_previous_stats(
+            quick_pending=quick_pending,
+            quick_skipped=quick_skipped,
+            previous_stats=stage_stats if stage_stats else None,
+            workers=resource_plan.parallel_workers,
+        )
+        local_stage["quick_throttle"] = float(quick_throttle)
         local_stage["quick_eval"] = float(len(quick_pending))
         local_stage["quick_skipped"] = float(len(quick_skipped))
         for _, skipped_genome in quick_skipped:
@@ -2768,6 +3091,7 @@ def _run_attacker_round(
         fitness,
         progress_callback=progress,
         batch_evaluator=batch_eval,
+        should_stop=should_stop,
     )
     evolver._predictive_controller_state = controller.to_dict()  # type: ignore[attr-defined]
     return evolver, generation_log
@@ -2849,9 +3173,25 @@ def run_continuous_experiment(
             # Preliminary best defender from the round.
             preliminary_defender = defender_evolver.population[0]
 
+            attacker_round_config, attacker_budget_meta = _adaptive_attacker_config_from_defender_log(
+                base_config=config,
+                defender_log=defender_log,
+            )
+            if attacker_budget_meta.get("active"):
+                print(
+                    "[pcpl-evolvo] adaptive attacker budget: pop={pop} gen={gen} reason={reason} reuse={reuse:.2f} uniq={uniq:.2f} gain={gain:.6f}".format(
+                        pop=int(attacker_budget_meta.get("population", config.attacker_population_size)),
+                        gen=int(attacker_budget_meta.get("generations", config.attacker_generations)),
+                        reason=str(attacker_budget_meta.get("reason", "adaptive")),
+                        reuse=float(attacker_budget_meta.get("reuse_ratio", 0.0)),
+                        uniq=float(attacker_budget_meta.get("uniqueness_ratio", 0.0)),
+                        gain=float(attacker_budget_meta.get("score_gain", 0.0)),
+                    )
+                )
+
             # Attacker co-evolution against this defender.
             attacker_evolver, attacker_log = _run_attacker_round(
-                config=config,
+                config=attacker_round_config,
                 resource_plan=resource_plan,
                 shared_executor=shared_executor,
                 scenarios=scenario_list,
@@ -2966,6 +3306,7 @@ def run_continuous_experiment(
                     "attacker": attacker_profile,
                     "selection_key_variants": selection_key_variants,
                 },
+                "adaptive_attacker_budget": attacker_budget_meta,
             }
             archive.setdefault("rounds", []).append(round_summary)
 
@@ -3112,6 +3453,12 @@ def run_continuous_experiment(
                 max_s=float(config.max_test_time_seconds),
                 dev=float(config.device_mhz),
                 prov=float(config.provider_mhz),
+            )
+        )
+        report_lines.append(
+            "- runtime-governor: target_gen_s={target:.2f} eval_cache={cache}".format(
+                target=float(config.target_generation_seconds),
+                cache=int(config.max_eval_cache_entries),
             )
         )
         report_lines.append("")

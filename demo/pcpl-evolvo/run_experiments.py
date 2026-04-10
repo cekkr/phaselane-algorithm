@@ -70,6 +70,8 @@ def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, An
         "key_variants": int(args.key_variants),
         "novelty_bonus": float(args.novelty_bonus),
         "predictive_penalty": float(args.predictive_penalty),
+        "target_generation_seconds": float(args.target_generation_seconds),
+        "max_eval_cache_entries": int(args.max_eval_cache_entries),
     }
     if mode != "paper":
         return [base]
@@ -88,6 +90,8 @@ def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, An
         "key_variants": max(3, base["key_variants"]),
         "novelty_bonus": _clamp_float(max(0.10, base["novelty_bonus"]), 0.03, 0.30),
         "predictive_penalty": _clamp_float(max(0.06, base["predictive_penalty"]), 0.03, 0.22),
+        "target_generation_seconds": _clamp_float(base["target_generation_seconds"] * 0.95, 0.70, 4.0),
+        "max_eval_cache_entries": max(15000, int(round(base["max_eval_cache_entries"] * 1.10))),
     }
     explorer = {
         "strategy": "explorer",
@@ -103,6 +107,8 @@ def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, An
         "key_variants": max(4, base["key_variants"]),
         "novelty_bonus": _clamp_float(max(0.14, base["novelty_bonus"]), 0.05, 0.35),
         "predictive_penalty": _clamp_float(max(0.10, base["predictive_penalty"]), 0.04, 0.25),
+        "target_generation_seconds": _clamp_float(base["target_generation_seconds"] * 0.88, 0.60, 4.0),
+        "max_eval_cache_entries": max(15000, int(round(base["max_eval_cache_entries"] * 1.18))),
     }
     return [dynamic, explorer]
 
@@ -171,6 +177,8 @@ def _build_continuous_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "key_variants": int(strategy["key_variants"]),
                     "novelty_bonus": float(strategy["novelty_bonus"]),
                     "predictive_penalty": float(strategy["predictive_penalty"]),
+                    "target_generation_seconds": float(strategy["target_generation_seconds"]),
+                    "max_eval_cache_entries": int(strategy["max_eval_cache_entries"]),
                 }
             )
 
@@ -207,6 +215,8 @@ def _build_experiment_config(
     key_variants: Optional[int] = None,
     novelty_bonus: Optional[float] = None,
     predictive_penalty: Optional[float] = None,
+    target_generation_seconds: Optional[float] = None,
+    max_eval_cache_entries: Optional[int] = None,
 ) -> ExperimentConfig:
     return ExperimentConfig(
         out_dir=out_dir,
@@ -239,6 +249,16 @@ def _build_experiment_config(
         novelty_bonus=args.novelty_bonus if novelty_bonus is None else float(novelty_bonus),
         predictive_penalty=args.predictive_penalty if predictive_penalty is None else float(predictive_penalty),
         auto_statistical_tuning=bool(args.auto_statistical_tuning),
+        target_generation_seconds=(
+            args.target_generation_seconds
+            if target_generation_seconds is None
+            else float(target_generation_seconds)
+        ),
+        max_eval_cache_entries=(
+            args.max_eval_cache_entries
+            if max_eval_cache_entries is None
+            else int(max_eval_cache_entries)
+        ),
         device_mhz=args.device_mhz,
         provider_mhz=args.provider_mhz,
         max_test_time_seconds=args.max_test_seconds,
@@ -320,6 +340,8 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "key_variants": "key_variants",
         "novelty_bonus": "novelty_bonus",
         "predictive_penalty": "predictive_penalty",
+        "target_generation_seconds": "target_generation_seconds",
+        "max_eval_cache_entries": "max_eval_cache_entries",
         "device_mhz": "device_mhz",
         "provider_mhz": "provider_mhz",
         "max_test_seconds": "max_test_seconds",
@@ -373,6 +395,8 @@ def _apply_runtime_config(args: argparse.Namespace, resolved: Dict[str, Any]) ->
         "key_variants",
         "novelty_bonus",
         "predictive_penalty",
+        "target_generation_seconds",
+        "max_eval_cache_entries",
         "device_mhz",
         "provider_mhz",
         "max_test_seconds",
@@ -421,6 +445,12 @@ def _print_effective_config(resolved: Dict[str, Any]) -> None:
             kv=int(resolved["key_variants"]),
             nov=float(resolved["novelty_bonus"]),
             pen=float(resolved["predictive_penalty"]),
+        )
+    )
+    print(
+        "[pcpl-evolvo] runtime target_gen_s={target:.2f} eval_cache={cache}".format(
+            target=float(resolved["target_generation_seconds"]),
+            cache=int(resolved["max_eval_cache_entries"]),
         )
     )
 
@@ -680,6 +710,18 @@ def parse_args() -> argparse.Namespace:
         help="Penalty applied when a genome is cut by predictive stages.",
     )
     parser.add_argument(
+        "--target-generation-seconds",
+        type=float,
+        default=None,
+        help="Target max wall-time per generation batch used by auto-tuning/early-stop.",
+    )
+    parser.add_argument(
+        "--max-eval-cache-entries",
+        type=int,
+        default=None,
+        help="Per-round dedup cache capacity for reuse of evaluated genome signatures.",
+    )
+    parser.add_argument(
         "--device-mhz",
         type=float,
         default=None,
@@ -858,10 +900,12 @@ def main() -> None:
                             key_variants=combo.get("key_variants"),
                             novelty_bonus=combo.get("novelty_bonus"),
                             predictive_penalty=combo.get("predictive_penalty"),
+                            target_generation_seconds=combo.get("target_generation_seconds"),
+                            max_eval_cache_entries=combo.get("max_eval_cache_entries"),
                         )
 
                         print(
-                            "[pcpl-evolvo] launch iter={iter} sweep={sweep} combo={combo} strategy={strategy} seed={seed} lane={lane}/{lanes} lane-workers={lane_workers}".format(
+                            "[pcpl-evolvo] launch iter={iter} sweep={sweep} combo={combo} strategy={strategy} seed={seed} lane={lane}/{lanes} lane-workers={lane_workers} target_gen_s={target:.2f} cache={cache}".format(
                                 iter=iteration_index,
                                 sweep=total_sweeps,
                                 combo=combo_name,
@@ -870,6 +914,8 @@ def main() -> None:
                                 lane=len(pending) + 1,
                                 lanes=lane_count,
                                 lane_workers=workers_per_lane,
+                                target=float(combo.get("target_generation_seconds", args.target_generation_seconds)),
+                                cache=int(combo.get("max_eval_cache_entries", args.max_eval_cache_entries)),
                             )
                         )
                         future = combo_pool.submit(_run_once, config)
