@@ -17,6 +17,7 @@ ensure_evolvo_importable()
 from evolvo import (
     Category,
     DataType,
+    GFSLExpressionBuilder,
     GFSLExecutor,
     GFSLGenome,
     GFSLInstruction,
@@ -378,6 +379,81 @@ def ensure_attacker_genome_io(genome: GFSLGenome) -> None:
 
     if len(genome.extract_effective_algorithm()) == 0:
         _inject_attacker_output_path(genome)
+
+
+def reference_pcpl_policy() -> PolicyDecision:
+    """Deterministic reference policy aligned with current paper-like PCPL behavior."""
+    return PolicyDecision(
+        active_ratio=1.0,
+        kernel=0,
+        stride_seed=0,
+        state_mix=0.5,
+        exponent_mix=0.5,
+        hash_rounds=1,
+        bouquet_spread=0.5,
+        state_churn=0.5,
+        lane_salt=0,
+        token_scramble=0.2689414213699951,  # sigmoid(-1)
+        phase_jitter=0.2689414213699951,  # sigmoid(-1)
+    )
+
+
+def _append_reference_value_instruction(
+    genome: GFSLGenome,
+    *,
+    target_idx: int,
+    op_code: int,
+    source1_value: float,
+    source2_value: float,
+) -> None:
+    (
+        GFSLExpressionBuilder(genome)
+        .target_var(DataType.DECIMAL, target_idx)
+        .op(op_code)
+        .source1_value(float(source1_value))
+        .source2_value(float(source2_value))
+        .commit()
+    )
+
+
+def build_reference_defender_genome() -> GFSLGenome:
+    """Create a deterministic paper-reference genome used as round-0 anchor."""
+    genome = GFSLGenome("algorithm")
+    dtype_key = int(DataType.DECIMAL)
+    genome.validator.variable_counts[dtype_key] = max(
+        int(genome.validator.variable_counts[dtype_key]),
+        INPUT_DECIMAL_COUNT,
+        max(OUTPUT_INDICES) + 1,
+    )
+    for idx in OUTPUT_INDICES:
+        genome.mark_output(DataType.DECIMAL, idx)
+
+    # Output constants chosen so _policy_from_outputs maps to paper-reference controls.
+    reference_program = (
+        (DEFENDER_OUTPUT_ACTIVE_IDX, int(Operation.ADD), 10.0, 10.0),   # ~1.0 after sigmoid
+        (DEFENDER_OUTPUT_KERNEL_IDX, int(Operation.SUB), 0.0, 0.0),    # kernel selector -> 0
+        (DEFENDER_OUTPUT_STATE_MIX_IDX, int(Operation.SUB), 0.0, 0.0),  # 0.5 after sigmoid
+        (DEFENDER_OUTPUT_EXP_MIX_IDX, int(Operation.SUB), 0.0, 0.0),    # 0.5 after sigmoid
+        (DEFENDER_OUTPUT_HASH_ROUNDS_IDX, int(Operation.SUB), 1.0, 1.0),  # hash_rounds -> 1
+        (DEFENDER_OUTPUT_BOUQUET_SPREAD_IDX, int(Operation.SUB), 0.0, 0.0),  # 0.5 after sigmoid
+        (DEFENDER_OUTPUT_STATE_CHURN_IDX, int(Operation.SUB), 0.0, 0.0),  # 0.5 after sigmoid
+        (DEFENDER_OUTPUT_LANE_SALT_IDX, int(Operation.SUB), 0.0, 0.0),  # 0 lane salt
+        (DEFENDER_OUTPUT_TOKEN_SCRAMBLE_IDX, int(Operation.SUB), 0.0, 1.0),  # sigmoid(-1)
+        (DEFENDER_OUTPUT_PHASE_JITTER_IDX, int(Operation.SUB), 0.0, 1.0),  # sigmoid(-1)
+    )
+    for target_idx, op_code, src1, src2 in reference_program:
+        _append_reference_value_instruction(
+            genome,
+            target_idx=int(target_idx),
+            op_code=int(op_code),
+            source1_value=float(src1),
+            source2_value=float(src2),
+        )
+
+    genome.rebuild_validator_state()
+    genome._pcpl_scaffold_injected = True  # type: ignore[attr-defined]
+    ensure_genome_io(genome)
+    return genome
 
 
 def _has_pcpl_control_path(genome: GFSLGenome) -> bool:

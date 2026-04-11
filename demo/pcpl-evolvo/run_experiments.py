@@ -83,10 +83,10 @@ def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, An
         "mutation_floor": _clamp_float(max(0.18, base["mutation_floor"]), 0.10, 0.90),
         "mutation_ceiling": _clamp_float(max(base["mutation_ceiling"], base["mutation_floor"] + 0.18), 0.55, 0.99),
         "mutation_step": _clamp_float(max(0.10, base["mutation_step"]), 0.03, 0.30),
-        "quick_cycle_fraction": _clamp_float(base["quick_cycle_fraction"] + 0.01, 0.08, 0.35),
-        "mid_cycle_fraction": _clamp_float(base["mid_cycle_fraction"] + 0.03, 0.25, 0.75),
-        "quick_keep_ratio": _clamp_float(base["quick_keep_ratio"] + 0.03, 0.35, 0.82),
-        "mid_keep_ratio": _clamp_float(base["mid_keep_ratio"] + 0.02, 0.12, 0.50),
+        "quick_cycle_fraction": _clamp_float(base["quick_cycle_fraction"] + 0.01, 0.05, 0.35),
+        "mid_cycle_fraction": _clamp_float(base["mid_cycle_fraction"] + 0.03, 0.18, 0.75),
+        "quick_keep_ratio": _clamp_float(base["quick_keep_ratio"] + 0.03, 0.20, 0.82),
+        "mid_keep_ratio": _clamp_float(base["mid_keep_ratio"] + 0.02, 0.08, 0.50),
         "key_variants": max(3, base["key_variants"]),
         "novelty_bonus": _clamp_float(max(0.10, base["novelty_bonus"]), 0.03, 0.30),
         "predictive_penalty": _clamp_float(max(0.06, base["predictive_penalty"]), 0.03, 0.22),
@@ -100,10 +100,10 @@ def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, An
         "mutation_floor": _clamp_float(max(0.26, base["mutation_floor"]), 0.18, 0.95),
         "mutation_ceiling": _clamp_float(max(0.94, base["mutation_ceiling"]), 0.70, 0.99),
         "mutation_step": _clamp_float(max(0.14, base["mutation_step"]), 0.05, 0.35),
-        "quick_cycle_fraction": _clamp_float(min(base["quick_cycle_fraction"], 0.10), 0.08, 0.30),
-        "mid_cycle_fraction": _clamp_float(min(base["mid_cycle_fraction"], 0.36), 0.24, 0.70),
-        "quick_keep_ratio": _clamp_float(min(base["quick_keep_ratio"], 0.42), 0.35, 0.75),
-        "mid_keep_ratio": _clamp_float(min(base["mid_keep_ratio"], 0.16), 0.12, 0.40),
+        "quick_cycle_fraction": _clamp_float(min(base["quick_cycle_fraction"], 0.10), 0.05, 0.30),
+        "mid_cycle_fraction": _clamp_float(min(base["mid_cycle_fraction"], 0.36), 0.18, 0.70),
+        "quick_keep_ratio": _clamp_float(min(base["quick_keep_ratio"], 0.42), 0.20, 0.75),
+        "mid_keep_ratio": _clamp_float(min(base["mid_keep_ratio"], 0.16), 0.08, 0.40),
         "key_variants": max(4, base["key_variants"]),
         "novelty_bonus": _clamp_float(max(0.14, base["novelty_bonus"]), 0.05, 0.35),
         "predictive_penalty": _clamp_float(max(0.10, base["predictive_penalty"]), 0.04, 0.25),
@@ -473,6 +473,10 @@ def _print_summary(summary: Dict[str, Any]) -> None:
     print(f"[pcpl-evolvo] out_dir={summary['out_dir']}")
     print(f"[pcpl-evolvo] best_score={summary['best_score']:.6f}")
     print(f"[pcpl-evolvo] best_attacker_score={summary['best_attacker_score']:.6f}")
+    if summary.get("reference_score") is not None:
+        ref = float(summary["reference_score"])
+        print(f"[pcpl-evolvo] reference_score={ref:.6f}")
+        print(f"[pcpl-evolvo] delta_vs_reference={(float(summary['best_score']) - ref):+.6f}")
     print(f"[pcpl-evolvo] rounds_completed={summary['rounds_completed']}")
     print(f"[pcpl-evolvo] results={summary['results_json']}")
     print(f"[pcpl-evolvo] report={summary['report_path']}")

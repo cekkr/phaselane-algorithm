@@ -16,17 +16,19 @@ from collections import OrderedDict
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .bootstrap import ensure_evolvo_importable
 from .simulation import (
     PolicyDecision,
     ScenarioConfig,
     ScenarioMetrics,
+    build_reference_defender_genome,
     default_scenarios,
     ensure_attacker_genome_io,
     ensure_genome_io,
     evaluate_across_scenarios,
+    reference_pcpl_policy,
 )
 
 ensure_evolvo_importable()
@@ -153,20 +155,21 @@ class PredictiveStageController:
             controller.mid_cycle_fraction = min(controller.mid_cycle_fraction, 0.45)
             controller.quick_keep_ratio = min(controller.quick_keep_ratio, 0.35)
             controller.mid_keep_ratio = min(controller.mid_keep_ratio, 0.20)
-            controller.key_variant_count = min(controller.key_variant_count, 1)
+            controller.key_variant_count = min(controller.key_variant_count, 3)
         controller.clamp()
         return controller
 
     def clamp(self) -> None:
-        self.quick_cycle_fraction = clamp(self.quick_cycle_fraction, 0.08, 0.65)
+        # Allow very small quick fractions when cycles are already very large.
+        self.quick_cycle_fraction = clamp(self.quick_cycle_fraction, 0.05, 0.65)
         self.mid_cycle_fraction = clamp(
             max(self.mid_cycle_fraction, self.quick_cycle_fraction + 0.12),
-            0.25,
+            0.18,
             0.95,
         )
-        self.quick_keep_ratio = clamp(self.quick_keep_ratio, 0.35, 0.92)
-        self.mid_keep_ratio = clamp(self.mid_keep_ratio, 0.12, 0.80)
-        self.mid_keep_ratio = min(self.mid_keep_ratio, max(0.12, self.quick_keep_ratio - 0.05))
+        self.quick_keep_ratio = clamp(self.quick_keep_ratio, 0.20, 0.92)
+        self.mid_keep_ratio = clamp(self.mid_keep_ratio, 0.08, 0.80)
+        self.mid_keep_ratio = min(self.mid_keep_ratio, max(0.08, self.quick_keep_ratio - 0.03))
         self.key_variant_count = max(1, min(6, int(self.key_variant_count)))
 
     def apply_feedback(self, stats: Dict[str, float]) -> None:
@@ -595,7 +598,24 @@ class SafeGFSLEvolver(GFSLEvolver):
             max_attempts = max(self.population_size * 90, 240)
             parent_pool_size = max(2, int(len(self.population) * self.parent_pool_ratio))
             parent_pool = self.population[: parent_pool_size]
-            local_refine_chance = 0.28 + (0.47 * stagnation_pressure)
+            # Under stagnation we bias towards diversity, not local micro-tweaks.
+            local_refine_chance = clamp(0.40 - (0.28 * stagnation_pressure), 0.08, 0.40)
+            guide_sizes = [
+                max(1, len(genome.extract_effective_algorithm()))
+                for genome in parent_pool[: max(4, min(len(parent_pool), elite_size + 2))]
+            ]
+            if guide_sizes:
+                guide_mean = sum(guide_sizes) / float(len(guide_sizes))
+            else:
+                guide_mean = 8.0
+            immigrant_instruction_budget = max(
+                4,
+                min(24, int(round((guide_mean * 1.55) + 2.0))),
+            )
+            fallback_instruction_budget = max(
+                4,
+                min(20, int(round((guide_mean * 1.20) + 1.0))),
+            )
 
             def tournament_from(pool: Sequence[GFSLGenome], size: int = 3) -> GFSLGenome:
                 tournament = random.sample(list(pool), min(size, len(pool)))
@@ -637,7 +657,7 @@ class SafeGFSLEvolver(GFSLEvolver):
 
             # Inject random immigrants when the top signature is stuck for too long.
             if self.signature_stagnation_count >= max(1, self.stagnation_patience):
-                immigrant_ratio = 0.15 + (0.20 * stagnation_pressure)
+                immigrant_ratio = 0.22 + (0.33 * stagnation_pressure)
                 immigrant_target = max(1, int(round(self.population_size * immigrant_ratio)))
                 injected = 0
                 inject_attempts = 0
@@ -647,9 +667,7 @@ class SafeGFSLEvolver(GFSLEvolver):
                     and inject_attempts < (immigrant_target * 12)
                 ):
                     inject_attempts += 1
-                    immigrant = _make_random_genome(
-                        max(4, int(self.population_size * 0.7))
-                    )
+                    immigrant = _make_random_genome(immigrant_instruction_budget)
                     immigrant.fitness = None
                     immigrant.generation = gen + 1
                     signature = _evaluation_signature(immigrant)
@@ -676,9 +694,7 @@ class SafeGFSLEvolver(GFSLEvolver):
                     fallback.generation = gen + 1
                 if fallback_added:
                     continue
-                immigrant = _make_random_genome(
-                    max(4, int(self.population_size * 0.6))
-                )
+                immigrant = _make_random_genome(fallback_instruction_budget)
                 immigrant.fitness = None
                 immigrant.generation = gen + 1
                 signature = _evaluation_signature(immigrant)
@@ -1848,6 +1864,7 @@ def _seed_population_from_archive(
     evolver: SafeGFSLEvolver,
     archive_elites: Sequence[Dict[str, Any]],
     io_initializer,
+    reference_anchor_factory: Optional[Callable[[], GFSLGenome]] = None,
     population_size: int,
     initial_instructions: int,
     elite_pool: int,
@@ -1864,6 +1881,13 @@ def _seed_population_from_archive(
         seen.add(signature)
         seeded.append(genome)
         return True
+
+    if reference_anchor_factory is not None:
+        try:
+            anchor = reference_anchor_factory()
+            push(anchor)
+        except Exception:
+            pass
 
     for entry in archive_elites[: max(1, elite_pool)]:
         try:
@@ -1928,6 +1952,9 @@ def _build_round_report(
     attacker_signature: str,
     defender_log: Sequence[Dict[str, Any]],
     attacker_log: Sequence[Dict[str, Any]],
+    reference_score: Optional[float] = None,
+    reference_signature: str = "",
+    reference_metrics: Optional[Sequence[ScenarioMetrics]] = None,
 ) -> str:
     lines: List[str] = []
     lines.append("# PCPL Evolvo Continuous Round")
@@ -1958,13 +1985,68 @@ def _build_round_report(
     lines.append("")
     lines.append(_scenario_table(defender_metrics))
     lines.append("")
+    if reference_score is not None:
+        ref_metrics = list(reference_metrics or [])
+        lines.append("## Reference Anchor Comparison")
+        lines.append("")
+        lines.append(f"- reference defender score: `{float(reference_score):.6f}`")
+        if reference_signature:
+            lines.append(f"- reference defender signature: `{reference_signature}`")
+        lines.append(
+            "- score delta vs reference: `{delta:+.6f}`".format(
+                delta=float(defender_score) - float(reference_score),
+            )
+        )
+        if ref_metrics:
+            lines.append("")
+            lines.append("| metric | current | reference | delta |")
+            lines.append("| --- | ---: | ---: | ---: |")
+            key_specs = [
+                ("principle_score", "principle"),
+                ("sync_score", "sync"),
+                ("security_score", "security"),
+                ("cost_score", "cost"),
+                ("runtime_score", "runtime"),
+                ("stability_score", "stability"),
+                ("attacker_advantage_score", "attacker-adv"),
+            ]
+            for key, label in key_specs:
+                current_value = _mean_metric(defender_metrics, key)
+                ref_value = _mean_metric(ref_metrics, key)
+                lines.append(
+                    "| {label} | {current:.4f} | {reference:.4f} | {delta:+.4f} |".format(
+                        label=label,
+                        current=current_value,
+                        reference=ref_value,
+                        delta=(current_value - ref_value),
+                    )
+                )
+        finding_rows = _pcpl_improvement_findings(
+            metrics_rows=_metrics_rows(defender_metrics),
+            reference_metrics_rows=_metrics_rows(ref_metrics) if ref_metrics else None,
+        )
+        if finding_rows:
+            lines.append("")
+            lines.append("### Priorities")
+            for item in finding_rows[:5]:
+                lines.append(
+                    "- {label}: weakness={weakness:.4f}, current={current:.4f}, delta_vs_reference={delta:+.4f}. {recommendation}".format(
+                        label=str(item["label"]),
+                        weakness=float(item["weakness"]),
+                        current=float(item["current"]),
+                        delta=float(item["delta_vs_reference"]),
+                        recommendation=str(item["recommendation"]),
+                    )
+                )
+        lines.append("")
+
     lines.append("## Defender Evolution")
     lines.append("")
-    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe | q-thr | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | t(s) |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe | q-thr | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | t(s) | stop |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
     for row in defender_log:
         lines.append(
-            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {qthr:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {secs:.2f} |".format(
+            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {qthr:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {secs:.2f} | {stop_reason} |".format(
                 generation=row["generation"],
                 best_score=row["best_score"],
                 principle=row["principle"],
@@ -1987,16 +2069,17 @@ def _build_round_report(
                 cache=int(row.get("cache_hits", 0)),
                 dup=int(row.get("dup_reuse", 0)),
                 secs=float(row.get("batch_seconds", 0.0)),
+                stop_reason=str(row.get("stop_reason", "")),
             )
         )
     lines.append("")
     lines.append("## Attacker Evolution")
     lines.append("")
-    lines.append("| gen | attack_score | lane_success | token_success | attacker_adv | q frac/keep | m frac/keep | key var | probe | q-thr | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | t(s) |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| gen | attack_score | lane_success | token_success | attacker_adv | q frac/keep | m frac/keep | key var | probe | q-thr | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | t(s) | stop |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
     for row in attacker_log:
         lines.append(
-            "| {generation} | {attack_score:.4f} | {lane_success:.4f} | {token_success:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {qthr:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {secs:.2f} |".format(
+            "| {generation} | {attack_score:.4f} | {lane_success:.4f} | {token_success:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {qthr:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {secs:.2f} | {stop_reason} |".format(
                 generation=row["generation"],
                 attack_score=row["attack_score"],
                 lane_success=row["lane_success"],
@@ -2017,6 +2100,7 @@ def _build_round_report(
                 cache=int(row.get("cache_hits", 0)),
                 dup=int(row.get("dup_reuse", 0)),
                 secs=float(row.get("batch_seconds", 0.0)),
+                stop_reason=str(row.get("stop_reason", "")),
             )
         )
     return "\n".join(lines) + "\n"
@@ -2026,19 +2110,7 @@ def _baseline_rows(scenarios: Sequence[ScenarioConfig]) -> List[Dict[str, Any]]:
     baselines = [
         (
             "reference-full",
-            PolicyDecision(
-                active_ratio=1.0,
-                kernel=0,
-                stride_seed=0,
-                state_mix=0.5,
-                exponent_mix=0.5,
-                hash_rounds=2,
-                bouquet_spread=0.5,
-                state_churn=0.5,
-                lane_salt=0,
-                token_scramble=0.25,
-                phase_jitter=0.25,
-            ),
+            reference_pcpl_policy(),
         ),
         (
             "balanced",
@@ -2109,6 +2181,135 @@ def _mean_metrics_row(metrics_rows: Sequence[Dict[str, Any]]) -> Dict[str, float
         values = [float(row.get(key, 0.0)) for row in metrics_rows]
         means[key] = sum(values) / float(max(1, len(values)))
     return means
+
+
+def _metric_mean_from_rows(metrics_rows: Sequence[Dict[str, Any]], key: str, default: float = 0.0) -> float:
+    values = [float(row.get(key, default)) for row in metrics_rows if key in row]
+    if not values:
+        return float(default)
+    return float(sum(values) / float(max(1, len(values))))
+
+
+def _baseline_row_by_name(
+    baseline_rows: Sequence[Dict[str, Any]],
+    *,
+    name: str,
+) -> Optional[Dict[str, Any]]:
+    for row in baseline_rows:
+        if str(row.get("name", "")) == str(name):
+            return row
+    return None
+
+
+def _pcpl_improvement_findings(
+    *,
+    metrics_rows: Sequence[Dict[str, Any]],
+    reference_metrics_rows: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    if not metrics_rows:
+        return []
+
+    reference_rows = list(reference_metrics_rows or [])
+    specs = [
+        (
+            "principle_score",
+            True,
+            "Principle Coherence",
+            "Tighten one-of-x/permutation constraints and add explicit invariant proofs in main-paper PCPL steps.",
+        ),
+        (
+            "sync_score",
+            True,
+            "Sync Robustness",
+            "Strengthen absolute-time drift compensation and resync trigger windows with bounded worst-case analysis.",
+        ),
+        (
+            "security_score",
+            True,
+            "Security Envelope",
+            "Increase unpredictability with stronger phase/hash mixing and document adversarial assumptions directly in the paper.",
+        ),
+        (
+            "cost_score",
+            True,
+            "Cost Efficiency",
+            "Introduce adaptive active-ratio/hash-round throttling in the PCPL formal definition to preserve low-cost regimes.",
+        ),
+        (
+            "runtime_score",
+            True,
+            "Runtime Headroom",
+            "Constrain heavy control branches and reserve complex transformations for high-risk phases only.",
+        ),
+        (
+            "stability_score",
+            True,
+            "Controller Stability",
+            "Reduce controller-fail paths by specifying safe fallback transitions and bounded state-churn rules.",
+        ),
+        (
+            "attacker_advantage_score",
+            False,
+            "Attacker Advantage",
+            "Harden lane and token unpredictability; prioritize anti-inference defenses where attacker advantage remains high.",
+        ),
+        (
+            "replay_rate",
+            False,
+            "Replay Exposure",
+            "Expand replay-window constraints and enforce stronger freshness coupling between phase and lane output.",
+        ),
+        (
+            "cross_lane_collision_rate",
+            False,
+            "Cross-Lane Collisions",
+            "Increase lane-decoupling entropy and formally bound collision probability in PCPL lane schedule definitions.",
+        ),
+        (
+            "shared_device_match_rate",
+            False,
+            "Shared-Device Impersonation",
+            "Add stronger seed-lineage separation to prevent converging behavior across same-device derivations.",
+        ),
+        (
+            "projected_sync_loss_rate",
+            False,
+            "Long-Horizon Sync Loss",
+            "Refine long-horizon sync model and derive explicit tolerance bounds for extended runtime windows.",
+        ),
+    ]
+
+    findings: List[Dict[str, Any]] = []
+    for key, higher_is_better, label, recommendation in specs:
+        current = _metric_mean_from_rows(metrics_rows, key, default=0.0)
+        reference = _metric_mean_from_rows(reference_rows, key, default=current)
+        if higher_is_better:
+            weakness = clamp(1.0 - current, 0.0, 1.0)
+            delta_vs_reference = current - reference
+        else:
+            weakness = clamp(current, 0.0, 1.0)
+            delta_vs_reference = reference - current
+        findings.append(
+            {
+                "metric": key,
+                "label": label,
+                "higher_is_better": bool(higher_is_better),
+                "current": float(current),
+                "reference": float(reference),
+                "delta_vs_reference": float(delta_vs_reference),
+                "weakness": float(weakness),
+                "recommendation": recommendation,
+            }
+        )
+
+    findings.sort(
+        key=lambda item: (
+            float(item.get("weakness", 0.0)),
+            -float(item.get("delta_vs_reference", 0.0)),
+        ),
+        reverse=True,
+    )
+    return findings
 
 
 def _write_view_outputs(
@@ -2188,8 +2389,13 @@ def _write_view_outputs(
     conclusion_lines.append(f"- workers: `{resource_plan.parallel_workers}`")
     conclusion_lines.append(f"- gpu backend: `{resource_plan.gpu_backend}`")
     conclusion_lines.append("")
+    reference_baseline = _baseline_row_by_name(baseline_rows, name="reference-full")
+    reference_metrics_rows: Sequence[Dict[str, Any]] = []
+    if reference_baseline is not None:
+        reference_metrics_rows = list(reference_baseline.get("metrics", []))
     if best_defender:
-        defender_mean = _mean_metrics_row(best_defender[0].get("metrics", []))
+        best_metrics_rows = list(best_defender[0].get("metrics", []))
+        defender_mean = _mean_metrics_row(best_metrics_rows)
         conclusion_lines.append("## Best Defender Summary")
         conclusion_lines.append(
             "- score={score:.6f}, principle={principle:.4f}, security={security:.4f}, sync={sync:.4f}, cost={cost:.4f}".format(
@@ -2209,6 +2415,31 @@ def _write_view_outputs(
                 hs=float(defender_mean.get("horizon_sync_score", 0.0)),
             )
         )
+        if reference_baseline is not None:
+            conclusion_lines.append(
+                "- delta vs reference-full baseline: {delta:+.6f} (best={best:.6f}, baseline={baseline:.6f})".format(
+                    delta=float(best_defender[0].get("score", 0.0)) - float(reference_baseline.get("mean_score", 0.0)),
+                    best=float(best_defender[0].get("score", 0.0)),
+                    baseline=float(reference_baseline.get("mean_score", 0.0)),
+                )
+            )
+        improvement_findings = _pcpl_improvement_findings(
+            metrics_rows=best_metrics_rows,
+            reference_metrics_rows=reference_metrics_rows,
+        )
+        if improvement_findings:
+            conclusion_lines.append("")
+            conclusion_lines.append("## Paper Improvement Priorities")
+            for item in improvement_findings[:6]:
+                conclusion_lines.append(
+                    "- {label}: weakness={weakness:.4f}, current={current:.4f}, delta_vs_reference={delta:+.4f}. {recommendation}".format(
+                        label=str(item["label"]),
+                        weakness=float(item["weakness"]),
+                        current=float(item["current"]),
+                        delta=float(item["delta_vs_reference"]),
+                        recommendation=str(item["recommendation"]),
+                    )
+                )
         conclusion_lines.append("")
     if best_attacker:
         attacker_mean = _mean_metrics_row(best_attacker[0].get("metrics", []))
@@ -2286,6 +2517,7 @@ def _run_defender_round(
         evolver=evolver,
         archive_elites=archive.get("defender_elites", []),
         io_initializer=ensure_genome_io,
+        reference_anchor_factory=build_reference_defender_genome,
         population_size=config.population_size,
         initial_instructions=config.initial_instructions,
         elite_pool=config.elite_pool,
@@ -2774,6 +3006,11 @@ def _run_defender_round(
         batch_evaluator=batch_eval,
         should_stop=should_stop,
     )
+    stop_reason = getattr(evolver, "_early_stop_reason", None)
+    stop_generation = getattr(evolver, "_early_stop_generation", None)
+    if generation_log:
+        generation_log[-1]["stop_reason"] = str(stop_reason) if stop_reason else ""
+        generation_log[-1]["stop_generation"] = int(stop_generation) if stop_generation is not None else -1
     evolver._predictive_controller_state = controller.to_dict()  # type: ignore[attr-defined]
     return evolver, generation_log
 
@@ -2801,6 +3038,7 @@ def _run_attacker_round(
         evolver=evolver,
         archive_elites=archive.get("attacker_elites", []),
         io_initializer=ensure_attacker_genome_io,
+        reference_anchor_factory=None,
         population_size=config.attacker_population_size,
         initial_instructions=max(4, config.initial_instructions // 2),
         elite_pool=max(4, config.elite_pool // 2),
@@ -3286,6 +3524,11 @@ def _run_attacker_round(
         batch_evaluator=batch_eval,
         should_stop=should_stop,
     )
+    stop_reason = getattr(evolver, "_early_stop_reason", None)
+    stop_generation = getattr(evolver, "_early_stop_generation", None)
+    if generation_log:
+        generation_log[-1]["stop_reason"] = str(stop_reason) if stop_reason else ""
+        generation_log[-1]["stop_generation"] = int(stop_generation) if stop_generation is not None else -1
     evolver._predictive_controller_state = controller.to_dict()  # type: ignore[attr-defined]
     return evolver, generation_log
 
@@ -3337,6 +3580,8 @@ def run_continuous_experiment(
         last_attacker_score = -float("inf")
         last_defender_signature = ""
         last_attacker_signature = ""
+        last_reference_score = -float("inf")
+        last_reference_signature = ""
         last_round_dir = None
 
         current_attacker: Optional[GFSLGenome] = None
@@ -3443,6 +3688,14 @@ def run_continuous_experiment(
                     selected_metrics = metrics
                     selected_defender = candidate
 
+            reference_defender = build_reference_defender_genome()
+            ensure_genome_io(reference_defender)
+            reference_score, reference_metrics = evaluate_across_scenarios(
+                selection_scenarios,
+                reference_defender,
+                attacker=best_attacker,
+            )
+
             attacker_score, attacker_metrics = evaluate_across_scenarios(
                 selection_scenarios,
                 selected_defender,
@@ -3452,6 +3705,7 @@ def run_continuous_experiment(
 
             defender_signature = selected_defender.get_signature()
             attacker_signature = best_attacker.get_signature()
+            reference_signature = reference_defender.get_signature()
 
             defender_record = {
                 "role": "defender",
@@ -3501,6 +3755,13 @@ def run_continuous_experiment(
                     "selection_key_variants": selection_key_variants,
                 },
                 "adaptive_attacker_budget": attacker_budget_meta,
+                "reference_anchor": {
+                    "score": float(reference_score),
+                    "signature": reference_signature,
+                    "canonical_signature": _canonical_signature(reference_defender),
+                    "score_delta": float(selected_score - reference_score),
+                    "metrics": _metrics_rows(reference_metrics),
+                },
             }
             archive.setdefault("rounds", []).append(round_summary)
 
@@ -3528,6 +3789,9 @@ def run_continuous_experiment(
                 attacker_signature=attacker_signature,
                 defender_log=defender_log,
                 attacker_log=attacker_log,
+                reference_score=reference_score,
+                reference_signature=reference_signature,
+                reference_metrics=reference_metrics,
             )
             (round_dir / "round-report.md").write_text(round_report, encoding="utf-8")
 
@@ -3538,6 +3802,8 @@ def run_continuous_experiment(
             last_attacker_score = attack_adv
             last_defender_signature = defender_signature
             last_attacker_signature = attacker_signature
+            last_reference_score = reference_score
+            last_reference_signature = reference_signature
             last_round_dir = round_dir
 
             print(
@@ -3582,6 +3848,19 @@ def run_continuous_experiment(
                 "signature": last_defender_signature,
                 "attacker_score": last_attacker_score,
                 "attacker_signature": last_attacker_signature,
+                "reference_score": (
+                    float(last_reference_score)
+                    if math.isfinite(float(last_reference_score))
+                    else None
+                ),
+                "reference_signature": (
+                    str(last_reference_signature) if str(last_reference_signature) else None
+                ),
+                "score_delta_vs_reference": (
+                    float(last_defender_score - last_reference_score)
+                    if math.isfinite(float(last_reference_score))
+                    else None
+                ),
                 "round_dir": str(last_round_dir) if last_round_dir else None,
             },
             "views": view_paths,
@@ -3669,6 +3948,49 @@ def run_continuous_experiment(
             report_lines.append(f"- round dir: `{last_round_dir}`")
         report_lines.append(f"- defender signature: `{last_defender_signature}`")
         report_lines.append(f"- attacker signature: `{last_attacker_signature}`")
+        if math.isfinite(float(last_reference_score)):
+            report_lines.append(f"- reference signature: `{last_reference_signature}`")
+            report_lines.append(
+                "- defender delta vs reference: `{delta:+.6f}`".format(
+                    delta=float(last_defender_score - last_reference_score),
+                )
+            )
+
+        best_defender_entry = archive.get("defender_elites", [])[:1]
+        reference_row = _baseline_row_by_name(baseline_rows, name="reference-full")
+        latest_round_summary = archive.get("rounds", [])[-1] if archive.get("rounds") else {}
+        latest_reference_metrics_rows: Optional[Sequence[Dict[str, Any]]] = None
+        if isinstance(latest_round_summary, dict):
+            anchor_payload = latest_round_summary.get("reference_anchor", {})
+            if isinstance(anchor_payload, dict):
+                metrics_rows = anchor_payload.get("metrics", [])
+                if isinstance(metrics_rows, list) and metrics_rows:
+                    latest_reference_metrics_rows = metrics_rows
+        if best_defender_entry:
+            report_lines.append("")
+            report_lines.append("## Paper Priorities")
+            findings = _pcpl_improvement_findings(
+                metrics_rows=list(best_defender_entry[0].get("metrics", [])),
+                reference_metrics_rows=(
+                    latest_reference_metrics_rows
+                    if latest_reference_metrics_rows is not None
+                    else (
+                        list(reference_row.get("metrics", []))
+                        if isinstance(reference_row, dict)
+                        else None
+                    )
+                ),
+            )
+            for item in findings[:5]:
+                report_lines.append(
+                    "- {label}: weakness={weakness:.4f}, current={current:.4f}, delta_vs_reference={delta:+.4f}. {recommendation}".format(
+                        label=str(item["label"]),
+                        weakness=float(item["weakness"]),
+                        current=float(item["current"]),
+                        delta=float(item["delta_vs_reference"]),
+                        recommendation=str(item["recommendation"]),
+                    )
+                )
 
         report_path = out_dir / "report.md"
         report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
@@ -3682,6 +4004,14 @@ def run_continuous_experiment(
             "best_signature": last_defender_signature,
             "best_attacker_score": last_attacker_score,
             "best_attacker_signature": last_attacker_signature,
+            "reference_score": (
+                float(last_reference_score)
+                if math.isfinite(float(last_reference_score))
+                else None
+            ),
+            "reference_signature": (
+                str(last_reference_signature) if str(last_reference_signature) else None
+            ),
             "rounds_completed": len(archive.get("rounds", [])),
             "resource_plan": resource_plan.to_dict(),
             "predictive_profile": predictive_profile,
