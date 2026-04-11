@@ -1426,6 +1426,96 @@ def _evaluate_pending_dedup_cache_parallel(
     return stats
 
 
+def _replace_genome_contents(target: GFSLGenome, source: GFSLGenome) -> None:
+    target.genome_type = str(source.genome_type)
+    target.instructions = [instruction.copy() for instruction in source.instructions]
+    target.outputs = [
+        (int(cat), int(dtype), int(idx))
+        for cat, dtype, idx in source.outputs
+    ]
+    target.validator = copy.deepcopy(source.validator)
+    target.instruction_activity = copy.deepcopy(source.instruction_activity)
+    target.fitness = None
+    _invalidate_genome_caches(target)
+    for attr in ("_pcpl_metrics", "_attack_metrics"):
+        if hasattr(target, attr):
+            delattr(target, attr)
+    if hasattr(source, "_pcpl_scaffold_injected"):
+        target._pcpl_scaffold_injected = bool(getattr(source, "_pcpl_scaffold_injected"))  # type: ignore[attr-defined]
+    elif hasattr(target, "_pcpl_scaffold_injected"):
+        delattr(target, "_pcpl_scaffold_injected")
+
+
+def _rebalance_pending_parallelism(
+    *,
+    pending: Sequence[Tuple[int, GFSLGenome]],
+    workers: int,
+    io_initializer,
+    mutate_fn,
+    random_genome_fn=None,
+) -> int:
+    """Mutate/replace duplicate genomes so unique eval tasks can saturate worker pool."""
+    total = len(pending)
+    if total <= 1 or workers <= 1:
+        return 0
+    desired_unique = min(total, max(2, int(math.ceil(float(workers) * 1.05))))
+
+    by_sig: Dict[str, List[GFSLGenome]] = {}
+    for _, genome in pending:
+        signature = _evaluation_signature(genome)
+        by_sig.setdefault(signature, []).append(genome)
+
+    seen = set(by_sig.keys())
+    if len(seen) >= desired_unique:
+        return 0
+
+    duplicates: List[GFSLGenome] = []
+    for genomes in by_sig.values():
+        if len(genomes) > 1:
+            duplicates.extend(genomes[1:])
+    if not duplicates:
+        return 0
+    random.shuffle(duplicates)
+
+    changed = 0
+    for genome in duplicates:
+        if len(seen) >= desired_unique:
+            break
+        accepted = False
+        for _ in range(10):
+            try:
+                candidate = mutate_fn(genome)
+                io_initializer(candidate)
+                signature = _evaluation_signature(candidate)
+                if signature in seen:
+                    continue
+                _replace_genome_contents(genome, candidate)
+                seen.add(signature)
+                changed += 1
+                accepted = True
+                break
+            except Exception:
+                continue
+        if accepted:
+            continue
+        if random_genome_fn is None:
+            continue
+        for _ in range(4):
+            try:
+                candidate = random_genome_fn()
+                io_initializer(candidate)
+                signature = _evaluation_signature(candidate)
+                if signature in seen:
+                    continue
+                _replace_genome_contents(genome, candidate)
+                seen.add(signature)
+                changed += 1
+                break
+            except Exception:
+                continue
+    return changed
+
+
 def _rank_with_novelty(
     genomes: Sequence[GFSLGenome],
     *,
@@ -2301,11 +2391,11 @@ def _build_round_report(
 
     lines.append("## Defender Evolution")
     lines.append("")
-    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe | q-thr | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | t(s) | stop |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
+    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe | q-thr | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | reb | t(s) | stop |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
     for row in defender_log:
         lines.append(
-            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {qthr:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {secs:.2f} | {stop_reason} |".format(
+            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {qthr:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {reb} | {secs:.2f} | {stop_reason} |".format(
                 generation=row["generation"],
                 best_score=row["best_score"],
                 principle=row["principle"],
@@ -2327,6 +2417,7 @@ def _build_round_report(
                 uniq=int(row.get("eval_unique", 0)),
                 cache=int(row.get("cache_hits", 0)),
                 dup=int(row.get("dup_reuse", 0)),
+                reb=int(row.get("parallel_rebalanced", 0)),
                 secs=float(row.get("batch_seconds", 0.0)),
                 stop_reason=str(row.get("stop_reason", "")),
             )
@@ -2334,11 +2425,11 @@ def _build_round_report(
     lines.append("")
     lines.append("## Attacker Evolution")
     lines.append("")
-    lines.append("| gen | attack_score | lane_success | token_success | attacker_adv | q frac/keep | m frac/keep | key var | probe | q-thr | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | t(s) | stop |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
+    lines.append("| gen | attack_score | lane_success | token_success | attacker_adv | q frac/keep | m frac/keep | key var | probe | q-thr | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | reb | t(s) | stop |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
     for row in attacker_log:
         lines.append(
-            "| {generation} | {attack_score:.4f} | {lane_success:.4f} | {token_success:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {qthr:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {secs:.2f} | {stop_reason} |".format(
+            "| {generation} | {attack_score:.4f} | {lane_success:.4f} | {token_success:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {qthr:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {reb} | {secs:.2f} | {stop_reason} |".format(
                 generation=row["generation"],
                 attack_score=row["attack_score"],
                 lane_success=row["lane_success"],
@@ -2358,6 +2449,7 @@ def _build_round_report(
                 uniq=int(row.get("eval_unique", 0)),
                 cache=int(row.get("cache_hits", 0)),
                 dup=int(row.get("dup_reuse", 0)),
+                reb=int(row.get("parallel_rebalanced", 0)),
                 secs=float(row.get("batch_seconds", 0.0)),
                 stop_reason=str(row.get("stop_reason", "")),
             )
@@ -2877,11 +2969,12 @@ def _run_defender_round(
             "eval_unique": int(stage_stats.get("eval_unique", 0.0)),
             "cache_hits": int(stage_stats.get("cache_hits", 0.0)),
             "dup_reuse": int(stage_stats.get("dup_reuse", 0.0)),
+            "parallel_rebalanced": int(stage_stats.get("parallel_rebalanced", 0.0)),
             "batch_seconds": float(stage_stats.get("batch_seconds", 0.0)),
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} t={secs:.2f}s".format(
+            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 security=row["security"],
@@ -2901,6 +2994,7 @@ def _run_defender_round(
                 uniq=row["eval_unique"],
                 cache=row["cache_hits"],
                 dup=row["dup_reuse"],
+                reb=row["parallel_rebalanced"],
                 secs=row["batch_seconds"],
             )
         )
@@ -2946,11 +3040,23 @@ def _run_defender_round(
             "eval_unique": 0.0,
             "cache_hits": 0.0,
             "dup_reuse": 0.0,
+            "parallel_rebalanced": 0.0,
             "quick_throttle": 1.0,
             "target_batch_seconds": float(config.target_generation_seconds),
             "batch_seconds": 0.0,
         }
         batch_controller_state = controller.to_dict()
+        rebalanced = _rebalance_pending_parallelism(
+            pending=pending,
+            workers=resource_plan.parallel_workers,
+            io_initializer=ensure_genome_io,
+            mutate_fn=lambda genome: evolver.mutate(copy.deepcopy(genome)),
+            random_genome_fn=lambda: _make_random_genome(
+                max(4, int(math.ceil(float(config.initial_instructions) * 0.80)))
+            ),
+        )
+        if rebalanced > 0:
+            local_stage["parallel_rebalanced"] = float(rebalanced)
 
         if config.statistical_predictive and config.auto_statistical_tuning:
             # Preemptively tighten staged load when pending genomes outnumber workers.
@@ -3431,11 +3537,12 @@ def _run_attacker_round(
             "eval_unique": int(stage_stats.get("eval_unique", 0.0)),
             "cache_hits": int(stage_stats.get("cache_hits", 0.0)),
             "dup_reuse": int(stage_stats.get("dup_reuse", 0.0)),
+            "parallel_rebalanced": int(stage_stats.get("parallel_rebalanced", 0.0)),
             "batch_seconds": float(stage_stats.get("batch_seconds", 0.0)),
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} t={secs:.2f}s".format(
+            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 lane=row["lane_success"],
@@ -3454,6 +3561,7 @@ def _run_attacker_round(
                 uniq=row["eval_unique"],
                 cache=row["cache_hits"],
                 dup=row["dup_reuse"],
+                reb=row["parallel_rebalanced"],
                 secs=row["batch_seconds"],
             )
         )
@@ -3499,11 +3607,23 @@ def _run_attacker_round(
             "eval_unique": 0.0,
             "cache_hits": 0.0,
             "dup_reuse": 0.0,
+            "parallel_rebalanced": 0.0,
             "quick_throttle": 1.0,
             "target_batch_seconds": float(config.target_generation_seconds),
             "batch_seconds": 0.0,
         }
         batch_controller_state = controller.to_dict()
+        rebalanced = _rebalance_pending_parallelism(
+            pending=pending,
+            workers=resource_plan.parallel_workers,
+            io_initializer=ensure_attacker_genome_io,
+            mutate_fn=lambda genome: evolver.mutate(copy.deepcopy(genome)),
+            random_genome_fn=lambda: _make_random_genome(
+                max(4, int(math.ceil(float(max(4, config.initial_instructions // 2)) * 0.85)))
+            ),
+        )
+        if rebalanced > 0:
+            local_stage["parallel_rebalanced"] = float(rebalanced)
 
         if config.statistical_predictive and config.auto_statistical_tuning:
             pressure = float(len(pending)) / float(max(1, resource_plan.parallel_workers))
@@ -3890,7 +4010,7 @@ def run_continuous_experiment(
             torch=resource_plan.torch_available,
         )
     )
-    shared_executor = _create_shared_executor(resource_plan)
+    shared_executor: Optional[concurrent.futures.Executor] = None
 
     try:
         random.seed(config.seed)
@@ -3916,6 +4036,10 @@ def run_continuous_experiment(
             round_index = start_round + offset
             round_dir = rounds_dir / f"round-{round_index:04d}"
             round_dir.mkdir(parents=True, exist_ok=True)
+            if resource_plan.parallel_backend != "off" and resource_plan.parallel_workers > 1:
+                if shared_executor is not None:
+                    _shutdown_shared_executor(shared_executor)
+                shared_executor = _create_shared_executor(resource_plan)
 
             # Defender evolution under current strongest attacker.
             defender_evolver, defender_log = _run_defender_round(
