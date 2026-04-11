@@ -750,7 +750,7 @@ def _resolve_resource_plan(config: ExperimentConfig, max_population: int) -> Res
     workers = int(config.parallel_workers)
     if workers <= 0:
         workers = cpu_count
-    workers = max(1, min(workers, max(1, max_population)))
+    workers = max(1, min(workers, cpu_count))
 
     requested_backend = str(config.parallel_backend).lower()
     if requested_backend not in {"auto", "process", "thread", "off"}:
@@ -1589,7 +1589,15 @@ def _evaluate_pending_parallel(
     )
     if use_batch_chunks:
         batch_worker = _defender_eval_worker_batch if worker_fn is _defender_eval_worker else _attacker_eval_worker_batch
-        batch_size = max(4, int(math.ceil(len(tasks) / float(max(1, workers)))))
+        if workers >= 24:
+            min_batch = 1
+        elif workers >= 12:
+            min_batch = 2
+        elif workers >= 6:
+            min_batch = 3
+        else:
+            min_batch = 4
+        batch_size = max(min_batch, int(math.ceil(len(tasks) / float(max(1, workers)))))
         batch_size = min(32, batch_size)
         task_chunks = [tasks[pos : pos + batch_size] for pos in range(0, len(tasks), batch_size)]
         if worker_fn is _defender_eval_worker:
@@ -2798,10 +2806,17 @@ def _run_defender_round(
             archive_signatures=archive_signatures,
             novelty_bonus=config.novelty_bonus,
         )
+        quick_min_keep = max(
+            2,
+            min(
+                len(ranked_quick),
+                int(math.ceil(max(2, resource_plan.parallel_workers) * 0.85)),
+            ),
+        )
         keep_quick_n = _stage_keep_count(
             len(ranked_quick),
             float(controller.quick_keep_ratio),
-            min_keep=2,
+            min_keep=quick_min_keep,
         )
         keep_quick_ids = {
             id(item[1]) for item in ranked_quick[: min(len(ranked_quick), keep_quick_n)]
@@ -2873,10 +2888,17 @@ def _run_defender_round(
             archive_signatures=archive_signatures,
             novelty_bonus=max(0.0, 0.5 * config.novelty_bonus),
         )
+        mid_min_keep = max(
+            1,
+            min(
+                len(ranked_mid),
+                int(math.ceil(max(1, resource_plan.parallel_workers) * 0.55)),
+            ),
+        )
         keep_mid_n = _stage_keep_count(
             len(ranked_mid),
             float(controller.mid_keep_ratio),
-            min_keep=1,
+            min_keep=mid_min_keep,
         )
         keep_mid_ids = {
             id(item[1]) for item in ranked_mid[: min(len(ranked_mid), keep_mid_n)]
@@ -3319,10 +3341,17 @@ def _run_attacker_round(
             archive_signatures=archive_signatures,
             novelty_bonus=config.novelty_bonus,
         )
+        quick_min_keep = max(
+            2,
+            min(
+                len(ranked_quick),
+                int(math.ceil(max(2, resource_plan.parallel_workers) * 0.85)),
+            ),
+        )
         keep_quick_n = _stage_keep_count(
             len(ranked_quick),
             float(controller.quick_keep_ratio),
-            min_keep=2,
+            min_keep=quick_min_keep,
         )
         keep_quick_ids = {
             id(item[1]) for item in ranked_quick[: min(len(ranked_quick), keep_quick_n)]
@@ -3393,10 +3422,17 @@ def _run_attacker_round(
             archive_signatures=archive_signatures,
             novelty_bonus=max(0.0, 0.5 * config.novelty_bonus),
         )
+        mid_min_keep = max(
+            1,
+            min(
+                len(ranked_mid),
+                int(math.ceil(max(1, resource_plan.parallel_workers) * 0.55)),
+            ),
+        )
         keep_mid_n = _stage_keep_count(
             len(ranked_mid),
             float(controller.mid_keep_ratio),
-            min_keep=1,
+            min_keep=mid_min_keep,
         )
         keep_mid_ids = {
             id(item[1]) for item in ranked_mid[: min(len(ranked_mid), keep_mid_n)]

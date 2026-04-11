@@ -287,8 +287,19 @@ def _resolve_continuous_lane_plan(
 
     # Keep parallel lanes wide enough to saturate CPUs inside each experiment lane.
     if backend == "process":
-        min_workers_per_lane = 4 if total_workers >= 8 else 2
-        max_lanes = 8
+        # Prefer wider process lanes to avoid tiny 4-worker islands on high-core hosts.
+        if total_workers >= 24:
+            min_workers_per_lane = 8
+            max_lanes = 3
+        elif total_workers >= 12:
+            min_workers_per_lane = 6
+            max_lanes = 3
+        elif total_workers >= 8:
+            min_workers_per_lane = 4
+            max_lanes = 2
+        else:
+            min_workers_per_lane = 2
+            max_lanes = 2
     else:
         min_workers_per_lane = 3 if total_workers >= 6 else 2
         max_lanes = 12
