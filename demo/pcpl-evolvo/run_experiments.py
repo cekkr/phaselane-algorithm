@@ -234,6 +234,7 @@ def _build_experiment_config(
         parallel_workers=workers,
         parallel_backend=args.parallel_backend,
         use_supervised_guide=bool(args.use_supervised_guide),
+        supervised_end_round_only=bool(args.supervised_end_round_only),
         preferred_device=args.device,
         parent_pool_ratio=args.parent_pool_ratio if parent_pool_ratio is None else float(parent_pool_ratio),
         stagnation_patience=args.stagnation_patience if stagnation_patience is None else int(stagnation_patience),
@@ -368,6 +369,14 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
     resolved["use_supervised_guide"] = bool(defaults["use_supervised_guide"]) and not bool(
         args.no_supervised_guide
     )
+    if args.supervised_end_round_only is None:
+        resolved["supervised_end_round_only"] = bool(
+            defaults.get("supervised_end_round_only", False)
+        )
+    else:
+        resolved["supervised_end_round_only"] = bool(args.supervised_end_round_only)
+    if not resolved["use_supervised_guide"]:
+        resolved["supervised_end_round_only"] = False
     resolved["statistical_predictive"] = bool(defaults["statistical_predictive"]) and not bool(
         args.no_statistical_predictive
     )
@@ -416,6 +425,11 @@ def _apply_runtime_config(args: argparse.Namespace, resolved: Dict[str, Any]) ->
     ):
         setattr(args, key, resolved[key])
     setattr(args, "use_supervised_guide", bool(resolved["use_supervised_guide"]))
+    setattr(
+        args,
+        "supervised_end_round_only",
+        bool(resolved["supervised_end_round_only"]),
+    )
     setattr(args, "statistical_predictive", bool(resolved["statistical_predictive"]))
     setattr(args, "auto_statistical_tuning", bool(resolved["auto_statistical_tuning"]))
     setattr(args, "resume", bool(resolved["resume"]))
@@ -460,6 +474,14 @@ def _print_effective_config(resolved: Dict[str, Any]) -> None:
             pen=float(resolved["predictive_penalty"]),
         )
     )
+    supervised_mode = "disabled"
+    if bool(resolved["use_supervised_guide"]):
+        supervised_mode = (
+            "end-round-only"
+            if bool(resolved["supervised_end_round_only"])
+            else "per-generation"
+        )
+    print(f"[pcpl-evolvo] supervised guide: {supervised_mode}")
     print(
         "[pcpl-evolvo] runtime target_gen_s={target:.2f} eval_cache={cache}".format(
             target=float(resolved["target_generation_seconds"]),
@@ -637,6 +659,20 @@ def parse_args() -> argparse.Namespace:
         "--no-supervised-guide",
         action="store_true",
         help="Disable optional supervised guide acceleration.",
+    )
+    supervised_group = parser.add_mutually_exclusive_group()
+    supervised_group.add_argument(
+        "--supervised-end-round-only",
+        dest="supervised_end_round_only",
+        action="store_true",
+        default=None,
+        help="Train supervised guide only once per round (after all generations).",
+    )
+    supervised_group.add_argument(
+        "--no-supervised-end-round-only",
+        dest="supervised_end_round_only",
+        action="store_false",
+        help="Use supervised guide each generation (higher overhead).",
     )
     parser.add_argument(
         "--device",

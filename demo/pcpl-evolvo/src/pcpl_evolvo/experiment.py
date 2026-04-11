@@ -53,6 +53,7 @@ class ExperimentConfig:
     parallel_workers: int = 0
     parallel_backend: str = "auto"  # auto|process|thread|off
     use_supervised_guide: bool = True
+    supervised_end_round_only: bool = True
     preferred_device: str = "auto"  # auto|cpu|cuda|mps
     parent_pool_ratio: float = 0.60
     stagnation_patience: int = 4
@@ -151,11 +152,12 @@ class PredictiveStageController:
             auto_tune=bool(config.auto_statistical_tuning),
         )
         if str(config.profile).lower() == "full":
-            controller.quick_cycle_fraction = min(controller.quick_cycle_fraction, 0.10)
-            controller.mid_cycle_fraction = min(controller.mid_cycle_fraction, 0.45)
-            controller.quick_keep_ratio = min(controller.quick_keep_ratio, 0.35)
-            controller.mid_keep_ratio = min(controller.mid_keep_ratio, 0.20)
-            controller.key_variant_count = min(controller.key_variant_count, 3)
+            # Full-profile runs should preserve high parallel load and diversity by default.
+            controller.quick_cycle_fraction = min(controller.quick_cycle_fraction, 0.08)
+            controller.mid_cycle_fraction = min(controller.mid_cycle_fraction, 0.30)
+            controller.quick_keep_ratio = max(controller.quick_keep_ratio, 0.52)
+            controller.mid_keep_ratio = max(controller.mid_keep_ratio, 0.28)
+            controller.key_variant_count = max(controller.key_variant_count, 4)
         controller.clamp()
         return controller
 
@@ -167,9 +169,9 @@ class PredictiveStageController:
             0.18,
             0.95,
         )
-        self.quick_keep_ratio = clamp(self.quick_keep_ratio, 0.20, 0.92)
-        self.mid_keep_ratio = clamp(self.mid_keep_ratio, 0.08, 0.80)
-        self.mid_keep_ratio = min(self.mid_keep_ratio, max(0.08, self.quick_keep_ratio - 0.03))
+        self.quick_keep_ratio = clamp(self.quick_keep_ratio, 0.24, 0.92)
+        self.mid_keep_ratio = clamp(self.mid_keep_ratio, 0.12, 0.80)
+        self.mid_keep_ratio = min(self.mid_keep_ratio, max(0.12, self.quick_keep_ratio - 0.03))
         self.key_variant_count = max(1, min(6, int(self.key_variant_count)))
 
     def apply_feedback(self, stats: Dict[str, float]) -> None:
@@ -192,12 +194,16 @@ class PredictiveStageController:
         target_seconds = max(0.5, float(stats.get("target_batch_seconds", 3.0)))
         workers = max(1.0, float(stats.get("workers", 1.0)))
         full_eval = max(0.0, float(stats.get("full_eval", 0.0)))
+        eval_unique = max(0.0, float(stats.get("eval_unique", 0.0)))
 
         over_budget = batch_seconds > target_seconds
         underutilized = (
             batch_seconds > 0.0
             and batch_seconds < (0.72 * target_seconds)
-            and full_eval < (0.85 * workers)
+            and (
+                full_eval < (0.90 * workers)
+                or eval_unique < (1.20 * workers)
+            )
         )
 
         # Enforce staged selectivity: if a stage keeps almost everyone, tighten it.
@@ -222,10 +228,10 @@ class PredictiveStageController:
 
         if underutilized:
             # Keep CPU lanes fed when batches complete too quickly with too few finalists.
-            self.quick_keep_ratio += 0.07
-            self.mid_keep_ratio += 0.06
-            self.quick_cycle_fraction += 0.03
-            self.mid_cycle_fraction += 0.04
+            self.quick_keep_ratio += 0.11
+            self.mid_keep_ratio += 0.10
+            self.quick_cycle_fraction += 0.04
+            self.mid_cycle_fraction += 0.05
             self.key_variant_count += 1
 
         if probe_win_rate > 0.20:
@@ -253,8 +259,8 @@ class PredictiveStageController:
 
         if batch_seconds > 0.0 and batch_seconds < (0.55 * target_seconds) and novelty > 0.20:
             # If we're comfortably below budget, allow a bit more exploration depth.
-            self.quick_cycle_fraction += 0.01
-            self.mid_cycle_fraction += 0.01
+            self.quick_cycle_fraction += 0.02
+            self.mid_cycle_fraction += 0.02
 
         self.clamp()
 
@@ -378,15 +384,22 @@ class TorchRuntimeTuner:
         target = max(0.25, float(stats.get("target_batch_seconds", 1.0)))
         batch_seconds = max(0.0, float(stats.get("batch_seconds", 0.0)))
         full_eval = max(0.0, float(stats.get("full_eval", 0.0)))
-        underutilized = batch_seconds < (0.72 * target) and full_eval < (0.85 * workers)
+        eval_unique = max(0.0, float(stats.get("eval_unique", 0.0)))
+        underutilized = (
+            batch_seconds < (0.72 * target)
+            and (
+                full_eval < (0.90 * workers)
+                or eval_unique < (1.20 * workers)
+            )
+        )
         overbudget = batch_seconds > (1.08 * target)
 
         population = float(stats.get("population", 1.0))
         quick_eval = float(stats.get("quick_eval", 0.0))
         mid_eval = float(stats.get("mid_eval", 0.0))
-        eval_unique = max(1.0, float(stats.get("eval_unique", 0.0)))
+        eval_unique_safe = max(1.0, eval_unique)
         cache_dup = float(stats.get("cache_hits", 0.0)) + float(stats.get("dup_reuse", 0.0))
-        reuse_ratio = cache_dup / eval_unique
+        reuse_ratio = cache_dup / eval_unique_safe
         probe_win_rate = float(stats.get("probe_win_rate", 0.0))
 
         base_qf = float(controller.quick_cycle_fraction)
@@ -407,9 +420,9 @@ class TorchRuntimeTuner:
         def clamp_candidate(qf: float, mf: float, qk: float, mk: float, kv: int) -> Tuple[float, float, float, float, int]:
             qf = clamp(qf, 0.05, 0.65)
             mf = clamp(max(mf, qf + 0.12), 0.18, 0.95)
-            qk = clamp(qk, 0.20, 0.92)
-            mk = clamp(mk, 0.08, 0.80)
-            mk = min(mk, max(0.08, qk - 0.03))
+            qk = clamp(qk, 0.24, 0.92)
+            mk = clamp(mk, 0.12, 0.80)
+            mk = min(mk, max(0.12, qk - 0.03))
             kv = max(1, min(6, int(kv)))
             return float(qf), float(mf), float(qk), float(mk), int(kv)
 
@@ -451,8 +464,8 @@ class TorchRuntimeTuner:
             load_gain = load - base_load
             objective = abs(pred_ratio - 1.0)
             if underutilized:
-                objective += 0.28 * max(0.0, -load_gain)
-                objective -= 0.12 * max(0.0, load_gain)
+                objective += 0.38 * max(0.0, -load_gain)
+                objective -= 0.22 * max(0.0, load_gain)
             if overbudget:
                 objective += 0.22 * max(0.0, load_gain)
                 objective -= 0.08 * max(0.0, -load_gain)
@@ -947,6 +960,69 @@ class SafeGFSLEvolver(GFSLEvolver):
             self.population = new_population[: self.population_size]
 
 
+def _runtime_underutilization_boost(
+    *,
+    controller: PredictiveStageController,
+    evolver: SafeGFSLEvolver,
+    stage_stats: Dict[str, float],
+) -> float:
+    """Raise exploration and mutation when effective parallel utilization collapses."""
+    workers = max(1.0, float(stage_stats.get("workers", 1.0)))
+    target = max(0.25, float(stage_stats.get("target_batch_seconds", 1.0)))
+    batch_seconds = max(0.0, float(stage_stats.get("batch_seconds", 0.0)))
+    quick_eval = max(0.0, float(stage_stats.get("quick_eval", 0.0)))
+    full_eval = max(0.0, float(stage_stats.get("full_eval", 0.0)))
+    eval_unique = max(0.0, float(stage_stats.get("eval_unique", 0.0)))
+    cache_dup = float(stage_stats.get("cache_hits", 0.0)) + float(stage_stats.get("dup_reuse", 0.0))
+    reuse_ratio = cache_dup / max(1.0, eval_unique)
+
+    underutilized = (
+        batch_seconds > 0.0
+        and batch_seconds < (0.74 * target)
+        and (
+            full_eval < (0.90 * workers)
+            or eval_unique < (1.20 * workers)
+            or quick_eval < (1.35 * workers)
+        )
+    )
+    repetitive = reuse_ratio >= 1.0 and eval_unique < (1.25 * workers)
+    if not underutilized and not repetitive:
+        return 0.0
+
+    full_gap = max(0.0, ((0.95 * workers) - full_eval) / max(1.0, 0.95 * workers))
+    unique_gap = max(0.0, ((1.20 * workers) - eval_unique) / max(1.0, 1.20 * workers))
+    quick_gap = max(0.0, ((1.35 * workers) - quick_eval) / max(1.0, 1.35 * workers))
+    boost = clamp(
+        0.22 + (0.78 * max(full_gap, unique_gap, quick_gap)) + (0.20 if repetitive else 0.0),
+        0.12,
+        1.0,
+    )
+
+    controller.quick_keep_ratio += 0.08 * boost
+    controller.mid_keep_ratio += 0.07 * boost
+    controller.quick_cycle_fraction += 0.03 * boost
+    controller.mid_cycle_fraction += 0.04 * boost
+    if boost >= 0.30:
+        controller.key_variant_count += 1
+    controller.clamp()
+
+    mutation_bump = max(0.02, (0.80 * float(evolver.mutation_step))) + (0.04 * boost)
+    evolver.mutation_rate = min(
+        float(evolver.mutation_ceiling),
+        max(float(evolver.mutation_floor), float(evolver.mutation_rate) + mutation_bump),
+    )
+    if boost >= 0.65:
+        evolver.stagnation_count = max(
+            int(evolver.stagnation_count),
+            int(evolver.stagnation_patience),
+        )
+        evolver.signature_stagnation_count = max(
+            int(evolver.signature_stagnation_count),
+            int(evolver.stagnation_patience),
+        )
+    return float(boost)
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1226,6 +1302,50 @@ def _stage_keep_count(total: int, ratio: float, *, min_keep: int) -> int:
     return max(1, keep)
 
 
+def _full_stage_fraction(mid_cycle_fraction: float) -> float:
+    """Full stage can stay below 100% because robust full checks happen at round selection."""
+    return clamp(float(mid_cycle_fraction) + 0.10, 0.35, 0.70)
+
+
+def _enforce_parallel_load_floor(
+    *,
+    controller: PredictiveStageController,
+    population: int,
+    workers: int,
+) -> bool:
+    """Ensure staged keep ratios can feed most workers with unique finalists."""
+    total = max(0, int(population))
+    lanes = max(1, int(workers))
+    if total <= 1 or lanes <= 1:
+        return False
+
+    desired_full = max(2.0, min(float(total), float(lanes) * 0.95))
+    expected_full = (
+        float(total)
+        * float(controller.quick_keep_ratio)
+        * float(controller.mid_keep_ratio)
+    )
+    if expected_full >= desired_full:
+        return False
+
+    target_product = desired_full / max(1.0, float(total))
+    current_product = max(
+        1e-6,
+        float(controller.quick_keep_ratio) * float(controller.mid_keep_ratio),
+    )
+    scale = min(2.6, max(1.0, math.sqrt(target_product / current_product)))
+    if scale <= 1.01:
+        return False
+
+    controller.quick_keep_ratio *= scale
+    controller.mid_keep_ratio *= scale
+    controller.quick_cycle_fraction += 0.01 * min(1.0, scale - 1.0)
+    controller.mid_cycle_fraction += 0.015 * min(1.0, scale - 1.0)
+    controller.key_variant_count += 1
+    controller.clamp()
+    return True
+
+
 def _quick_eval_limit(
     *,
     total: int,
@@ -1323,7 +1443,7 @@ def _throttle_quick_pending_from_previous_stats(
     if reuse_ratio >= 1.30 and uniqueness_ratio <= 0.45:
         throttle = 0.50
 
-    min_keep = max(4, min(len(selected), int(math.ceil(max(1, int(workers)) * 1.20))))
+    min_keep = max(4, min(len(selected), int(math.ceil(max(1, int(workers)) * 1.50))))
     target = max(min_keep, int(math.ceil(float(len(selected)) * throttle)))
     if target >= len(selected):
         return selected, skipped, 1.0
@@ -1458,7 +1578,10 @@ def _rebalance_pending_parallelism(
     total = len(pending)
     if total <= 1 or workers <= 1:
         return 0
-    desired_unique = min(total, max(2, int(math.ceil(float(workers) * 1.05))))
+    target_ratio = 1.35
+    if total >= int(math.ceil(float(workers) * 2.0)):
+        target_ratio = 1.60
+    desired_unique = min(total, max(2, int(math.ceil(float(workers) * target_ratio))))
 
     by_sig: Dict[str, List[GFSLGenome]] = {}
     for _, genome in pending:
@@ -2855,9 +2978,10 @@ def _run_defender_round(
     attacker: Optional[GFSLGenome],
 ) -> Tuple[SafeGFSLEvolver, List[Dict[str, Any]]]:
     guide = _build_supervised_guide_if_available(config, resource_plan)
+    evolver_guide = None if bool(config.supervised_end_round_only) else guide
     evolver = SafeGFSLEvolver(
         population_size=config.population_size,
-        supervised_guide=guide,
+        supervised_guide=evolver_guide,
         parent_pool_ratio=config.parent_pool_ratio,
         stagnation_patience=config.stagnation_patience,
         mutation_floor=config.mutation_floor,
@@ -2906,7 +3030,7 @@ def _run_defender_round(
             key_variants = min(3, max(1, controller.key_variant_count))
             complexity = "mid"
         else:
-            frac = min(1.0, max(0.50, controller.mid_cycle_fraction + 0.08))
+            frac = _full_stage_fraction(controller.mid_cycle_fraction)
             key_variants = max(1, controller.key_variant_count)
             complexity = "hard"
         stage_scenarios = _build_stage_scenarios(
@@ -2970,11 +3094,13 @@ def _run_defender_round(
             "cache_hits": int(stage_stats.get("cache_hits", 0.0)),
             "dup_reuse": int(stage_stats.get("dup_reuse", 0.0)),
             "parallel_rebalanced": int(stage_stats.get("parallel_rebalanced", 0.0)),
+            "underutilization_boost": float(stage_stats.get("underutilization_boost", 0.0)),
+            "mutation_rate": float(stage_stats.get("mutation_rate", evolver.mutation_rate)),
             "batch_seconds": float(stage_stats.get("batch_seconds", 0.0)),
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} t={secs:.2f}s".format(
+            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 security=row["security"],
@@ -2995,6 +3121,8 @@ def _run_defender_round(
                 cache=row["cache_hits"],
                 dup=row["dup_reuse"],
                 reb=row["parallel_rebalanced"],
+                ub=row["underutilization_boost"],
+                mut=row["mutation_rate"],
                 secs=row["batch_seconds"],
             )
         )
@@ -3041,6 +3169,8 @@ def _run_defender_round(
             "cache_hits": 0.0,
             "dup_reuse": 0.0,
             "parallel_rebalanced": 0.0,
+            "underutilization_boost": 0.0,
+            "mutation_rate": float(evolver.mutation_rate),
             "quick_throttle": 1.0,
             "target_batch_seconds": float(config.target_generation_seconds),
             "batch_seconds": 0.0,
@@ -3070,6 +3200,11 @@ def _run_defender_round(
                 if pressure > 3.0 and controller.key_variant_count > 1:
                     controller.key_variant_count -= 1
                 controller.clamp()
+            _enforce_parallel_load_floor(
+                controller=controller,
+                population=len(pending),
+                workers=resource_plan.parallel_workers,
+            )
             batch_controller_state = controller.to_dict()
 
         if not config.statistical_predictive:
@@ -3103,6 +3238,12 @@ def _run_defender_round(
             local_stage["dup_reuse"] += float(eval_stats["dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
+            local_stage["underutilization_boost"] = _runtime_underutilization_boost(
+                controller=controller,
+                evolver=evolver,
+                stage_stats=local_stage,
+            )
+            local_stage["mutation_rate"] = float(evolver.mutation_rate)
             stage_stats.clear()
             stage_stats.update(local_stage)
             return
@@ -3211,6 +3352,12 @@ def _run_defender_round(
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
             torch_tuner.tune(controller, stats=local_stage)
+            local_stage["underutilization_boost"] = _runtime_underutilization_boost(
+                controller=controller,
+                evolver=evolver,
+                stage_stats=local_stage,
+            )
+            local_stage["mutation_rate"] = float(evolver.mutation_rate)
             stage_stats.clear()
             stage_stats.update({
                 **local_stage,
@@ -3295,6 +3442,12 @@ def _run_defender_round(
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
             torch_tuner.tune(controller, stats=local_stage)
+            local_stage["underutilization_boost"] = _runtime_underutilization_boost(
+                controller=controller,
+                evolver=evolver,
+                stage_stats=local_stage,
+            )
+            local_stage["mutation_rate"] = float(evolver.mutation_rate)
             stage_stats.clear()
             stage_stats.update({
                 **local_stage,
@@ -3385,6 +3538,12 @@ def _run_defender_round(
         torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
         controller.apply_feedback(local_stage)
         torch_tuner.tune(controller, stats=local_stage)
+        local_stage["underutilization_boost"] = _runtime_underutilization_boost(
+            controller=controller,
+            evolver=evolver,
+            stage_stats=local_stage,
+        )
+        local_stage["mutation_rate"] = float(evolver.mutation_rate)
         stage_stats.clear()
         stage_stats.update({
             **local_stage,
@@ -3399,6 +3558,11 @@ def _run_defender_round(
         batch_evaluator=batch_eval,
         should_stop=should_stop,
     )
+    if guide is not None and bool(config.supervised_end_round_only):
+        try:
+            guide.observe_population(evolver.population)
+        except Exception:
+            pass
     stop_reason = getattr(evolver, "_early_stop_reason", None)
     stop_generation = getattr(evolver, "_early_stop_generation", None)
     if generation_log:
@@ -3420,9 +3584,10 @@ def _run_attacker_round(
     defender: GFSLGenome,
 ) -> Tuple[SafeGFSLEvolver, List[Dict[str, Any]]]:
     guide = _build_supervised_guide_if_available(config, resource_plan)
+    evolver_guide = None if bool(config.supervised_end_round_only) else guide
     evolver = SafeGFSLEvolver(
         population_size=config.attacker_population_size,
-        supervised_guide=guide,
+        supervised_guide=evolver_guide,
         parent_pool_ratio=config.parent_pool_ratio,
         stagnation_patience=config.stagnation_patience,
         mutation_floor=config.mutation_floor,
@@ -3470,7 +3635,7 @@ def _run_attacker_round(
             key_variants = min(3, max(1, controller.key_variant_count))
             complexity = "mid"
         else:
-            frac = min(1.0, max(0.50, controller.mid_cycle_fraction + 0.08))
+            frac = _full_stage_fraction(controller.mid_cycle_fraction)
             key_variants = max(1, controller.key_variant_count)
             complexity = "hard"
         stage_scenarios = _build_stage_scenarios(
@@ -3538,11 +3703,13 @@ def _run_attacker_round(
             "cache_hits": int(stage_stats.get("cache_hits", 0.0)),
             "dup_reuse": int(stage_stats.get("dup_reuse", 0.0)),
             "parallel_rebalanced": int(stage_stats.get("parallel_rebalanced", 0.0)),
+            "underutilization_boost": float(stage_stats.get("underutilization_boost", 0.0)),
+            "mutation_rate": float(stage_stats.get("mutation_rate", evolver.mutation_rate)),
             "batch_seconds": float(stage_stats.get("batch_seconds", 0.0)),
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} t={secs:.2f}s".format(
+            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 lane=row["lane_success"],
@@ -3562,6 +3729,8 @@ def _run_attacker_round(
                 cache=row["cache_hits"],
                 dup=row["dup_reuse"],
                 reb=row["parallel_rebalanced"],
+                ub=row["underutilization_boost"],
+                mut=row["mutation_rate"],
                 secs=row["batch_seconds"],
             )
         )
@@ -3608,6 +3777,8 @@ def _run_attacker_round(
             "cache_hits": 0.0,
             "dup_reuse": 0.0,
             "parallel_rebalanced": 0.0,
+            "underutilization_boost": 0.0,
+            "mutation_rate": float(evolver.mutation_rate),
             "quick_throttle": 1.0,
             "target_batch_seconds": float(config.target_generation_seconds),
             "batch_seconds": 0.0,
@@ -3636,6 +3807,11 @@ def _run_attacker_round(
                 if pressure > 3.0 and controller.key_variant_count > 1:
                     controller.key_variant_count -= 1
                 controller.clamp()
+            _enforce_parallel_load_floor(
+                controller=controller,
+                population=len(pending),
+                workers=resource_plan.parallel_workers,
+            )
             batch_controller_state = controller.to_dict()
 
         if not config.statistical_predictive:
@@ -3669,6 +3845,12 @@ def _run_attacker_round(
             local_stage["dup_reuse"] += float(eval_stats["dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
+            local_stage["underutilization_boost"] = _runtime_underutilization_boost(
+                controller=controller,
+                evolver=evolver,
+                stage_stats=local_stage,
+            )
+            local_stage["mutation_rate"] = float(evolver.mutation_rate)
             stage_stats.clear()
             stage_stats.update(local_stage)
             return
@@ -3776,6 +3958,12 @@ def _run_attacker_round(
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
             torch_tuner.tune(controller, stats=local_stage)
+            local_stage["underutilization_boost"] = _runtime_underutilization_boost(
+                controller=controller,
+                evolver=evolver,
+                stage_stats=local_stage,
+            )
+            local_stage["mutation_rate"] = float(evolver.mutation_rate)
             stage_stats.clear()
             stage_stats.update({
                 **local_stage,
@@ -3859,6 +4047,12 @@ def _run_attacker_round(
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
             torch_tuner.tune(controller, stats=local_stage)
+            local_stage["underutilization_boost"] = _runtime_underutilization_boost(
+                controller=controller,
+                evolver=evolver,
+                stage_stats=local_stage,
+            )
+            local_stage["mutation_rate"] = float(evolver.mutation_rate)
             stage_stats.clear()
             stage_stats.update({
                 **local_stage,
@@ -3947,6 +4141,12 @@ def _run_attacker_round(
         torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
         controller.apply_feedback(local_stage)
         torch_tuner.tune(controller, stats=local_stage)
+        local_stage["underutilization_boost"] = _runtime_underutilization_boost(
+            controller=controller,
+            evolver=evolver,
+            stage_stats=local_stage,
+        )
+        local_stage["mutation_rate"] = float(evolver.mutation_rate)
         stage_stats.clear()
         stage_stats.update({
             **local_stage,
@@ -3961,6 +4161,11 @@ def _run_attacker_round(
         batch_evaluator=batch_eval,
         should_stop=should_stop,
     )
+    if guide is not None and bool(config.supervised_end_round_only):
+        try:
+            guide.observe_population(evolver.population)
+        except Exception:
+            pass
     stop_reason = getattr(evolver, "_early_stop_reason", None)
     stop_generation = getattr(evolver, "_early_stop_generation", None)
     if generation_log:
@@ -4342,6 +4547,19 @@ def run_continuous_experiment(
                     "enabled"
                     if bool(config.statistical_predictive and config.auto_statistical_tuning)
                     else "disabled"
+                )
+            )
+        )
+        report_lines.append(
+            "- supervised guide mode: `{mode}`".format(
+                mode=(
+                    "disabled"
+                    if not bool(config.use_supervised_guide)
+                    else (
+                        "end-round-only"
+                        if bool(config.supervised_end_round_only)
+                        else "per-generation"
+                    )
                 )
             )
         )
