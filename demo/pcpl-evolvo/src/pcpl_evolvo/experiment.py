@@ -13,7 +13,7 @@ import platform
 import random
 import time
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -190,8 +190,15 @@ class PredictiveStageController:
         novelty = 0.5 * (novelty_quick + novelty_mid)
         batch_seconds = max(0.0, float(stats.get("batch_seconds", 0.0)))
         target_seconds = max(0.5, float(stats.get("target_batch_seconds", 3.0)))
+        workers = max(1.0, float(stats.get("workers", 1.0)))
+        full_eval = max(0.0, float(stats.get("full_eval", 0.0)))
 
         over_budget = batch_seconds > target_seconds
+        underutilized = (
+            batch_seconds > 0.0
+            and batch_seconds < (0.72 * target_seconds)
+            and full_eval < (0.85 * workers)
+        )
 
         # Enforce staged selectivity: if a stage keeps almost everyone, tighten it.
         if population >= 3.0 and quick_rate > 0.90:
@@ -212,6 +219,14 @@ class PredictiveStageController:
                 self.key_variant_count -= 1
             self.clamp()
             return
+
+        if underutilized:
+            # Keep CPU lanes fed when batches complete too quickly with too few finalists.
+            self.quick_keep_ratio += 0.07
+            self.mid_keep_ratio += 0.06
+            self.quick_cycle_fraction += 0.03
+            self.mid_cycle_fraction += 0.04
+            self.key_variant_count += 1
 
         if probe_win_rate > 0.20:
             self.quick_keep_ratio += 0.08
@@ -253,6 +268,232 @@ class PredictiveStageController:
             "key_variant_count": int(self.key_variant_count),
             "auto_tune": bool(self.auto_tune),
         }
+
+
+@dataclass
+class TorchRuntimeTuner:
+    """Torch-backed micro-predictor to keep staged workload near runtime target."""
+
+    enabled: bool
+    max_history: int = 128
+    history_x: List[List[float]] = field(default_factory=list)
+    history_y: List[float] = field(default_factory=list)
+    last_prediction_ratio: float = 1.0
+    last_mode: str = "neutral"
+
+    def _feature_vector(
+        self,
+        *,
+        quick_cycle_fraction: float,
+        mid_cycle_fraction: float,
+        quick_keep_ratio: float,
+        mid_keep_ratio: float,
+        key_variant_count: int,
+        population: float,
+        quick_eval: float,
+        mid_eval: float,
+        full_eval: float,
+        reuse_ratio: float,
+        probe_win_rate: float,
+        workers: float,
+    ) -> List[float]:
+        worker = max(1.0, float(workers))
+        return [
+            clamp(float(quick_cycle_fraction), 0.0, 1.0),
+            clamp(float(mid_cycle_fraction), 0.0, 1.0),
+            clamp(float(quick_keep_ratio), 0.0, 1.0),
+            clamp(float(mid_keep_ratio), 0.0, 1.0),
+            clamp(float(key_variant_count) / 6.0, 0.0, 2.0),
+            clamp(float(population) / (worker * 6.0), 0.0, 2.5),
+            clamp(float(quick_eval) / (worker * 3.0), 0.0, 2.5),
+            clamp(float(mid_eval) / (worker * 2.0), 0.0, 2.5),
+            clamp(float(full_eval) / worker, 0.0, 2.5),
+            clamp(float(reuse_ratio), 0.0, 3.0),
+            clamp(float(probe_win_rate), 0.0, 1.0),
+        ]
+
+    def observe(self, *, controller_state: Dict[str, Any], stats: Dict[str, float]) -> None:
+        if not self.enabled:
+            return
+        target = max(0.25, float(stats.get("target_batch_seconds", 1.0)))
+        ratio = clamp(float(stats.get("batch_seconds", 0.0)) / target, 0.05, 4.0)
+        eval_unique = max(1.0, float(stats.get("eval_unique", 0.0)))
+        cache_dup = float(stats.get("cache_hits", 0.0)) + float(stats.get("dup_reuse", 0.0))
+        reuse_ratio = cache_dup / eval_unique
+        features = self._feature_vector(
+            quick_cycle_fraction=float(controller_state.get("quick_cycle_fraction", 0.10)),
+            mid_cycle_fraction=float(controller_state.get("mid_cycle_fraction", 0.35)),
+            quick_keep_ratio=float(controller_state.get("quick_keep_ratio", 0.42)),
+            mid_keep_ratio=float(controller_state.get("mid_keep_ratio", 0.16)),
+            key_variant_count=int(controller_state.get("key_variant_count", 2)),
+            population=float(stats.get("population", 1.0)),
+            quick_eval=float(stats.get("quick_eval", 0.0)),
+            mid_eval=float(stats.get("mid_eval", 0.0)),
+            full_eval=float(stats.get("full_eval", 0.0)),
+            reuse_ratio=float(reuse_ratio),
+            probe_win_rate=float(stats.get("probe_win_rate", 0.0)),
+            workers=float(stats.get("workers", 1.0)),
+        )
+        self.history_x.append(features)
+        self.history_y.append(float(ratio))
+        while len(self.history_x) > self.max_history:
+            self.history_x.pop(0)
+            self.history_y.pop(0)
+
+    def _fit_coefficients(self):
+        if not self.enabled:
+            return None
+        if len(self.history_x) < 10:
+            return None
+        try:
+            import torch  # type: ignore
+
+            x = torch.tensor(self.history_x, dtype=torch.float32)
+            y = torch.tensor(self.history_y, dtype=torch.float32).unsqueeze(1)
+            ones = torch.ones((x.shape[0], 1), dtype=torch.float32)
+            design = torch.cat((x, ones), dim=1)
+            ridge = 0.06 * torch.eye(design.shape[1], dtype=torch.float32)
+            ridge[-1, -1] = 0.0
+            coeff = torch.linalg.solve(design.T @ design + ridge, design.T @ y)
+            return coeff
+        except Exception:
+            return None
+
+    def _predict_ratio(self, coeff, features: Sequence[float]) -> float:
+        try:
+            import torch  # type: ignore
+
+            row = torch.tensor([*features, 1.0], dtype=torch.float32).unsqueeze(0)
+            prediction = float((row @ coeff).squeeze().item())
+            return clamp(prediction, 0.05, 4.0)
+        except Exception:
+            return 1.0
+
+    def tune(self, controller: PredictiveStageController, *, stats: Dict[str, float]) -> None:
+        coeff = self._fit_coefficients()
+        if coeff is None:
+            return
+
+        workers = max(1.0, float(stats.get("workers", 1.0)))
+        target = max(0.25, float(stats.get("target_batch_seconds", 1.0)))
+        batch_seconds = max(0.0, float(stats.get("batch_seconds", 0.0)))
+        full_eval = max(0.0, float(stats.get("full_eval", 0.0)))
+        underutilized = batch_seconds < (0.72 * target) and full_eval < (0.85 * workers)
+        overbudget = batch_seconds > (1.08 * target)
+
+        population = float(stats.get("population", 1.0))
+        quick_eval = float(stats.get("quick_eval", 0.0))
+        mid_eval = float(stats.get("mid_eval", 0.0))
+        eval_unique = max(1.0, float(stats.get("eval_unique", 0.0)))
+        cache_dup = float(stats.get("cache_hits", 0.0)) + float(stats.get("dup_reuse", 0.0))
+        reuse_ratio = cache_dup / eval_unique
+        probe_win_rate = float(stats.get("probe_win_rate", 0.0))
+
+        base_qf = float(controller.quick_cycle_fraction)
+        base_mf = float(controller.mid_cycle_fraction)
+        base_qk = float(controller.quick_keep_ratio)
+        base_mk = float(controller.mid_keep_ratio)
+        base_kv = int(controller.key_variant_count)
+        base_load = base_qf + base_mf + base_qk + base_mk + (float(base_kv) / 6.0)
+
+        candidates = [
+            (0.00, 0.00, 0.00, 0.00, 0, "neutral"),
+            (0.03, 0.04, 0.05, 0.04, 1, "up"),
+            (0.02, 0.03, 0.03, 0.03, 0, "up-soft"),
+            (-0.02, -0.03, -0.04, -0.03, -1, "down"),
+            (-0.01, -0.02, -0.02, -0.02, 0, "down-soft"),
+        ]
+
+        def clamp_candidate(qf: float, mf: float, qk: float, mk: float, kv: int) -> Tuple[float, float, float, float, int]:
+            qf = clamp(qf, 0.05, 0.65)
+            mf = clamp(max(mf, qf + 0.12), 0.18, 0.95)
+            qk = clamp(qk, 0.20, 0.92)
+            mk = clamp(mk, 0.08, 0.80)
+            mk = min(mk, max(0.08, qk - 0.03))
+            kv = max(1, min(6, int(kv)))
+            return float(qf), float(mf), float(qk), float(mk), int(kv)
+
+        best = None
+        best_score = float("inf")
+        for dqf, dmf, dqk, dmk, dkv, mode in candidates:
+            qf, mf, qk, mk, kv = clamp_candidate(
+                base_qf + dqf,
+                base_mf + dmf,
+                base_qk + dqk,
+                base_mk + dmk,
+                base_kv + dkv,
+            )
+            qf_scale = qf / max(1e-6, base_qf)
+            qk_scale = qk / max(1e-6, base_qk)
+            mf_scale = mf / max(1e-6, base_mf)
+            mk_scale = mk / max(1e-6, base_mk)
+            kv_scale = float(kv) / float(max(1, base_kv))
+            est_quick = quick_eval * qf_scale * (0.60 + (0.40 * kv_scale))
+            est_mid = mid_eval * qk_scale * mf_scale
+            est_full = full_eval * mk_scale * (0.75 + (0.25 * kv_scale))
+
+            features = self._feature_vector(
+                quick_cycle_fraction=qf,
+                mid_cycle_fraction=mf,
+                quick_keep_ratio=qk,
+                mid_keep_ratio=mk,
+                key_variant_count=kv,
+                population=population,
+                quick_eval=est_quick,
+                mid_eval=est_mid,
+                full_eval=est_full,
+                reuse_ratio=reuse_ratio,
+                probe_win_rate=probe_win_rate,
+                workers=workers,
+            )
+            pred_ratio = self._predict_ratio(coeff, features)
+            load = qf + mf + qk + mk + (float(kv) / 6.0)
+            load_gain = load - base_load
+            objective = abs(pred_ratio - 1.0)
+            if underutilized:
+                objective += 0.28 * max(0.0, -load_gain)
+                objective -= 0.12 * max(0.0, load_gain)
+            if overbudget:
+                objective += 0.22 * max(0.0, load_gain)
+                objective -= 0.08 * max(0.0, -load_gain)
+            if objective < best_score:
+                best_score = objective
+                best = (qf, mf, qk, mk, kv, pred_ratio, mode)
+
+        if best is None:
+            return
+        qf, mf, qk, mk, kv, pred_ratio, mode = best
+        blend = 0.55
+        controller.quick_cycle_fraction = base_qf + (blend * (qf - base_qf))
+        controller.mid_cycle_fraction = base_mf + (blend * (mf - base_mf))
+        controller.quick_keep_ratio = base_qk + (blend * (qk - base_qk))
+        controller.mid_keep_ratio = base_mk + (blend * (mk - base_mk))
+        controller.key_variant_count = int(round(base_kv + (blend * float(kv - base_kv))))
+        controller.clamp()
+        self.last_prediction_ratio = float(pred_ratio)
+        self.last_mode = str(mode)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": bool(self.enabled),
+            "samples": int(len(self.history_x)),
+            "last_prediction_ratio": float(self.last_prediction_ratio),
+            "last_mode": str(self.last_mode),
+        }
+
+
+def _build_torch_runtime_tuner(
+    *,
+    config: ExperimentConfig,
+    resource_plan: ResourcePlan,
+) -> TorchRuntimeTuner:
+    enabled = bool(
+        config.statistical_predictive
+        and config.auto_statistical_tuning
+        and resource_plan.torch_available
+        and resource_plan.parallel_workers > 1
+    )
+    return TorchRuntimeTuner(enabled=enabled)
 
 
 def _seed_controller_from_payload(
@@ -1060,9 +1301,19 @@ def _throttle_quick_pending_from_previous_stats(
         previous_stats.get("dup_reuse", 0.0)
     )
     prev_probe = float(previous_stats.get("probe_win_rate", 0.0))
+    prev_batch_seconds = float(previous_stats.get("batch_seconds", 0.0))
+    prev_target_seconds = max(0.25, float(previous_stats.get("target_batch_seconds", 1.0)))
+    prev_quick_eval = float(previous_stats.get("quick_eval", 0.0))
 
     reuse_ratio = prev_cache_dup / max(1.0, prev_unique)
     uniqueness_ratio = prev_unique / max(1.0, prev_total_eval)
+    underutilized = (
+        prev_batch_seconds > 0.0
+        and prev_batch_seconds < (0.72 * prev_target_seconds)
+        and prev_quick_eval < (1.20 * float(max(1, int(workers))))
+    )
+    if underutilized:
+        return selected, skipped, 1.0
     if prev_probe > 0.08 or reuse_ratio < 0.75:
         return selected, skipped, 1.0
 
@@ -2544,6 +2795,10 @@ def _run_defender_round(
         controller,
         archive.get("predictive_profile", {}).get("defender"),
     )
+    torch_tuner = _build_torch_runtime_tuner(
+        config=config,
+        resource_plan=resource_plan,
+    )
     stage_stats: Dict[str, float] = {}
     stage_cache: "OrderedDict[str, Tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
     cache_limit = max(500, int(config.max_eval_cache_entries))
@@ -2678,6 +2933,7 @@ def _run_defender_round(
         eval_started = time.perf_counter()
         local_stage: Dict[str, float] = {
             "population": float(len(pending)),
+            "workers": float(resource_plan.parallel_workers),
             "quick_eval": float(len(pending)),
             "mid_eval": 0.0,
             "full_eval": 0.0,
@@ -2694,6 +2950,7 @@ def _run_defender_round(
             "target_batch_seconds": float(config.target_generation_seconds),
             "batch_seconds": 0.0,
         }
+        batch_controller_state = controller.to_dict()
 
         if config.statistical_predictive and config.auto_statistical_tuning:
             # Preemptively tighten staged load when pending genomes outnumber workers.
@@ -2707,6 +2964,7 @@ def _run_defender_round(
                 if pressure > 3.0 and controller.key_variant_count > 1:
                     controller.key_variant_count -= 1
                 controller.clamp()
+            batch_controller_state = controller.to_dict()
 
         if not config.statistical_predictive:
             full_scenarios = make_scenarios("full")
@@ -2738,6 +2996,7 @@ def _run_defender_round(
             local_stage["cache_hits"] += float(eval_stats["cache_hits"])
             local_stage["dup_reuse"] += float(eval_stats["dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+            torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             stage_stats.clear()
             stage_stats.update(local_stage)
             return
@@ -2843,7 +3102,9 @@ def _run_defender_round(
         local_stage["mid_eval"] = float(len(mid_pending))
         if not mid_pending:
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+            torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
+            torch_tuner.tune(controller, stats=local_stage)
             stage_stats.clear()
             stage_stats.update({
                 **local_stage,
@@ -2892,7 +3153,7 @@ def _run_defender_round(
             1,
             min(
                 len(ranked_mid),
-                int(math.ceil(max(1, resource_plan.parallel_workers) * 0.55)),
+                int(math.ceil(max(1, resource_plan.parallel_workers) * 0.85)),
             ),
         )
         keep_mid_n = _stage_keep_count(
@@ -2925,7 +3186,9 @@ def _run_defender_round(
         local_stage["full_eval"] = float(len(full_pending))
         if not full_pending:
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+            torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
+            torch_tuner.tune(controller, stats=local_stage)
             stage_stats.clear()
             stage_stats.update({
                 **local_stage,
@@ -3013,7 +3276,9 @@ def _run_defender_round(
             local_stage["probe_wins"] = float(probe_wins)
 
         local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+        torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
         controller.apply_feedback(local_stage)
+        torch_tuner.tune(controller, stats=local_stage)
         stage_stats.clear()
         stage_stats.update({
             **local_stage,
@@ -3033,7 +3298,9 @@ def _run_defender_round(
     if generation_log:
         generation_log[-1]["stop_reason"] = str(stop_reason) if stop_reason else ""
         generation_log[-1]["stop_generation"] = int(stop_generation) if stop_generation is not None else -1
-    evolver._predictive_controller_state = controller.to_dict()  # type: ignore[attr-defined]
+    controller_state = controller.to_dict()
+    controller_state["torch_tuner"] = torch_tuner.to_dict()
+    evolver._predictive_controller_state = controller_state  # type: ignore[attr-defined]
     return evolver, generation_log
 
 
@@ -3077,6 +3344,10 @@ def _run_attacker_round(
     controller = _seed_controller_from_payload(
         controller,
         archive.get("predictive_profile", {}).get("attacker"),
+    )
+    torch_tuner = _build_torch_runtime_tuner(
+        config=config,
+        resource_plan=resource_plan,
     )
     stage_stats: Dict[str, float] = {}
     stage_cache: "OrderedDict[str, Tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
@@ -3215,6 +3486,7 @@ def _run_attacker_round(
         eval_started = time.perf_counter()
         local_stage: Dict[str, float] = {
             "population": float(len(pending)),
+            "workers": float(resource_plan.parallel_workers),
             "quick_eval": float(len(pending)),
             "mid_eval": 0.0,
             "full_eval": 0.0,
@@ -3231,6 +3503,7 @@ def _run_attacker_round(
             "target_batch_seconds": float(config.target_generation_seconds),
             "batch_seconds": 0.0,
         }
+        batch_controller_state = controller.to_dict()
 
         if config.statistical_predictive and config.auto_statistical_tuning:
             pressure = float(len(pending)) / float(max(1, resource_plan.parallel_workers))
@@ -3243,6 +3516,7 @@ def _run_attacker_round(
                 if pressure > 3.0 and controller.key_variant_count > 1:
                     controller.key_variant_count -= 1
                 controller.clamp()
+            batch_controller_state = controller.to_dict()
 
         if not config.statistical_predictive:
             full_scenarios = make_scenarios("full")
@@ -3274,6 +3548,7 @@ def _run_attacker_round(
             local_stage["cache_hits"] += float(eval_stats["cache_hits"])
             local_stage["dup_reuse"] += float(eval_stats["dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+            torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             stage_stats.clear()
             stage_stats.update(local_stage)
             return
@@ -3378,7 +3653,9 @@ def _run_attacker_round(
         local_stage["mid_eval"] = float(len(mid_pending))
         if not mid_pending:
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+            torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
+            torch_tuner.tune(controller, stats=local_stage)
             stage_stats.clear()
             stage_stats.update({
                 **local_stage,
@@ -3426,7 +3703,7 @@ def _run_attacker_round(
             1,
             min(
                 len(ranked_mid),
-                int(math.ceil(max(1, resource_plan.parallel_workers) * 0.55)),
+                int(math.ceil(max(1, resource_plan.parallel_workers) * 0.85)),
             ),
         )
         keep_mid_n = _stage_keep_count(
@@ -3459,7 +3736,9 @@ def _run_attacker_round(
         local_stage["full_eval"] = float(len(full_pending))
         if not full_pending:
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+            torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
+            torch_tuner.tune(controller, stats=local_stage)
             stage_stats.clear()
             stage_stats.update({
                 **local_stage,
@@ -3545,7 +3824,9 @@ def _run_attacker_round(
             local_stage["probe_wins"] = float(probe_wins)
 
         local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+        torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
         controller.apply_feedback(local_stage)
+        torch_tuner.tune(controller, stats=local_stage)
         stage_stats.clear()
         stage_stats.update({
             **local_stage,
@@ -3565,7 +3846,9 @@ def _run_attacker_round(
     if generation_log:
         generation_log[-1]["stop_reason"] = str(stop_reason) if stop_reason else ""
         generation_log[-1]["stop_generation"] = int(stop_generation) if stop_generation is not None else -1
-    evolver._predictive_controller_state = controller.to_dict()  # type: ignore[attr-defined]
+    controller_state = controller.to_dict()
+    controller_state["torch_tuner"] = torch_tuner.to_dict()
+    evolver._predictive_controller_state = controller_state  # type: ignore[attr-defined]
     return evolver, generation_log
 
 
@@ -3957,6 +4240,25 @@ def run_continuous_experiment(
                     key_vars=int(attacker_profile.get("key_variant_count", config.key_variant_count)),
                 )
             )
+            defender_torch = defender_profile.get("torch_tuner", {})
+            attacker_torch = attacker_profile.get("torch_tuner", {})
+            if isinstance(defender_torch, dict) or isinstance(attacker_torch, dict):
+                if not isinstance(defender_torch, dict):
+                    defender_torch = {}
+                if not isinstance(attacker_torch, dict):
+                    attacker_torch = {}
+                report_lines.append(
+                    "- torch runtime tuner: defender(enabled={de}, samples={ds}, mode={dm}, pred_ratio={dr:.2f}) attacker(enabled={ae}, samples={as_}, mode={am}, pred_ratio={ar:.2f})".format(
+                        de=bool(defender_torch.get("enabled", False)),
+                        ds=int(defender_torch.get("samples", 0)),
+                        dm=str(defender_torch.get("last_mode", "n/a")),
+                        dr=float(defender_torch.get("last_prediction_ratio", 1.0)),
+                        ae=bool(attacker_torch.get("enabled", False)),
+                        as_=int(attacker_torch.get("samples", 0)),
+                        am=str(attacker_torch.get("last_mode", "n/a")),
+                        ar=float(attacker_torch.get("last_prediction_ratio", 1.0)),
+                    )
+                )
         report_lines.append(
             "- timing-horizon: max_test_s={max_s:.1f} device_mhz={dev:.1f} provider_mhz={prov:.1f}".format(
                 max_s=float(config.max_test_time_seconds),
