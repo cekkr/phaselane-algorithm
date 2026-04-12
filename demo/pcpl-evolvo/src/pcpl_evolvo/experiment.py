@@ -1485,6 +1485,7 @@ def _evaluate_pending_dedup_cache_parallel(
     cache: "OrderedDict[str, Tuple[float, List[Dict[str, Any]]]]",
     cache_key_fn,
     max_cache_entries: int,
+    store_metrics: bool = True,
 ) -> Dict[str, float]:
     stats = {
         "total": 0.0,
@@ -1509,7 +1510,13 @@ def _evaluate_pending_dedup_cache_parallel(
             score, rows = cached
             cache.move_to_end(key)
             for genome in genomes:
-                setattr(genome, attr_name, _metrics_from_rows(rows))
+                if store_metrics:
+                    if rows:
+                        setattr(genome, attr_name, _metrics_from_rows(rows))
+                    elif hasattr(genome, attr_name):
+                        delattr(genome, attr_name)
+                elif hasattr(genome, attr_name):
+                    delattr(genome, attr_name)
                 genome.fitness = float(score)
             stats["cache_hits"] += float(len(genomes))
             continue
@@ -1528,19 +1535,28 @@ def _evaluate_pending_dedup_cache_parallel(
             worker_fn=worker_fn,
             build_task=build_task,
             attr_name=attr_name,
+            store_metrics=store_metrics,
         )
         stats["unique_eval"] = float(len(unique_pending))
 
         for (_, genome), key in zip(unique_pending, unique_keys):
             score = float(genome.fitness or -float("inf"))
-            metrics = getattr(genome, attr_name, [])
-            rows = _metrics_rows(metrics)
+            rows: List[Dict[str, Any]] = []
+            if store_metrics:
+                metrics = getattr(genome, attr_name, [])
+                rows = _metrics_rows(metrics)
             cache[key] = (score, rows)
             while len(cache) > max_cache_entries:
                 cache.popitem(last=False)
 
             for dup in groups[key][1:]:
-                setattr(dup, attr_name, _metrics_from_rows(rows))
+                if store_metrics:
+                    if rows:
+                        setattr(dup, attr_name, _metrics_from_rows(rows))
+                    elif hasattr(dup, attr_name):
+                        delattr(dup, attr_name)
+                elif hasattr(dup, attr_name):
+                    delattr(dup, attr_name)
                 dup.fitness = score
 
     return stats
@@ -1637,6 +1653,138 @@ def _rebalance_pending_parallelism(
             except Exception:
                 continue
     return changed
+
+
+def _idle_random_trial_budget(
+    *,
+    workers: int,
+    pending_count: int,
+    full_eval: float,
+    probe_samples: float,
+    elapsed_seconds: float,
+    target_seconds: float,
+) -> int:
+    lanes = max(1, int(workers))
+    if lanes <= 1:
+        return 0
+    if pending_count <= 0:
+        return 0
+    if float(elapsed_seconds) >= (0.92 * max(0.25, float(target_seconds))):
+        return 0
+
+    current_load = max(0.0, float(full_eval) + float(probe_samples))
+    desired_load = max(float(lanes), min(float(pending_count), float(lanes) * 1.45))
+    gap = int(math.ceil(desired_load - current_load))
+    if gap <= 0:
+        return 0
+
+    if pending_count < lanes:
+        cap = max(2, lanes)
+    else:
+        cap = max(2, min(pending_count, lanes))
+    return max(0, min(gap, cap))
+
+
+def _evaluate_idle_random_trials(
+    *,
+    pending: Sequence[Tuple[int, GFSLGenome]],
+    workers: int,
+    full_eval: float,
+    probe_samples: float,
+    elapsed_seconds: float,
+    target_seconds: float,
+    backend: str,
+    executor: Optional[concurrent.futures.Executor],
+    worker_fn,
+    build_task,
+    attr_name: str,
+    cache: "OrderedDict[str, Tuple[float, List[Dict[str, Any]]]]",
+    cache_key_fn,
+    max_cache_entries: int,
+    random_genome_fn: Callable[[], GFSLGenome],
+) -> Dict[str, float]:
+    stats = {
+        "trial_count": 0.0,
+        "trial_unique_eval": 0.0,
+        "trial_cache_hits": 0.0,
+        "trial_dup_reuse": 0.0,
+        "trial_injected": 0.0,
+    }
+    budget = _idle_random_trial_budget(
+        workers=workers,
+        pending_count=len(pending),
+        full_eval=full_eval,
+        probe_samples=probe_samples,
+        elapsed_seconds=elapsed_seconds,
+        target_seconds=target_seconds,
+    )
+    if budget <= 0:
+        return stats
+
+    trial_pending: List[Tuple[int, GFSLGenome]] = []
+    for idx in range(budget):
+        try:
+            trial_pending.append((idx, random_genome_fn()))
+        except Exception:
+            continue
+    if not trial_pending:
+        return stats
+
+    eval_stats = _evaluate_pending_dedup_cache_parallel(
+        pending=trial_pending,
+        backend=backend,
+        workers=workers,
+        executor=executor,
+        worker_fn=worker_fn,
+        build_task=build_task,
+        attr_name=attr_name,
+        cache=cache,
+        cache_key_fn=cache_key_fn,
+        max_cache_entries=max_cache_entries,
+        store_metrics=False,
+    )
+    stats["trial_count"] = float(len(trial_pending))
+    stats["trial_unique_eval"] = float(eval_stats.get("unique_eval", 0.0))
+    stats["trial_cache_hits"] = float(eval_stats.get("cache_hits", 0.0))
+    stats["trial_dup_reuse"] = float(eval_stats.get("dup_reuse", 0.0))
+
+    replace_targets = sorted(
+        [genome for _, genome in pending],
+        key=lambda genome: float(genome.fitness or -float("inf")),
+    )
+    challengers = sorted(
+        [genome for _, genome in trial_pending],
+        key=lambda genome: float(genome.fitness or -float("inf")),
+        reverse=True,
+    )
+    if not replace_targets or not challengers:
+        return stats
+
+    seen_signatures = {_evaluation_signature(genome) for genome in replace_targets}
+    replace_idx = 0
+    injected = 0
+    for challenger in challengers:
+        if replace_idx >= len(replace_targets):
+            break
+        challenger_score = float(challenger.fitness or -float("inf"))
+        target = replace_targets[replace_idx]
+        target_score = float(target.fitness or -float("inf"))
+        if challenger_score <= (target_score + 1e-9):
+            break
+        challenger_signature = _evaluation_signature(challenger)
+        if challenger_signature in seen_signatures:
+            continue
+
+        _replace_genome_contents(target, challenger)
+        target.fitness = challenger_score
+        if hasattr(target, attr_name):
+            delattr(target, attr_name)
+        seen_signatures.add(challenger_signature)
+        injected += 1
+        replace_idx += 1
+
+    stats["trial_injected"] = float(injected)
+    return stats
 
 
 def _rank_with_novelty(
@@ -1949,17 +2097,33 @@ def _shutdown_shared_executor(executor: Optional[concurrent.futures.Executor]) -
         pass
 
 
-def _defender_eval_worker(task: Tuple[GFSLGenome, Sequence[ScenarioConfig], Optional[GFSLGenome]]) -> Tuple[float, List[Dict[str, Any]]]:
-    genome, scenarios, attacker = task
+def _defender_eval_worker(
+    task: Tuple[GFSLGenome, Sequence[ScenarioConfig], Optional[GFSLGenome], bool]
+    | Tuple[GFSLGenome, Sequence[ScenarioConfig], Optional[GFSLGenome]]
+) -> Tuple[float, List[Dict[str, Any]]]:
+    if len(task) == 3:
+        genome, scenarios, attacker = task
+        emit_rows = True
+    else:
+        genome, scenarios, attacker, emit_rows = task
     ensure_genome_io(genome)
     if attacker is not None:
         ensure_attacker_genome_io(attacker)
     score, metrics = evaluate_across_scenarios(scenarios, genome, attacker=attacker)
+    if not bool(emit_rows):
+        return float(score), []
     return float(score), _metrics_rows(metrics)
 
 
-def _attacker_eval_worker(task: Tuple[GFSLGenome, GFSLGenome, Sequence[ScenarioConfig]]) -> Tuple[float, List[Dict[str, Any]]]:
-    attacker, defender, scenarios = task
+def _attacker_eval_worker(
+    task: Tuple[GFSLGenome, GFSLGenome, Sequence[ScenarioConfig], bool]
+    | Tuple[GFSLGenome, GFSLGenome, Sequence[ScenarioConfig]]
+) -> Tuple[float, List[Dict[str, Any]]]:
+    if len(task) == 3:
+        attacker, defender, scenarios = task
+        emit_rows = True
+    else:
+        attacker, defender, scenarios, emit_rows = task
     ensure_attacker_genome_io(attacker)
     ensure_genome_io(defender)
     _, metrics = evaluate_across_scenarios(scenarios, defender, attacker=attacker)
@@ -1972,27 +2136,40 @@ def _attacker_eval_worker(task: Tuple[GFSLGenome, GFSLGenome, Sequence[ScenarioC
     else:
         complexity_penalty = min(0.10, max(0.0, (effective - 18) * 0.0025))
         score = attack_adv + (0.04 * lane_success) + (0.02 * token_success) - complexity_penalty
+    if not bool(emit_rows):
+        return float(score), []
     return float(score), _metrics_rows(metrics)
 
 
 def _defender_eval_worker_batch(
-    task: Tuple[List[GFSLGenome], Sequence[ScenarioConfig], Optional[GFSLGenome]]
+    task: Tuple[List[GFSLGenome], Sequence[ScenarioConfig], Optional[GFSLGenome], bool]
+    | Tuple[List[GFSLGenome], Sequence[ScenarioConfig], Optional[GFSLGenome]]
 ) -> List[Tuple[float, List[Dict[str, Any]]]]:
-    genomes, scenarios, attacker = task
+    if len(task) == 3:
+        genomes, scenarios, attacker = task
+        emit_rows = True
+    else:
+        genomes, scenarios, attacker, emit_rows = task
     if attacker is not None:
         ensure_attacker_genome_io(attacker)
     results: List[Tuple[float, List[Dict[str, Any]]]] = []
     for genome in genomes:
         ensure_genome_io(genome)
         score, metrics = evaluate_across_scenarios(scenarios, genome, attacker=attacker)
-        results.append((float(score), _metrics_rows(metrics)))
+        rows = _metrics_rows(metrics) if bool(emit_rows) else []
+        results.append((float(score), rows))
     return results
 
 
 def _attacker_eval_worker_batch(
-    task: Tuple[List[GFSLGenome], GFSLGenome, Sequence[ScenarioConfig]]
+    task: Tuple[List[GFSLGenome], GFSLGenome, Sequence[ScenarioConfig], bool]
+    | Tuple[List[GFSLGenome], GFSLGenome, Sequence[ScenarioConfig]]
 ) -> List[Tuple[float, List[Dict[str, Any]]]]:
-    attackers, defender, scenarios = task
+    if len(task) == 3:
+        attackers, defender, scenarios = task
+        emit_rows = True
+    else:
+        attackers, defender, scenarios, emit_rows = task
     ensure_genome_io(defender)
     results: List[Tuple[float, List[Dict[str, Any]]]] = []
     for attacker in attackers:
@@ -2007,7 +2184,8 @@ def _attacker_eval_worker_batch(
         else:
             complexity_penalty = min(0.10, max(0.0, (effective - 18) * 0.0025))
             score = attack_adv + (0.04 * lane_success) + (0.02 * token_success) - complexity_penalty
-        results.append((float(score), _metrics_rows(metrics)))
+        rows = _metrics_rows(metrics) if bool(emit_rows) else []
+        results.append((float(score), rows))
     return results
 
 
@@ -2020,6 +2198,7 @@ def _evaluate_pending_parallel(
     worker_fn,
     build_task,
     attr_name: str,
+    store_metrics: bool = True,
 ) -> None:
     if not pending:
         return
@@ -2027,11 +2206,28 @@ def _evaluate_pending_parallel(
     if backend == "off" or workers <= 1:
         for _, genome in pending:
             score, rows = worker_fn(build_task(genome))
-            setattr(genome, attr_name, _metrics_from_rows(rows))
+            if store_metrics:
+                if rows:
+                    setattr(genome, attr_name, _metrics_from_rows(rows))
+                elif hasattr(genome, attr_name):
+                    delattr(genome, attr_name)
+            elif hasattr(genome, attr_name):
+                delattr(genome, attr_name)
             genome.fitness = float(score)
         return
 
     tasks = [build_task(genome) for _, genome in pending]
+    if worker_fn in {_defender_eval_worker, _attacker_eval_worker}:
+        normalized_tasks = []
+        for task in tasks:
+            if not isinstance(task, tuple):
+                normalized_tasks.append(task)
+                continue
+            if len(task) >= 4:
+                normalized_tasks.append((task[0], task[1], task[2], bool(task[3]) and bool(store_metrics)))
+            else:
+                normalized_tasks.append((*task, bool(store_metrics)))
+        tasks = normalized_tasks
     map_chunk_size = max(1, len(tasks) // max(1, workers * 2))
 
     def run_with_executor(exec_obj: concurrent.futures.Executor, fn, task_list):
@@ -2041,7 +2237,13 @@ def _evaluate_pending_parallel(
 
     def assign(results: Sequence[Tuple[float, List[Dict[str, Any]]]]) -> None:
         for (_, genome), (score, rows) in zip(pending, results):
-            setattr(genome, attr_name, _metrics_from_rows(rows))
+            if store_metrics:
+                if rows:
+                    setattr(genome, attr_name, _metrics_from_rows(rows))
+                elif hasattr(genome, attr_name):
+                    delattr(genome, attr_name)
+            elif hasattr(genome, attr_name):
+                delattr(genome, attr_name)
             genome.fitness = float(score)
 
     # Process backend benefits from batch-chunked tasks to reduce pickle/IPC overhead.
@@ -2066,12 +2268,12 @@ def _evaluate_pending_parallel(
         task_chunks = [tasks[pos : pos + batch_size] for pos in range(0, len(tasks), batch_size)]
         if worker_fn is _defender_eval_worker:
             batch_tasks = [
-                ([item[0] for item in chunk], chunk[0][1], chunk[0][2])
+                ([item[0] for item in chunk], chunk[0][1], chunk[0][2], bool(chunk[0][3]))
                 for chunk in task_chunks
             ]
         else:
             batch_tasks = [
-                ([item[0] for item in chunk], chunk[0][1], chunk[0][2])
+                ([item[0] for item in chunk], chunk[0][1], chunk[0][2], bool(chunk[0][3]))
                 for chunk in task_chunks
             ]
 
@@ -2119,10 +2321,16 @@ def _evaluate_pending_parallel(
     assign(results)
 
 
-def _mean_metric(metrics: Sequence[ScenarioMetrics], attr: str) -> float:
+def _mean_metric(metrics: Sequence[Any], attr: str) -> float:
     if not metrics:
         return 0.0
-    return sum(float(getattr(item, attr)) for item in metrics) / float(len(metrics))
+    total = 0.0
+    for item in metrics:
+        if isinstance(item, dict):
+            total += float(item.get(attr, 0.0))
+        else:
+            total += float(getattr(item, attr, 0.0))
+    return total / float(len(metrics))
 
 
 def _make_random_genome(initial_instructions: int, *, slot_count: Optional[int] = None) -> GFSLGenome:
@@ -2139,25 +2347,51 @@ def _make_random_genome(initial_instructions: int, *, slot_count: Optional[int] 
     return genome
 
 
-def _metrics_rows(metrics: Sequence[ScenarioMetrics]) -> List[Dict[str, Any]]:
-    return [metric.to_dict() for metric in metrics]
+def _metrics_rows(metrics: Sequence[Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for metric in metrics:
+        if isinstance(metric, dict):
+            rows.append(dict(metric))
+            continue
+        to_dict = getattr(metric, "to_dict", None)
+        if callable(to_dict):
+            rows.append(dict(to_dict()))
+    return rows
 
 
-def _scenario_table(metrics: Sequence[ScenarioMetrics]) -> str:
+def _scenario_table(metrics: Sequence[Any]) -> str:
     lines = []
     lines.append("| scenario | total | principle | sync | security | cost | op-cost | attacker-adv |")
     lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for metric in metrics:
+        if isinstance(metric, dict):
+            scenario = str(metric.get("scenario", "n/a"))
+            total = float(metric.get("total_score", 0.0))
+            principle = float(metric.get("principle_score", 0.0))
+            sync = float(metric.get("sync_score", 0.0))
+            security = float(metric.get("security_score", 0.0))
+            cost = float(metric.get("cost_score", 0.0))
+            op_cost = float(metric.get("operation_cost_score", 0.0))
+            attack_adv = float(metric.get("attacker_advantage_score", 0.0))
+        else:
+            scenario = str(getattr(metric, "scenario", "n/a"))
+            total = float(getattr(metric, "total_score", 0.0))
+            principle = float(getattr(metric, "principle_score", 0.0))
+            sync = float(getattr(metric, "sync_score", 0.0))
+            security = float(getattr(metric, "security_score", 0.0))
+            cost = float(getattr(metric, "cost_score", 0.0))
+            op_cost = float(getattr(metric, "operation_cost_score", 0.0))
+            attack_adv = float(getattr(metric, "attacker_advantage_score", 0.0))
         lines.append(
             "| {name} | {total:.4f} | {principle:.4f} | {sync:.4f} | {security:.4f} | {cost:.4f} | {op_cost:.4f} | {attack_adv:.4f} |".format(
-                name=metric.scenario,
-                total=metric.total_score,
-                principle=metric.principle_score,
-                sync=metric.sync_score,
-                security=metric.security_score,
-                cost=metric.cost_score,
-                op_cost=metric.operation_cost_score,
-                attack_adv=metric.attacker_advantage_score,
+                name=scenario,
+                total=total,
+                principle=principle,
+                sync=sync,
+                security=security,
+                cost=cost,
+                op_cost=op_cost,
+                attack_adv=attack_adv,
             )
         )
     return "\n".join(lines)
@@ -2294,6 +2528,54 @@ def _load_archive(path: Path) -> Dict[str, Any]:
     payload.setdefault("predictive_profile", {})
     payload.setdefault("updated_at", None)
     return payload
+
+
+def _compact_round_summary_for_archive(entry: Dict[str, Any]) -> Dict[str, Any]:
+    reference_payload = entry.get("reference_anchor", {})
+    if not isinstance(reference_payload, dict):
+        reference_payload = {}
+    predictor_payload = entry.get("predictive_profile", {})
+    if not isinstance(predictor_payload, dict):
+        predictor_payload = {}
+    adaptive_payload = entry.get("adaptive_attacker_budget", {})
+    if not isinstance(adaptive_payload, dict):
+        adaptive_payload = {}
+
+    compact: Dict[str, Any] = {
+        "round": int(entry.get("round", -1)),
+        "timestamp": str(entry.get("timestamp", _utc_now_iso())),
+        "defender_score": float(entry.get("defender_score", 0.0)),
+        "defender_signature": str(entry.get("defender_signature", "")),
+        "attacker_score": float(entry.get("attacker_score", 0.0)),
+        "attacker_signature": str(entry.get("attacker_signature", "")),
+        "round_dir": entry.get("round_dir"),
+        "defender_stop_reason": str(entry.get("defender_stop_reason", "")),
+        "attacker_stop_reason": str(entry.get("attacker_stop_reason", "")),
+        "predictive_profile": predictor_payload,
+        "adaptive_attacker_budget": adaptive_payload,
+        "reference_anchor": {
+            "score": float(reference_payload.get("score", 0.0)),
+            "signature": str(reference_payload.get("signature", "")),
+            "canonical_signature": str(reference_payload.get("canonical_signature", "")),
+            "score_delta": float(reference_payload.get("score_delta", 0.0)),
+        },
+    }
+    return compact
+
+
+def _compact_archive_payload(archive: Dict[str, Any]) -> Dict[str, Any]:
+    rounds_payload = archive.get("rounds", [])
+    if not isinstance(rounds_payload, list):
+        archive["rounds"] = []
+        return archive
+
+    compacted: List[Dict[str, Any]] = []
+    for entry in rounds_payload:
+        if not isinstance(entry, dict):
+            continue
+        compacted.append(_compact_round_summary_for_archive(entry))
+    archive["rounds"] = compacted
+    return archive
 
 
 def _save_archive(path: Path, archive: Dict[str, Any]) -> None:
@@ -3093,6 +3375,8 @@ def _run_defender_round(
             "eval_unique": int(stage_stats.get("eval_unique", 0.0)),
             "cache_hits": int(stage_stats.get("cache_hits", 0.0)),
             "dup_reuse": int(stage_stats.get("dup_reuse", 0.0)),
+            "random_trials": int(stage_stats.get("random_trials", 0.0)),
+            "random_injected": int(stage_stats.get("random_injected", 0.0)),
             "parallel_rebalanced": int(stage_stats.get("parallel_rebalanced", 0.0)),
             "underutilization_boost": float(stage_stats.get("underutilization_boost", 0.0)),
             "mutation_rate": float(stage_stats.get("mutation_rate", evolver.mutation_rate)),
@@ -3100,7 +3384,7 @@ def _run_defender_round(
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
+            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 security=row["security"],
@@ -3121,6 +3405,8 @@ def _run_defender_round(
                 cache=row["cache_hits"],
                 dup=row["dup_reuse"],
                 reb=row["parallel_rebalanced"],
+                rt=row["random_trials"],
+                ri=row["random_injected"],
                 ub=row["underutilization_boost"],
                 mut=row["mutation_rate"],
                 secs=row["batch_seconds"],
@@ -3163,6 +3449,8 @@ def _run_defender_round(
             "mid_kept": 0.0,
             "probe_samples": 0.0,
             "probe_wins": 0.0,
+            "random_trials": 0.0,
+            "random_injected": 0.0,
             "novelty_quick": 0.0,
             "novelty_mid": 0.0,
             "eval_unique": 0.0,
@@ -3180,7 +3468,7 @@ def _run_defender_round(
             pending=pending,
             workers=resource_plan.parallel_workers,
             io_initializer=ensure_genome_io,
-            mutate_fn=lambda genome: evolver.mutate(copy.deepcopy(genome)),
+            mutate_fn=lambda genome: evolver.mutate(genome),
             random_genome_fn=lambda: _make_random_genome(
                 max(4, int(math.ceil(float(config.initial_instructions) * 0.80)))
             ),
@@ -3229,6 +3517,7 @@ def _run_defender_round(
                     sig=_evaluation_signature(g),
                 ),
                 max_cache_entries=cache_limit,
+                store_metrics=False,
             )
             local_stage["full_eval"] = float(eval_stats["total"])
             local_stage["quick_kept"] = float(eval_stats["total"])
@@ -3236,6 +3525,38 @@ def _run_defender_round(
             local_stage["eval_unique"] += float(eval_stats["unique_eval"])
             local_stage["cache_hits"] += float(eval_stats["cache_hits"])
             local_stage["dup_reuse"] += float(eval_stats["dup_reuse"])
+            trial_stats = _evaluate_idle_random_trials(
+                pending=pending,
+                workers=resource_plan.parallel_workers,
+                full_eval=local_stage["full_eval"],
+                probe_samples=0.0,
+                elapsed_seconds=float(time.perf_counter() - eval_started),
+                target_seconds=float(config.target_generation_seconds),
+                backend=resource_plan.parallel_backend,
+                executor=shared_executor,
+                worker_fn=_defender_eval_worker,
+                build_task=lambda g: (
+                    g,
+                    full_scenarios,
+                    attacker,
+                ),
+                attr_name="_pcpl_metrics",
+                cache=stage_cache,
+                cache_key_fn=lambda g, sf=full_fp: "def:trial:{sf}:{att}:{sig}".format(
+                    sf=sf,
+                    att=attacker_signature,
+                    sig=_evaluation_signature(g),
+                ),
+                max_cache_entries=cache_limit,
+                random_genome_fn=lambda: _make_random_genome(
+                    max(4, int(math.ceil(float(config.initial_instructions) * 0.85)))
+                ),
+            )
+            local_stage["random_trials"] = float(trial_stats["trial_count"])
+            local_stage["random_injected"] = float(trial_stats["trial_injected"])
+            local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
+            local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
+            local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             local_stage["underutilization_boost"] = _runtime_underutilization_boost(
@@ -3297,6 +3618,7 @@ def _run_defender_round(
                 sig=_evaluation_signature(g),
             ),
             max_cache_entries=cache_limit,
+            store_metrics=False,
         )
         local_stage["eval_unique"] += float(quick_stats["unique_eval"])
         local_stage["cache_hits"] += float(quick_stats["cache_hits"])
@@ -3386,6 +3708,7 @@ def _run_defender_round(
                 sig=_evaluation_signature(g),
             ),
             max_cache_entries=cache_limit,
+            store_metrics=False,
         )
         local_stage["mid_eval"] = float(mid_stats["total"])
         local_stage["eval_unique"] += float(mid_stats["unique_eval"])
@@ -3515,6 +3838,7 @@ def _run_defender_round(
                     sig=_evaluation_signature(g),
                 ),
                 max_cache_entries=cache_limit,
+                store_metrics=False,
             )
             local_stage["eval_unique"] += float(probe_stats["unique_eval"])
             local_stage["cache_hits"] += float(probe_stats["cache_hits"])
@@ -3533,6 +3857,39 @@ def _run_defender_round(
                     )
             local_stage["probe_samples"] = float(len(probe_pending))
             local_stage["probe_wins"] = float(probe_wins)
+
+        trial_stats = _evaluate_idle_random_trials(
+            pending=pending,
+            workers=resource_plan.parallel_workers,
+            full_eval=local_stage["full_eval"],
+            probe_samples=local_stage["probe_samples"],
+            elapsed_seconds=float(time.perf_counter() - eval_started),
+            target_seconds=float(config.target_generation_seconds),
+            backend=resource_plan.parallel_backend,
+            executor=shared_executor,
+            worker_fn=_defender_eval_worker,
+            build_task=lambda g: (
+                g,
+                full_scenarios,
+                attacker,
+            ),
+            attr_name="_pcpl_metrics",
+            cache=stage_cache,
+            cache_key_fn=lambda g, sf=full_fp: "def:trial:{sf}:{att}:{sig}".format(
+                sf=sf,
+                att=attacker_signature,
+                sig=_evaluation_signature(g),
+            ),
+            max_cache_entries=cache_limit,
+            random_genome_fn=lambda: _make_random_genome(
+                max(4, int(math.ceil(float(config.initial_instructions) * 0.85)))
+            ),
+        )
+        local_stage["random_trials"] = float(trial_stats["trial_count"])
+        local_stage["random_injected"] = float(trial_stats["trial_injected"])
+        local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
+        local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
+        local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
 
         local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
         torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
@@ -3702,6 +4059,8 @@ def _run_attacker_round(
             "eval_unique": int(stage_stats.get("eval_unique", 0.0)),
             "cache_hits": int(stage_stats.get("cache_hits", 0.0)),
             "dup_reuse": int(stage_stats.get("dup_reuse", 0.0)),
+            "random_trials": int(stage_stats.get("random_trials", 0.0)),
+            "random_injected": int(stage_stats.get("random_injected", 0.0)),
             "parallel_rebalanced": int(stage_stats.get("parallel_rebalanced", 0.0)),
             "underutilization_boost": float(stage_stats.get("underutilization_boost", 0.0)),
             "mutation_rate": float(stage_stats.get("mutation_rate", evolver.mutation_rate)),
@@ -3709,7 +4068,7 @@ def _run_attacker_round(
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
+            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 lane=row["lane_success"],
@@ -3729,6 +4088,8 @@ def _run_attacker_round(
                 cache=row["cache_hits"],
                 dup=row["dup_reuse"],
                 reb=row["parallel_rebalanced"],
+                rt=row["random_trials"],
+                ri=row["random_injected"],
                 ub=row["underutilization_boost"],
                 mut=row["mutation_rate"],
                 secs=row["batch_seconds"],
@@ -3771,6 +4132,8 @@ def _run_attacker_round(
             "mid_kept": 0.0,
             "probe_samples": 0.0,
             "probe_wins": 0.0,
+            "random_trials": 0.0,
+            "random_injected": 0.0,
             "novelty_quick": 0.0,
             "novelty_mid": 0.0,
             "eval_unique": 0.0,
@@ -3788,7 +4151,7 @@ def _run_attacker_round(
             pending=pending,
             workers=resource_plan.parallel_workers,
             io_initializer=ensure_attacker_genome_io,
-            mutate_fn=lambda genome: evolver.mutate(copy.deepcopy(genome)),
+            mutate_fn=lambda genome: evolver.mutate(genome),
             random_genome_fn=lambda: _make_random_genome(
                 max(4, int(math.ceil(float(max(4, config.initial_instructions // 2)) * 0.85)))
             ),
@@ -3836,6 +4199,7 @@ def _run_attacker_round(
                     sig=_evaluation_signature(g),
                 ),
                 max_cache_entries=cache_limit,
+                store_metrics=False,
             )
             local_stage["full_eval"] = float(eval_stats["total"])
             local_stage["quick_kept"] = float(eval_stats["total"])
@@ -3843,6 +4207,38 @@ def _run_attacker_round(
             local_stage["eval_unique"] += float(eval_stats["unique_eval"])
             local_stage["cache_hits"] += float(eval_stats["cache_hits"])
             local_stage["dup_reuse"] += float(eval_stats["dup_reuse"])
+            trial_stats = _evaluate_idle_random_trials(
+                pending=pending,
+                workers=resource_plan.parallel_workers,
+                full_eval=local_stage["full_eval"],
+                probe_samples=0.0,
+                elapsed_seconds=float(time.perf_counter() - eval_started),
+                target_seconds=float(config.target_generation_seconds),
+                backend=resource_plan.parallel_backend,
+                executor=shared_executor,
+                worker_fn=_attacker_eval_worker,
+                build_task=lambda attacker_genome: (
+                    attacker_genome,
+                    defender,
+                    full_scenarios,
+                ),
+                attr_name="_attack_metrics",
+                cache=stage_cache,
+                cache_key_fn=lambda g, sf=full_fp: "atk:trial:{sf}:{def_sig}:{sig}".format(
+                    sf=sf,
+                    def_sig=defender_signature,
+                    sig=_evaluation_signature(g),
+                ),
+                max_cache_entries=cache_limit,
+                random_genome_fn=lambda: _make_random_genome(
+                    max(4, int(math.ceil(float(max(4, config.initial_instructions // 2)) * 0.95)))
+                ),
+            )
+            local_stage["random_trials"] = float(trial_stats["trial_count"])
+            local_stage["random_injected"] = float(trial_stats["trial_injected"])
+            local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
+            local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
+            local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             local_stage["underutilization_boost"] = _runtime_underutilization_boost(
@@ -3903,6 +4299,7 @@ def _run_attacker_round(
                 sig=_evaluation_signature(g),
             ),
             max_cache_entries=cache_limit,
+            store_metrics=False,
         )
         local_stage["eval_unique"] += float(quick_stats["unique_eval"])
         local_stage["cache_hits"] += float(quick_stats["cache_hits"])
@@ -3991,6 +4388,7 @@ def _run_attacker_round(
                 sig=_evaluation_signature(g),
             ),
             max_cache_entries=cache_limit,
+            store_metrics=False,
         )
         local_stage["mid_eval"] = float(mid_stats["total"])
         local_stage["eval_unique"] += float(mid_stats["unique_eval"])
@@ -4118,6 +4516,7 @@ def _run_attacker_round(
                     sig=_evaluation_signature(g),
                 ),
                 max_cache_entries=cache_limit,
+                store_metrics=False,
             )
             local_stage["eval_unique"] += float(probe_stats["unique_eval"])
             local_stage["cache_hits"] += float(probe_stats["cache_hits"])
@@ -4136,6 +4535,39 @@ def _run_attacker_round(
                     )
             local_stage["probe_samples"] = float(len(probe_pending))
             local_stage["probe_wins"] = float(probe_wins)
+
+        trial_stats = _evaluate_idle_random_trials(
+            pending=pending,
+            workers=resource_plan.parallel_workers,
+            full_eval=local_stage["full_eval"],
+            probe_samples=local_stage["probe_samples"],
+            elapsed_seconds=float(time.perf_counter() - eval_started),
+            target_seconds=float(config.target_generation_seconds),
+            backend=resource_plan.parallel_backend,
+            executor=shared_executor,
+            worker_fn=_attacker_eval_worker,
+            build_task=lambda attacker_genome: (
+                attacker_genome,
+                defender,
+                full_scenarios,
+            ),
+            attr_name="_attack_metrics",
+            cache=stage_cache,
+            cache_key_fn=lambda g, sf=full_fp: "atk:trial:{sf}:{def_sig}:{sig}".format(
+                sf=sf,
+                def_sig=defender_signature,
+                sig=_evaluation_signature(g),
+            ),
+            max_cache_entries=cache_limit,
+            random_genome_fn=lambda: _make_random_genome(
+                max(4, int(math.ceil(float(max(4, config.initial_instructions // 2)) * 0.95)))
+            ),
+        )
+        local_stage["random_trials"] = float(trial_stats["trial_count"])
+        local_stage["random_injected"] = float(trial_stats["trial_injected"])
+        local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
+        local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
+        local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
 
         local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
         torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
@@ -4204,6 +4636,7 @@ def run_continuous_experiment(
 
     archive_path = out_dir / "archive.json"
     archive = _load_archive(archive_path) if config.resume else _load_archive(Path("/dev/null"))
+    archive = _compact_archive_payload(archive)
     baseline_rows = _baseline_rows(scenario_list)
 
     print(
@@ -4236,15 +4669,14 @@ def run_continuous_experiment(
             except Exception:
                 current_attacker = None
 
+        if resource_plan.parallel_backend != "off" and resource_plan.parallel_workers > 1:
+            shared_executor = _create_shared_executor(resource_plan)
+
         start_round = len(archive.get("rounds", []))
         for offset in range(max(1, config.rounds)):
             round_index = start_round + offset
             round_dir = rounds_dir / f"round-{round_index:04d}"
             round_dir.mkdir(parents=True, exist_ok=True)
-            if resource_plan.parallel_backend != "off" and resource_plan.parallel_workers > 1:
-                if shared_executor is not None:
-                    _shutdown_shared_executor(shared_executor)
-                shared_executor = _create_shared_executor(resource_plan)
 
             # Defender evolution under current strongest attacker.
             defender_evolver, defender_log = _run_defender_round(
@@ -4394,8 +4826,19 @@ def run_continuous_experiment(
                 "defender_signature": defender_signature,
                 "attacker_score": float(attack_adv),
                 "attacker_signature": attacker_signature,
+                "round_dir": str(round_dir),
                 "defender_log": defender_log,
                 "attacker_log": attacker_log,
+                "defender_stop_reason": (
+                    str(defender_log[-1].get("stop_reason", ""))
+                    if defender_log
+                    else ""
+                ),
+                "attacker_stop_reason": (
+                    str(attacker_log[-1].get("stop_reason", ""))
+                    if attacker_log
+                    else ""
+                ),
                 "metrics": _metrics_rows(selected_metrics),
                 "predictive_profile": {
                     "defender": defender_profile,
@@ -4411,7 +4854,9 @@ def run_continuous_experiment(
                     "metrics": _metrics_rows(reference_metrics),
                 },
             }
-            archive.setdefault("rounds", []).append(round_summary)
+            archive.setdefault("rounds", []).append(
+                _compact_round_summary_for_archive(round_summary)
+            )
 
             # Round artifacts.
             (round_dir / "defender-genome.txt").write_text(
