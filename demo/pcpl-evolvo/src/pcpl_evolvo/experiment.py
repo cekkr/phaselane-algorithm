@@ -11,6 +11,8 @@ import multiprocessing
 import os
 import platform
 import random
+import signal
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, replace
@@ -98,6 +100,8 @@ MAX_DEFENDER_TOTAL_INSTRUCTIONS = 128
 MAX_DEFENDER_EFFECTIVE_INSTRUCTIONS = 72
 MAX_ATTACKER_TOTAL_INSTRUCTIONS = 96
 MAX_ATTACKER_EFFECTIVE_INSTRUCTIONS = 56
+DEFENDER_EVAL_TIMEOUT_SECONDS = 45.0
+ATTACKER_EVAL_TIMEOUT_SECONDS = 35.0
 
 
 def _complexity_limits(role: str) -> Tuple[int, int]:
@@ -122,25 +126,82 @@ def _complexity_cut_score(*, role: str, total: int, effective: int) -> float:
     return float(base - min(2.0, 0.015 * excess))
 
 
+def _cached_effective_instruction_count(genome: GFSLGenome) -> Optional[int]:
+    cached = getattr(genome, "_effective_instructions", None)
+    if cached is None:
+        return None
+    if isinstance(cached, int):
+        return max(0, int(cached))
+    try:
+        return max(0, int(len(cached)))  # type: ignore[arg-type]
+    except Exception:
+        return None
+
+
+def _estimated_effective_instruction_count(genome: GFSLGenome) -> int:
+    cached = _cached_effective_instruction_count(genome)
+    if cached is not None:
+        return int(cached)
+    total = max(0, int(len(genome.instructions)))
+    if total == 0:
+        return 0
+    return int(max(1, min(total, math.ceil(float(total) * 0.62))))
+
+
 def _is_genome_over_complexity_budget(genome: GFSLGenome, *, role: str) -> Tuple[bool, float]:
     total_limit, effective_limit = _complexity_limits(role)
     total = len(genome.instructions)
+    estimated_effective = _estimated_effective_instruction_count(genome)
     if total <= int(total_limit):
-        effective = len(genome.extract_effective_algorithm()) if total > 0 else 0
-        if effective <= int(effective_limit):
+        if estimated_effective <= int(effective_limit):
             return False, 0.0
         return True, _complexity_cut_score(
             role=role,
             total=total,
-            effective=effective,
+            effective=estimated_effective,
         )
-
-    effective = len(genome.extract_effective_algorithm()) if total > 0 else 0
     return True, _complexity_cut_score(
         role=role,
         total=total,
-        effective=effective,
+        effective=estimated_effective,
     )
+
+
+def _timeout_cut_score(*, role: str) -> float:
+    return -3.00 if str(role).lower() == "defender" else -1.50
+
+
+def _can_use_eval_timeout() -> bool:
+    if os.name == "nt":
+        return False
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    return bool(hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer"))
+
+
+def _evaluate_with_timeout(
+    scenarios: Sequence[ScenarioConfig],
+    genome: GFSLGenome,
+    *,
+    attacker: Optional[GFSLGenome],
+    timeout_seconds: float,
+) -> Tuple[float, Sequence[Any]]:
+    timeout = max(0.0, float(timeout_seconds))
+    if timeout <= 0.0 or not _can_use_eval_timeout():
+        return evaluate_across_scenarios(scenarios, genome, attacker=attacker)
+
+    def _raise_timeout(signum, frame):  # type: ignore[no-untyped-def]
+        _ = (signum, frame)
+        raise TimeoutError("evaluation-timeout")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    try:
+        signal.signal(signal.SIGALRM, _raise_timeout)
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+        return evaluate_across_scenarios(scenarios, genome, attacker=attacker)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _invalidate_genome_caches(genome: GFSLGenome) -> None:
@@ -1236,6 +1297,22 @@ def _process_pool_context_name() -> Optional[str]:
     return "fork"
 
 
+def _process_pool_kwargs() -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {}
+    ctx_name = _process_pool_context_name()
+    if ctx_name is not None:
+        try:
+            kwargs["mp_context"] = multiprocessing.get_context(ctx_name)
+        except Exception:
+            pass
+    return kwargs
+
+
+def _create_process_pool_executor(max_workers: int) -> concurrent.futures.ProcessPoolExecutor:
+    kwargs = _process_pool_kwargs()
+    return concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, **kwargs)
+
+
 def _metrics_from_rows(rows: Sequence[Dict[str, Any]]) -> List[ScenarioMetrics]:
     return [ScenarioMetrics(**row) for row in rows]
 
@@ -2226,17 +2303,7 @@ def _create_shared_executor(plan: ResourcePlan) -> Optional[concurrent.futures.E
     if plan.parallel_backend == "off" or plan.parallel_workers <= 1:
         return None
     if plan.parallel_backend == "process":
-        kwargs: Dict[str, Any] = {}
-        ctx_name = _process_pool_context_name()
-        if ctx_name is not None:
-            try:
-                kwargs["mp_context"] = multiprocessing.get_context(ctx_name)
-            except Exception:
-                pass
-        return concurrent.futures.ProcessPoolExecutor(
-            max_workers=plan.parallel_workers,
-            **kwargs,
-        )
+        return _create_process_pool_executor(max_workers=plan.parallel_workers)
     return concurrent.futures.ThreadPoolExecutor(max_workers=plan.parallel_workers)
 
 
@@ -2264,7 +2331,15 @@ def _defender_eval_worker(
         return float(cut_score), []
     if attacker is not None:
         ensure_attacker_genome_io(attacker)
-    score, metrics = evaluate_across_scenarios(scenarios, genome, attacker=attacker)
+    try:
+        score, metrics = _evaluate_with_timeout(
+            scenarios,
+            genome,
+            attacker=attacker,
+            timeout_seconds=float(DEFENDER_EVAL_TIMEOUT_SECONDS),
+        )
+    except TimeoutError:
+        return _timeout_cut_score(role="defender"), []
     if not bool(emit_rows):
         return float(score), []
     return float(score), _metrics_rows(metrics)
@@ -2284,11 +2359,19 @@ def _attacker_eval_worker(
     if over_budget:
         return float(cut_score), []
     ensure_genome_io(defender)
-    _, metrics = evaluate_across_scenarios(scenarios, defender, attacker=attacker)
+    try:
+        _, metrics = _evaluate_with_timeout(
+            scenarios,
+            defender,
+            attacker=attacker,
+            timeout_seconds=float(ATTACKER_EVAL_TIMEOUT_SECONDS),
+        )
+    except TimeoutError:
+        return _timeout_cut_score(role="attacker"), []
     attack_adv = _mean_metric(metrics, "attacker_advantage_score")
     lane_success = _mean_metric(metrics, "attacker_lane_success_rate")
     token_success = _mean_metric(metrics, "attacker_token_success_rate")
-    effective = len(attacker.extract_effective_algorithm())
+    effective = _estimated_effective_instruction_count(attacker)
     if effective == 0:
         score = attack_adv - 0.08
     else:
@@ -2317,7 +2400,16 @@ def _defender_eval_worker_batch(
         if over_budget:
             results.append((float(cut_score), []))
             continue
-        score, metrics = evaluate_across_scenarios(scenarios, genome, attacker=attacker)
+        try:
+            score, metrics = _evaluate_with_timeout(
+                scenarios,
+                genome,
+                attacker=attacker,
+                timeout_seconds=float(DEFENDER_EVAL_TIMEOUT_SECONDS),
+            )
+        except TimeoutError:
+            results.append((_timeout_cut_score(role="defender"), []))
+            continue
         rows = _metrics_rows(metrics) if bool(emit_rows) else []
         results.append((float(score), rows))
     return results
@@ -2340,11 +2432,20 @@ def _attacker_eval_worker_batch(
         if over_budget:
             results.append((float(cut_score), []))
             continue
-        _, metrics = evaluate_across_scenarios(scenarios, defender, attacker=attacker)
+        try:
+            _, metrics = _evaluate_with_timeout(
+                scenarios,
+                defender,
+                attacker=attacker,
+                timeout_seconds=float(ATTACKER_EVAL_TIMEOUT_SECONDS),
+            )
+        except TimeoutError:
+            results.append((_timeout_cut_score(role="attacker"), []))
+            continue
         attack_adv = _mean_metric(metrics, "attacker_advantage_score")
         lane_success = _mean_metric(metrics, "attacker_lane_success_rate")
         token_success = _mean_metric(metrics, "attacker_token_success_rate")
-        effective = len(attacker.extract_effective_algorithm())
+        effective = _estimated_effective_instruction_count(attacker)
         if effective == 0:
             score = attack_adv - 0.08
         else:
@@ -2353,6 +2454,74 @@ def _attacker_eval_worker_batch(
         rows = _metrics_rows(metrics) if bool(emit_rows) else []
         results.append((float(score), rows))
     return results
+
+
+def _genome_parallel_weight(genome: GFSLGenome, *, role: str) -> float:
+    total = len(genome.instructions)
+    if total <= 0:
+        return 1.0
+    effective = _estimated_effective_instruction_count(genome)
+    eff_scale = 1.90 if str(role).lower() == "attacker" else 1.70
+    return float(max(1, total) + (eff_scale * float(max(0, effective))))
+
+
+def _task_parallel_weight(task: Any, *, worker_fn) -> float:
+    if not isinstance(task, tuple) or not task:
+        return 1.0
+    try:
+        if worker_fn is _defender_eval_worker:
+            genome = task[0]
+            if isinstance(genome, GFSLGenome):
+                return _genome_parallel_weight(genome, role="defender")
+        if worker_fn is _attacker_eval_worker:
+            attacker = task[0]
+            if isinstance(attacker, GFSLGenome):
+                return _genome_parallel_weight(attacker, role="attacker")
+    except Exception:
+        return 1.0
+    return 1.0
+
+
+def _balanced_task_chunks(
+    tasks: Sequence[Any],
+    *,
+    worker_fn,
+    batch_size: int,
+) -> List[List[Any]]:
+    if not tasks:
+        return []
+    limit = max(1, int(batch_size))
+    chunk_count = int(math.ceil(float(len(tasks)) / float(limit)))
+    chunk_count = max(1, min(chunk_count, len(tasks)))
+
+    chunks: List[List[Any]] = [[] for _ in range(chunk_count)]
+    loads: List[float] = [0.0 for _ in range(chunk_count)]
+    ranked = [
+        (
+            _task_parallel_weight(task, worker_fn=worker_fn),
+            int(idx),
+            task,
+        )
+        for idx, task in enumerate(tasks)
+    ]
+    ranked.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+
+    for weight, _, task in ranked:
+        chosen_idx: Optional[int] = None
+        chosen_key: Optional[Tuple[float, int, int]] = None
+        for idx in range(chunk_count):
+            if len(chunks[idx]) >= limit:
+                continue
+            key = (loads[idx], len(chunks[idx]), idx)
+            if chosen_key is None or key < chosen_key:
+                chosen_idx = idx
+                chosen_key = key
+        if chosen_idx is None:
+            chosen_idx = min(range(chunk_count), key=lambda idx: (loads[idx], len(chunks[idx]), idx))
+        chunks[chosen_idx].append(task)
+        loads[chosen_idx] += float(weight)
+
+    return [chunk for chunk in chunks if chunk]
 
 
 def _evaluate_pending_parallel(
@@ -2394,7 +2563,14 @@ def _evaluate_pending_parallel(
             else:
                 normalized_tasks.append((*task, bool(store_metrics)))
         tasks = normalized_tasks
-    map_chunk_size = max(1, len(tasks) // max(1, workers * 2))
+    if backend == "process" and workers > 1:
+        # Keep process scheduling fine-grained enough to avoid long tail stalls.
+        if len(tasks) <= max(16, workers * 12):
+            map_chunk_size = 1
+        else:
+            map_chunk_size = max(1, len(tasks) // max(1, workers * 4))
+    else:
+        map_chunk_size = max(1, len(tasks) // max(1, workers * 2))
 
     def run_with_executor(
         exec_obj: concurrent.futures.Executor,
@@ -2428,28 +2604,13 @@ def _evaluate_pending_parallel(
     )
     if use_batch_chunks:
         batch_worker = _defender_eval_worker_batch if worker_fn is _defender_eval_worker else _attacker_eval_worker_batch
-        # Keep enough chunks to occupy worker lanes when task count is modest.
-        if len(tasks) <= max(8, workers * 2):
-            batch_size = 1
-        else:
-            if workers >= 24:
-                min_batch = 1
-            elif workers >= 12:
-                min_batch = 2
-            elif workers >= 6:
-                min_batch = 3
-            else:
-                min_batch = 4
-            # Start from a wider split, then cap so we still have >= workers chunks when possible.
-            batch_size = max(
-                min_batch,
-                int(math.ceil(len(tasks) / float(max(1, workers * 2)))),
-            )
-            if len(tasks) >= workers:
-                max_batch_for_full_fanout = max(1, len(tasks) // workers)
-                batch_size = min(batch_size, max_batch_for_full_fanout)
-        batch_size = min(32, batch_size)
-        task_chunks = [tasks[pos : pos + batch_size] for pos in range(0, len(tasks), batch_size)]
+        # One genome per process task avoids chunk-level stragglers that can idle most workers.
+        batch_size = 1
+        task_chunks = _balanced_task_chunks(
+            tasks,
+            worker_fn=worker_fn,
+            batch_size=batch_size,
+        )
         if worker_fn is _defender_eval_worker:
             batch_tasks = [
                 ([item[0] for item in chunk], chunk[0][1], chunk[0][2], bool(chunk[0][3]))
@@ -2472,14 +2633,7 @@ def _evaluate_pending_parallel(
             assign(flat_results)
             return
 
-        kwargs: Dict[str, Any] = {}
-        ctx_name = _process_pool_context_name()
-        if ctx_name is not None:
-            try:
-                kwargs["mp_context"] = multiprocessing.get_context(ctx_name)
-            except Exception:
-                pass
-        with concurrent.futures.ProcessPoolExecutor(max_workers=workers, **kwargs) as local_exec:
+        with _create_process_pool_executor(max_workers=workers) as local_exec:
             chunk_results = run_with_executor(
                 local_exec,
                 batch_worker,
@@ -2504,14 +2658,7 @@ def _evaluate_pending_parallel(
         return
 
     if backend == "process":
-        kwargs: Dict[str, Any] = {}
-        ctx_name = _process_pool_context_name()
-        if ctx_name is not None:
-            try:
-                kwargs["mp_context"] = multiprocessing.get_context(ctx_name)
-            except Exception:
-                pass
-        with concurrent.futures.ProcessPoolExecutor(max_workers=workers, **kwargs) as local_exec:
+        with _create_process_pool_executor(max_workers=workers) as local_exec:
             results = run_standard(local_exec)
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as local_exec:
