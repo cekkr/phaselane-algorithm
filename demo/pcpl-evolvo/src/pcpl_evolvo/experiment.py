@@ -94,6 +94,55 @@ def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, float(value)))
 
 
+MAX_DEFENDER_TOTAL_INSTRUCTIONS = 128
+MAX_DEFENDER_EFFECTIVE_INSTRUCTIONS = 72
+MAX_ATTACKER_TOTAL_INSTRUCTIONS = 96
+MAX_ATTACKER_EFFECTIVE_INSTRUCTIONS = 56
+
+
+def _complexity_limits(role: str) -> Tuple[int, int]:
+    role_norm = str(role).strip().lower()
+    if role_norm == "attacker":
+        return (
+            int(MAX_ATTACKER_TOTAL_INSTRUCTIONS),
+            int(MAX_ATTACKER_EFFECTIVE_INSTRUCTIONS),
+        )
+    return (
+        int(MAX_DEFENDER_TOTAL_INSTRUCTIONS),
+        int(MAX_DEFENDER_EFFECTIVE_INSTRUCTIONS),
+    )
+
+
+def _complexity_cut_score(*, role: str, total: int, effective: int) -> float:
+    total_limit, effective_limit = _complexity_limits(role)
+    total_excess = max(0, int(total) - int(total_limit))
+    effective_excess = max(0, int(effective) - int(effective_limit))
+    excess = float(total_excess + (2 * effective_excess))
+    base = -1.20 if str(role).lower() == "defender" else -0.45
+    return float(base - min(2.0, 0.015 * excess))
+
+
+def _is_genome_over_complexity_budget(genome: GFSLGenome, *, role: str) -> Tuple[bool, float]:
+    total_limit, effective_limit = _complexity_limits(role)
+    total = len(genome.instructions)
+    if total <= int(total_limit):
+        effective = len(genome.extract_effective_algorithm()) if total > 0 else 0
+        if effective <= int(effective_limit):
+            return False, 0.0
+        return True, _complexity_cut_score(
+            role=role,
+            total=total,
+            effective=effective,
+        )
+
+    effective = len(genome.extract_effective_algorithm()) if total > 0 else 0
+    return True, _complexity_cut_score(
+        role=role,
+        total=total,
+        effective=effective,
+    )
+
+
 def _invalidate_genome_caches(genome: GFSLGenome) -> None:
     genome._signature = None
     genome._effective_instructions = None
@@ -545,6 +594,8 @@ class SafeGFSLEvolver(GFSLEvolver):
         mutation_floor: float = 0.12,
         mutation_ceiling: float = 0.55,
         mutation_step: float = 0.05,
+        max_instruction_count: int = MAX_DEFENDER_TOTAL_INSTRUCTIONS,
+        max_effective_instruction_count: int = MAX_DEFENDER_EFFECTIVE_INSTRUCTIONS,
     ):
         super().__init__(population_size=population_size, supervised_guide=supervised_guide)
         self.parent_pool_ratio = max(0.25, min(1.0, float(parent_pool_ratio)))
@@ -552,10 +603,76 @@ class SafeGFSLEvolver(GFSLEvolver):
         self.mutation_floor = max(0.01, min(1.0, float(mutation_floor)))
         self.mutation_ceiling = max(self.mutation_floor, min(1.0, float(mutation_ceiling)))
         self.mutation_step = max(0.005, min(0.5, float(mutation_step)))
+        self.max_instruction_count = max(8, int(max_instruction_count))
+        self.max_effective_instruction_count = max(
+            4,
+            min(self.max_instruction_count, int(max_effective_instruction_count)),
+        )
         self.best_fitness_tracker = -float("inf")
         self.stagnation_count = 0
         self.best_signature_tracker = ""
         self.signature_stagnation_count = 0
+
+    def _enforce_complexity_budget(self, genome: GFSLGenome) -> None:
+        max_total = max(8, int(self.max_instruction_count))
+        max_effective = max(
+            4,
+            min(max_total, int(self.max_effective_instruction_count)),
+        )
+        if not genome.instructions:
+            return
+
+        total = len(genome.instructions)
+        if total <= max_total:
+            effective = len(genome.extract_effective_algorithm())
+            if effective <= max_effective:
+                return
+        else:
+            # Trim obvious dead weight first when genomes drift too large.
+            try:
+                genome.prune_stale_instructions(
+                    min_hits=1,
+                    include_never_used=True,
+                    keep_effective=True,
+                    max_pruned=max(0, total - max_total),
+                )
+            except Exception:
+                pass
+
+        effective_indices = list(genome.extract_effective_algorithm())
+        keep_effective = (
+            set(effective_indices[-max_effective:])
+            if len(effective_indices) > max_effective
+            else set(effective_indices)
+        )
+
+        target_keep = min(len(genome.instructions), max_total)
+        keep_indices = sorted(keep_effective)
+        if len(keep_indices) < target_keep:
+            for idx in range(len(genome.instructions) - 1, -1, -1):
+                if idx in keep_effective:
+                    continue
+                keep_indices.append(idx)
+                if len(keep_indices) >= target_keep:
+                    break
+
+        keep_indices = sorted(set(keep_indices))
+        if not keep_indices:
+            keep_indices = list(range(min(len(genome.instructions), max_total)))
+        if len(keep_indices) > max_total:
+            keep_indices = keep_indices[-max_total:]
+        if len(keep_indices) >= len(genome.instructions):
+            return
+
+        old_instructions = genome.instructions
+        old_activity = genome.instruction_activity
+        genome.instructions = [old_instructions[idx].copy() for idx in keep_indices]
+        genome.instruction_activity = [
+            copy.deepcopy(old_activity[idx])
+            for idx in keep_indices
+            if idx < len(old_activity)
+        ]
+        genome.rebuild_validator_state()
 
     def initialize_population(
         self,
@@ -662,11 +779,16 @@ class SafeGFSLEvolver(GFSLEvolver):
         operations: List[str] = ["slot", "add", "swap"]
         slot_weight = max(0.10, 0.46 - (0.16 * pressure))
         add_weight = 0.24 + (0.22 * pressure)
+        if instruction_count >= int(self.max_instruction_count):
+            add_weight = 0.02
         swap_weight = 0.10 + (0.10 * pressure)
         weights: List[float] = [slot_weight, add_weight, swap_weight]
         if instruction_count > 1:
             operations.append("remove")
-            weights.append(0.14 + (0.06 * pressure))
+            remove_weight = 0.14 + (0.06 * pressure)
+            if instruction_count >= int(self.max_instruction_count):
+                remove_weight += 0.18
+            weights.append(remove_weight)
         return random.choices(operations, weights=weights, k=1)[0]
 
     def mutate(self, genome: GFSLGenome) -> GFSLGenome:
@@ -700,6 +822,8 @@ class SafeGFSLEvolver(GFSLEvolver):
                     diversification=diversification,
                 ) or changed
             elif op == "add":
+                if len(mutated.instructions) >= int(self.max_instruction_count):
+                    continue
                 changed = (
                     _append_random_instruction_fast(
                         mutated,
@@ -735,12 +859,17 @@ class SafeGFSLEvolver(GFSLEvolver):
                     diversification=max(diversification, 0.45),
                 )
             if not changed:
-                changed = _append_random_instruction_fast(
-                    mutated,
-                    max_attempts=14,
-                )
+                if len(mutated.instructions) < int(self.max_instruction_count):
+                    changed = _append_random_instruction_fast(
+                        mutated,
+                        max_attempts=14,
+                    )
 
         mutated.rebuild_validator_state()
+        self._enforce_complexity_budget(mutated)
+        if not mutated.instructions:
+            _append_random_instruction_fast(mutated, max_attempts=8)
+            mutated.rebuild_validator_state()
         _invalidate_genome_caches(mutated)
         mutated.fitness = None
         mutated.generation = genome.generation
@@ -893,6 +1022,7 @@ class SafeGFSLEvolver(GFSLEvolver):
 
                 child.fitness = None
                 child.generation = gen + 1
+                self._enforce_complexity_budget(child)
 
                 force_mutation = stagnation_pressure >= 0.55 and random.random() < 0.70
                 if force_mutation or random.random() < self.mutation_rate:
@@ -902,6 +1032,7 @@ class SafeGFSLEvolver(GFSLEvolver):
                         child = self.mutate(child)
                     child.fitness = None
                     child.generation = gen + 1
+                    self._enforce_complexity_budget(child)
 
                 signature = _evaluation_signature(child)
                 if signature in seen:
@@ -1994,6 +2125,27 @@ def _should_stop_by_runtime_stats(
     ):
         return True, "runtime-budget-pressure"
 
+    flat_floor = max(16, int(math.ceil(float(total_generations) * 0.45)))
+    if len(generation_log) >= flat_floor:
+        flat_window = min(
+            len(generation_log),
+            max(10, int(math.ceil(float(total_generations) * 0.30))),
+        )
+        recent_flat = list(generation_log[-flat_window:])
+        recent_scores = [float(row.get(score_key, -float("inf"))) for row in recent_flat]
+        finite_scores = [score for score in recent_scores if math.isfinite(score)]
+        if finite_scores:
+            flat_gain = float(max(finite_scores) - min(finite_scores))
+            score_levels = {round(score, 8) for score in finite_scores}
+            if (
+                flat_gain <= max(0.00025, 0.40 * float(min_gain))
+                and len(score_levels) <= 2
+                and probe_win_rate <= 0.12
+                and avg_batch_seconds > (0.80 * target_secs)
+                and slow_batches >= max(3.0, 0.60 * float(flat_window))
+            ):
+                return True, "flat-score-window"
+
     return False, ""
 
 
@@ -2107,6 +2259,9 @@ def _defender_eval_worker(
     else:
         genome, scenarios, attacker, emit_rows = task
     ensure_genome_io(genome)
+    over_budget, cut_score = _is_genome_over_complexity_budget(genome, role="defender")
+    if over_budget:
+        return float(cut_score), []
     if attacker is not None:
         ensure_attacker_genome_io(attacker)
     score, metrics = evaluate_across_scenarios(scenarios, genome, attacker=attacker)
@@ -2125,6 +2280,9 @@ def _attacker_eval_worker(
     else:
         attacker, defender, scenarios, emit_rows = task
     ensure_attacker_genome_io(attacker)
+    over_budget, cut_score = _is_genome_over_complexity_budget(attacker, role="attacker")
+    if over_budget:
+        return float(cut_score), []
     ensure_genome_io(defender)
     _, metrics = evaluate_across_scenarios(scenarios, defender, attacker=attacker)
     attack_adv = _mean_metric(metrics, "attacker_advantage_score")
@@ -2155,6 +2313,10 @@ def _defender_eval_worker_batch(
     results: List[Tuple[float, List[Dict[str, Any]]]] = []
     for genome in genomes:
         ensure_genome_io(genome)
+        over_budget, cut_score = _is_genome_over_complexity_budget(genome, role="defender")
+        if over_budget:
+            results.append((float(cut_score), []))
+            continue
         score, metrics = evaluate_across_scenarios(scenarios, genome, attacker=attacker)
         rows = _metrics_rows(metrics) if bool(emit_rows) else []
         results.append((float(score), rows))
@@ -2174,6 +2336,10 @@ def _attacker_eval_worker_batch(
     results: List[Tuple[float, List[Dict[str, Any]]]] = []
     for attacker in attackers:
         ensure_attacker_genome_io(attacker)
+        over_budget, cut_score = _is_genome_over_complexity_budget(attacker, role="attacker")
+        if over_budget:
+            results.append((float(cut_score), []))
+            continue
         _, metrics = evaluate_across_scenarios(scenarios, defender, attacker=attacker)
         attack_adv = _mean_metric(metrics, "attacker_advantage_score")
         lane_success = _mean_metric(metrics, "attacker_lane_success_rate")
@@ -2262,15 +2428,26 @@ def _evaluate_pending_parallel(
     )
     if use_batch_chunks:
         batch_worker = _defender_eval_worker_batch if worker_fn is _defender_eval_worker else _attacker_eval_worker_batch
-        if workers >= 24:
-            min_batch = 1
-        elif workers >= 12:
-            min_batch = 2
-        elif workers >= 6:
-            min_batch = 3
+        # Keep enough chunks to occupy worker lanes when task count is modest.
+        if len(tasks) <= max(8, workers * 2):
+            batch_size = 1
         else:
-            min_batch = 4
-        batch_size = max(min_batch, int(math.ceil(len(tasks) / float(max(1, workers)))))
+            if workers >= 24:
+                min_batch = 1
+            elif workers >= 12:
+                min_batch = 2
+            elif workers >= 6:
+                min_batch = 3
+            else:
+                min_batch = 4
+            # Start from a wider split, then cap so we still have >= workers chunks when possible.
+            batch_size = max(
+                min_batch,
+                int(math.ceil(len(tasks) / float(max(1, workers * 2)))),
+            )
+            if len(tasks) >= workers:
+                max_batch_for_full_fanout = max(1, len(tasks) // workers)
+                batch_size = min(batch_size, max_batch_for_full_fanout)
         batch_size = min(32, batch_size)
         task_chunks = [tasks[pos : pos + batch_size] for pos in range(0, len(tasks), batch_size)]
         if worker_fn is _defender_eval_worker:
@@ -3283,6 +3460,20 @@ def _run_defender_round(
 ) -> Tuple[SafeGFSLEvolver, List[Dict[str, Any]]]:
     guide = _build_supervised_guide_if_available(config, resource_plan)
     evolver_guide = None if bool(config.supervised_end_round_only) else guide
+    defender_instruction_cap = max(
+        64,
+        min(
+            int(MAX_DEFENDER_TOTAL_INSTRUCTIONS),
+            int(math.ceil(float(config.initial_instructions) * 6.0)),
+        ),
+    )
+    defender_effective_cap = max(
+        32,
+        min(
+            defender_instruction_cap,
+            int(math.ceil(float(defender_instruction_cap) * 0.62)),
+        ),
+    )
     evolver = SafeGFSLEvolver(
         population_size=config.population_size,
         supervised_guide=evolver_guide,
@@ -3291,6 +3482,8 @@ def _run_defender_round(
         mutation_floor=config.mutation_floor,
         mutation_ceiling=config.mutation_ceiling,
         mutation_step=config.mutation_step,
+        max_instruction_count=defender_instruction_cap,
+        max_effective_instruction_count=defender_effective_cap,
     )
     _seed_population_from_archive(
         evolver=evolver,
@@ -3301,6 +3494,9 @@ def _run_defender_round(
         initial_instructions=config.initial_instructions,
         elite_pool=config.elite_pool,
     )
+    for genome in evolver.population:
+        evolver._enforce_complexity_budget(genome)
+        _invalidate_genome_caches(genome)
 
     generation_log: List[Dict[str, Any]] = []
     archive_signatures = {
@@ -4030,6 +4226,21 @@ def _run_attacker_round(
 ) -> Tuple[SafeGFSLEvolver, List[Dict[str, Any]]]:
     guide = _build_supervised_guide_if_available(config, resource_plan)
     evolver_guide = None if bool(config.supervised_end_round_only) else guide
+    attacker_seed_budget = max(4, config.initial_instructions // 2)
+    attacker_instruction_cap = max(
+        40,
+        min(
+            int(MAX_ATTACKER_TOTAL_INSTRUCTIONS),
+            int(math.ceil(float(attacker_seed_budget) * 6.0)),
+        ),
+    )
+    attacker_effective_cap = max(
+        24,
+        min(
+            attacker_instruction_cap,
+            int(math.ceil(float(attacker_instruction_cap) * 0.60)),
+        ),
+    )
     evolver = SafeGFSLEvolver(
         population_size=config.attacker_population_size,
         supervised_guide=evolver_guide,
@@ -4038,6 +4249,8 @@ def _run_attacker_round(
         mutation_floor=config.mutation_floor,
         mutation_ceiling=config.mutation_ceiling,
         mutation_step=config.mutation_step,
+        max_instruction_count=attacker_instruction_cap,
+        max_effective_instruction_count=attacker_effective_cap,
     )
     _seed_population_from_archive(
         evolver=evolver,
@@ -4045,9 +4258,12 @@ def _run_attacker_round(
         io_initializer=ensure_attacker_genome_io,
         reference_anchor_factory=None,
         population_size=config.attacker_population_size,
-        initial_instructions=max(4, config.initial_instructions // 2),
+        initial_instructions=attacker_seed_budget,
         elite_pool=max(4, config.elite_pool // 2),
     )
+    for attacker_genome in evolver.population:
+        evolver._enforce_complexity_budget(attacker_genome)
+        _invalidate_genome_caches(attacker_genome)
 
     generation_log: List[Dict[str, Any]] = []
     archive_signatures = {
