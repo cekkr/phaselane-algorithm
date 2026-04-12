@@ -1669,19 +1669,19 @@ def _idle_random_trial_budget(
         return 0
     if pending_count <= 0:
         return 0
-    if float(elapsed_seconds) >= (0.92 * max(0.25, float(target_seconds))):
-        return 0
+    _ = (elapsed_seconds, target_seconds)
 
     current_load = max(0.0, float(full_eval) + float(probe_samples))
-    desired_load = max(float(lanes), min(float(pending_count), float(lanes) * 1.45))
+    desired_load = max(float(lanes) * 1.25, min(float(pending_count), float(lanes) * 2.0))
     gap = int(math.ceil(desired_load - current_load))
     if gap <= 0:
         return 0
 
     if pending_count < lanes:
-        cap = max(2, lanes)
+        cap = max(2, int(math.ceil(float(lanes) * 1.25)))
     else:
-        cap = max(2, min(pending_count, lanes))
+        cap = max(2, lanes)
+    cap = min(cap, max(2, pending_count * 2))
     return max(0, min(gap, cap))
 
 
@@ -2230,9 +2230,16 @@ def _evaluate_pending_parallel(
         tasks = normalized_tasks
     map_chunk_size = max(1, len(tasks) // max(1, workers * 2))
 
-    def run_with_executor(exec_obj: concurrent.futures.Executor, fn, task_list):
+    def run_with_executor(
+        exec_obj: concurrent.futures.Executor,
+        fn,
+        task_list,
+        *,
+        process_chunksize: Optional[int] = None,
+    ):
         if isinstance(exec_obj, concurrent.futures.ProcessPoolExecutor):
-            return list(exec_obj.map(fn, task_list, chunksize=map_chunk_size))
+            chunk_size = map_chunk_size if process_chunksize is None else int(process_chunksize)
+            return list(exec_obj.map(fn, task_list, chunksize=max(1, chunk_size)))
         return list(exec_obj.map(fn, task_list))
 
     def assign(results: Sequence[Tuple[float, List[Dict[str, Any]]]]) -> None:
@@ -2278,7 +2285,12 @@ def _evaluate_pending_parallel(
             ]
 
         if executor is not None:
-            chunk_results = run_with_executor(executor, batch_worker, batch_tasks)
+            chunk_results = run_with_executor(
+                executor,
+                batch_worker,
+                batch_tasks,
+                process_chunksize=1,
+            )
             flat_results = [item for chunk in chunk_results for item in chunk]
             assign(flat_results)
             return
@@ -2291,13 +2303,23 @@ def _evaluate_pending_parallel(
             except Exception:
                 pass
         with concurrent.futures.ProcessPoolExecutor(max_workers=workers, **kwargs) as local_exec:
-            chunk_results = run_with_executor(local_exec, batch_worker, batch_tasks)
+            chunk_results = run_with_executor(
+                local_exec,
+                batch_worker,
+                batch_tasks,
+                process_chunksize=1,
+            )
         flat_results = [item for chunk in chunk_results for item in chunk]
         assign(flat_results)
         return
 
     def run_standard(exec_obj: concurrent.futures.Executor):
-        return run_with_executor(exec_obj, worker_fn, tasks)
+        return run_with_executor(
+            exec_obj,
+            worker_fn,
+            tasks,
+            process_chunksize=map_chunk_size,
+        )
 
     if executor is not None:
         results = run_standard(executor)
@@ -3670,6 +3692,39 @@ def _run_defender_round(
         ]
         local_stage["mid_eval"] = float(len(mid_pending))
         if not mid_pending:
+            full_fp = _scenario_fingerprint(full_scenarios)
+            trial_stats = _evaluate_idle_random_trials(
+                pending=pending,
+                workers=resource_plan.parallel_workers,
+                full_eval=local_stage["full_eval"],
+                probe_samples=0.0,
+                elapsed_seconds=float(time.perf_counter() - eval_started),
+                target_seconds=float(config.target_generation_seconds),
+                backend=resource_plan.parallel_backend,
+                executor=shared_executor,
+                worker_fn=_defender_eval_worker,
+                build_task=lambda g: (
+                    g,
+                    full_scenarios,
+                    attacker,
+                ),
+                attr_name="_pcpl_metrics",
+                cache=stage_cache,
+                cache_key_fn=lambda g, sf=full_fp: "def:trial-early-mid:{sf}:{att}:{sig}".format(
+                    sf=sf,
+                    att=attacker_signature,
+                    sig=_evaluation_signature(g),
+                ),
+                max_cache_entries=cache_limit,
+                random_genome_fn=lambda: _make_random_genome(
+                    max(4, int(math.ceil(float(config.initial_instructions) * 0.85)))
+                ),
+            )
+            local_stage["random_trials"] = float(trial_stats["trial_count"])
+            local_stage["random_injected"] = float(trial_stats["trial_injected"])
+            local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
+            local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
+            local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
@@ -3761,6 +3816,39 @@ def _run_defender_round(
         ]
         local_stage["full_eval"] = float(len(full_pending))
         if not full_pending:
+            full_fp = _scenario_fingerprint(full_scenarios)
+            trial_stats = _evaluate_idle_random_trials(
+                pending=pending,
+                workers=resource_plan.parallel_workers,
+                full_eval=local_stage["full_eval"],
+                probe_samples=0.0,
+                elapsed_seconds=float(time.perf_counter() - eval_started),
+                target_seconds=float(config.target_generation_seconds),
+                backend=resource_plan.parallel_backend,
+                executor=shared_executor,
+                worker_fn=_defender_eval_worker,
+                build_task=lambda g: (
+                    g,
+                    full_scenarios,
+                    attacker,
+                ),
+                attr_name="_pcpl_metrics",
+                cache=stage_cache,
+                cache_key_fn=lambda g, sf=full_fp: "def:trial-early-full:{sf}:{att}:{sig}".format(
+                    sf=sf,
+                    att=attacker_signature,
+                    sig=_evaluation_signature(g),
+                ),
+                max_cache_entries=cache_limit,
+                random_genome_fn=lambda: _make_random_genome(
+                    max(4, int(math.ceil(float(config.initial_instructions) * 0.85)))
+                ),
+            )
+            local_stage["random_trials"] = float(trial_stats["trial_count"])
+            local_stage["random_injected"] = float(trial_stats["trial_injected"])
+            local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
+            local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
+            local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
@@ -4351,6 +4439,39 @@ def _run_attacker_round(
         ]
         local_stage["mid_eval"] = float(len(mid_pending))
         if not mid_pending:
+            full_fp = _scenario_fingerprint(full_scenarios)
+            trial_stats = _evaluate_idle_random_trials(
+                pending=pending,
+                workers=resource_plan.parallel_workers,
+                full_eval=local_stage["full_eval"],
+                probe_samples=0.0,
+                elapsed_seconds=float(time.perf_counter() - eval_started),
+                target_seconds=float(config.target_generation_seconds),
+                backend=resource_plan.parallel_backend,
+                executor=shared_executor,
+                worker_fn=_attacker_eval_worker,
+                build_task=lambda attacker_genome: (
+                    attacker_genome,
+                    defender,
+                    full_scenarios,
+                ),
+                attr_name="_attack_metrics",
+                cache=stage_cache,
+                cache_key_fn=lambda g, sf=full_fp: "atk:trial-early-mid:{sf}:{def_sig}:{sig}".format(
+                    sf=sf,
+                    def_sig=defender_signature,
+                    sig=_evaluation_signature(g),
+                ),
+                max_cache_entries=cache_limit,
+                random_genome_fn=lambda: _make_random_genome(
+                    max(4, int(math.ceil(float(max(4, config.initial_instructions // 2)) * 0.95)))
+                ),
+            )
+            local_stage["random_trials"] = float(trial_stats["trial_count"])
+            local_stage["random_injected"] = float(trial_stats["trial_injected"])
+            local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
+            local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
+            local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
@@ -4441,6 +4562,39 @@ def _run_attacker_round(
         ]
         local_stage["full_eval"] = float(len(full_pending))
         if not full_pending:
+            full_fp = _scenario_fingerprint(full_scenarios)
+            trial_stats = _evaluate_idle_random_trials(
+                pending=pending,
+                workers=resource_plan.parallel_workers,
+                full_eval=local_stage["full_eval"],
+                probe_samples=0.0,
+                elapsed_seconds=float(time.perf_counter() - eval_started),
+                target_seconds=float(config.target_generation_seconds),
+                backend=resource_plan.parallel_backend,
+                executor=shared_executor,
+                worker_fn=_attacker_eval_worker,
+                build_task=lambda attacker_genome: (
+                    attacker_genome,
+                    defender,
+                    full_scenarios,
+                ),
+                attr_name="_attack_metrics",
+                cache=stage_cache,
+                cache_key_fn=lambda g, sf=full_fp: "atk:trial-early-full:{sf}:{def_sig}:{sig}".format(
+                    sf=sf,
+                    def_sig=defender_signature,
+                    sig=_evaluation_signature(g),
+                ),
+                max_cache_entries=cache_limit,
+                random_genome_fn=lambda: _make_random_genome(
+                    max(4, int(math.ceil(float(max(4, config.initial_instructions // 2)) * 0.95)))
+                ),
+            )
+            local_stage["random_trials"] = float(trial_stats["trial_count"])
+            local_stage["random_injected"] = float(trial_stats["trial_injected"])
+            local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
+            local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
+            local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
@@ -4754,19 +4908,33 @@ def run_continuous_experiment(
                 top_candidates = defender_evolver.population[:]
             top_candidates = top_candidates[: min(5, len(top_candidates))]
             selected_defender = top_candidates[0]
-            selected_metrics: List[ScenarioMetrics] = []
-            selected_score = -float("inf")
+            candidate_pending = list(enumerate(top_candidates))
             for candidate in top_candidates:
                 ensure_genome_io(candidate)
-                score, metrics = evaluate_across_scenarios(
+            _evaluate_pending_parallel(
+                pending=candidate_pending,
+                backend=resource_plan.parallel_backend,
+                workers=resource_plan.parallel_workers,
+                executor=shared_executor,
+                worker_fn=_defender_eval_worker,
+                build_task=lambda g: (
+                    g,
                     selection_scenarios,
-                    candidate,
-                    attacker=best_attacker,
-                )
-                if score > selected_score:
-                    selected_score = score
-                    selected_metrics = metrics
-                    selected_defender = candidate
+                    best_attacker,
+                ),
+                attr_name="_pcpl_metrics",
+                store_metrics=False,
+            )
+            selected_defender = max(
+                top_candidates,
+                key=lambda genome: float(genome.fitness or -float("inf")),
+            )
+            selected_score = float(selected_defender.fitness or -float("inf"))
+            _, selected_metrics = evaluate_across_scenarios(
+                selection_scenarios,
+                selected_defender,
+                attacker=best_attacker,
+            )
 
             reference_defender = build_reference_defender_genome()
             ensure_genome_io(reference_defender)
@@ -4776,12 +4944,7 @@ def run_continuous_experiment(
                 attacker=best_attacker,
             )
 
-            attacker_score, attacker_metrics = evaluate_across_scenarios(
-                selection_scenarios,
-                selected_defender,
-                attacker=best_attacker,
-            )
-            attack_adv = _mean_metric(attacker_metrics, "attacker_advantage_score")
+            attack_adv = _mean_metric(selected_metrics, "attacker_advantage_score")
 
             defender_signature = selected_defender.get_signature()
             attacker_signature = best_attacker.get_signature()
@@ -4804,7 +4967,7 @@ def run_continuous_experiment(
                 "score": float(attack_adv),
                 "signature": attacker_signature,
                 "canonical_signature": _canonical_signature(best_attacker),
-                "metrics": _metrics_rows(attacker_metrics),
+                "metrics": _metrics_rows(selected_metrics),
                 "genome": _serialize_genome(best_attacker, role="attacker"),
             }
 
