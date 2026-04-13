@@ -8,6 +8,7 @@ import math
 import random
 import time
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .bootstrap import ensure_evolvo_importable, load_reference_pcpl
@@ -264,6 +265,16 @@ class ScenarioMetrics:
     device_compound_ratio: float
     provider_compound_ratio: float
     elapsed_seconds: float
+    qft_score: float = 0.0
+    qft_period_bits: float = 0.0
+    qft_period_ratio: float = 0.0
+    linear_rank_score: float = 0.0
+    linear_rank_mod2_ratio: float = 0.0
+    linear_rank_mod65537_ratio: float = 0.0
+    linear_rank_unique_ratio: float = 0.0
+    compare_x_score: float = 0.0
+    compare_x_period_ratio: float = 0.0
+    compare_x_chain_ratio: float = 0.0
 
     def to_dict(self) -> Dict[str, float]:
         return asdict(self)
@@ -295,6 +306,156 @@ def _budget_score(ratio: float) -> float:
     if ratio <= 1.0:
         return 1.0
     return 1.0 / (1.0 + (ratio - 1.0))
+
+
+def _analysis_seed_label(scenario_name: str, base_x: int, x_value: int) -> str:
+    if int(x_value) == int(base_x):
+        return f"PARAMS:{scenario_name}"
+    return f"PARAMS:{scenario_name}:COMPARE_X:{int(x_value)}"
+
+
+@lru_cache(maxsize=1024)
+def _period_bits_for_x(
+    x_value: int,
+    token_bits: int,
+    prime_mode: str,
+    prime_bits: int,
+    modulus_bits: int,
+    seed: int,
+    scenario_name: str,
+    base_x: int,
+) -> int:
+    pcpl = load_reference_pcpl()
+    build_params = pcpl["build_params"]
+    derive_seed = pcpl["derive_seed"]
+    schedule_period = pcpl["schedule_period"]
+
+    param_rng = None
+    if str(prime_mode) == "generated":
+        label = _analysis_seed_label(str(scenario_name), int(base_x), int(x_value))
+        param_rng = random.Random(derive_seed(int(seed), label))
+
+    params = build_params(
+        int(x_value),
+        int(token_bits),
+        prime_mode=str(prime_mode),
+        prime_bits=int(prime_bits),
+        modulus_bits=int(modulus_bits),
+        rng=param_rng,
+    )
+    return int(schedule_period(params)).bit_length()
+
+
+@lru_cache(maxsize=512)
+def _compare_x_profile(
+    x_value: int,
+    token_bits: int,
+    prime_mode: str,
+    prime_bits: int,
+    modulus_bits: int,
+    seed: int,
+    scenario_name: str,
+) -> Tuple[float, float, float]:
+    candidates = sorted(set((2, 3, 4, 5, 6, int(x_value))))
+    period_bits = [
+        _period_bits_for_x(
+            int(candidate),
+            int(token_bits),
+            str(prime_mode),
+            int(prime_bits),
+            int(modulus_bits),
+            int(seed),
+            str(scenario_name),
+            int(x_value),
+        )
+        for candidate in candidates
+    ]
+
+    current_bits = float(
+        _period_bits_for_x(
+            int(x_value),
+            int(token_bits),
+            str(prime_mode),
+            int(prime_bits),
+            int(modulus_bits),
+            int(seed),
+            str(scenario_name),
+            int(x_value),
+        )
+    )
+    max_bits = float(max(period_bits)) if period_bits else max(1.0, current_bits)
+    min_bits = float(min(period_bits)) if period_bits else min(1.0, current_bits)
+
+    ratio_vs_max = clamp(current_bits / float(max(1.0, max_bits)), 0.0, 1.0)
+    if max_bits <= min_bits:
+        ratio_vs_span = 1.0
+    else:
+        ratio_vs_span = clamp((current_bits - min_bits) / (max_bits - min_bits), 0.0, 1.0)
+    compare_x_period_ratio = clamp((0.70 * ratio_vs_max) + (0.30 * ratio_vs_span), 0.0, 1.0)
+    compare_x_chain_ratio = clamp(
+        float(max(1, int(x_value) - 1)) / float(max(1, max(candidates) - 1)),
+        0.0,
+        1.0,
+    )
+    return current_bits, compare_x_period_ratio, compare_x_chain_ratio
+
+
+@lru_cache(maxsize=1024)
+def _linear_rank_profile(
+    x_value: int,
+    token_bits: int,
+    prime_mode: str,
+    prime_bits: int,
+    modulus_bits: int,
+    seed: int,
+    scenario_name: str,
+    num_compounds: int,
+    window: int,
+) -> Tuple[float, float, float]:
+    pcpl = load_reference_pcpl()
+    build_params = pcpl["build_params"]
+    derive_seed = pcpl["derive_seed"]
+    exponent_vector = pcpl["exponent_vector"]
+    phase_clock = pcpl["phase_clock"]
+    rank_mod = pcpl["rank_mod"]
+
+    param_rng = None
+    if str(prime_mode) == "generated":
+        param_rng = random.Random(derive_seed(int(seed), f"PARAMS:{str(scenario_name)}"))
+
+    params = build_params(
+        int(x_value),
+        int(token_bits),
+        prime_mode=str(prime_mode),
+        prime_bits=int(prime_bits),
+        modulus_bits=int(modulus_bits),
+        rng=param_rng,
+    )
+
+    compound_count = max(2, int(num_compounds))
+    sample_window = max(8, min(128, int(window)))
+    matrices: Dict[str, List[List[int]]] = {"A": [], "B": [], "C": []}
+
+    for t in range(sample_window):
+        phase = phase_clock(t, params)
+        matrices["A"].append(exponent_vector(compound_count, phase.a, phase.u1, params))
+        matrices["B"].append(exponent_vector(compound_count, phase.b, phase.u2, params))
+        matrices["C"].append(exponent_vector(compound_count, phase.c, phase.u3, params))
+
+    mod2_ratios: List[float] = []
+    modp_ratios: List[float] = []
+    unique_ratios: List[float] = []
+    for rows in matrices.values():
+        unique_rows = len({tuple(row) for row in rows})
+        unique_ratios.append(unique_rows / float(max(1, sample_window)))
+        mod2_ratios.append(rank_mod(rows, 2) / float(max(1, compound_count)))
+        modp_ratios.append(rank_mod(rows, 65537) / float(max(1, compound_count)))
+
+    return (
+        clamp(sum(mod2_ratios) / float(max(1, len(mod2_ratios))), 0.0, 1.0),
+        clamp(sum(modp_ratios) / float(max(1, len(modp_ratios))), 0.0, 1.0),
+        clamp(sum(unique_ratios) / float(max(1, len(unique_ratios))), 0.0, 1.0),
+    )
 
 
 def default_scenarios(profile: str = "fast") -> List[ScenarioConfig]:
@@ -1313,13 +1474,62 @@ def evaluate_scenario(
         1.0,
     )
 
+    qft_period_bits, compare_x_period_ratio, compare_x_chain_ratio = _compare_x_profile(
+        params.x,
+        scenario.token_bits,
+        scenario.prime_mode,
+        scenario.prime_bits,
+        scenario.modulus_bits,
+        scenario.seed,
+        scenario.name,
+    )
+    qft_target_bits = float(max(32, min(128, int(scenario.token_bits))))
+    qft_period_ratio = clamp(float(qft_period_bits) / qft_target_bits, 0.0, 1.0)
+    qft_score = clamp((0.58 * qft_period_ratio) + (0.42 * horizon_sync_score), 0.0, 1.0)
+
+    avg_active_compounds = device_compound_total / float(max(1, scenario.cycles))
+    rank_compounds = max(2, min(int(scenario.compound_count), int(round(avg_active_compounds))))
+    linear_rank_mod2_ratio, linear_rank_mod65537_ratio, linear_rank_unique_ratio = _linear_rank_profile(
+        params.x,
+        scenario.token_bits,
+        scenario.prime_mode,
+        scenario.prime_bits,
+        scenario.modulus_bits,
+        scenario.seed,
+        scenario.name,
+        rank_compounds,
+        min(64, scenario.cycles),
+    )
+    linear_rank_core = (
+        0.44 * linear_rank_mod2_ratio
+        + 0.44 * linear_rank_mod65537_ratio
+        + 0.12 * linear_rank_unique_ratio
+    )
+    linear_rank_score = clamp(
+        (0.80 * linear_rank_core) + (0.20 * (1.0 - controller_fail_rate)),
+        0.0,
+        1.0,
+    )
+
+    compare_x_score = clamp(
+        0.40 * compare_x_period_ratio
+        + 0.20 * compare_x_chain_ratio
+        + 0.25 * one_of_x_rate
+        + 0.15 * block_once_rate,
+        0.0,
+        1.0,
+    )
+
     total_score = (
-        0.30 * principle_score
-        + 0.20 * sync_score
-        + 0.24 * security_score
-        + 0.16 * cost_score
-        + 0.06 * runtime_score
-        + 0.04 * stability_score
+        0.22 * principle_score
+        + 0.25 * sync_score
+        + 0.20 * security_score
+        + 0.10 * cost_score
+        + 0.03 * runtime_score
+        + 0.10 * stability_score
+        + 0.04 * qft_score
+        + 0.03 * linear_rank_score
+        + 0.03 * compare_x_score
     )
 
     if one_of_x_rate < 1.0:
@@ -1374,6 +1584,16 @@ def evaluate_scenario(
         device_compound_ratio=device_compound_ratio,
         provider_compound_ratio=provider_compound_ratio,
         elapsed_seconds=elapsed,
+        qft_score=qft_score,
+        qft_period_bits=float(qft_period_bits),
+        qft_period_ratio=qft_period_ratio,
+        linear_rank_score=linear_rank_score,
+        linear_rank_mod2_ratio=linear_rank_mod2_ratio,
+        linear_rank_mod65537_ratio=linear_rank_mod65537_ratio,
+        linear_rank_unique_ratio=linear_rank_unique_ratio,
+        compare_x_score=compare_x_score,
+        compare_x_period_ratio=compare_x_period_ratio,
+        compare_x_chain_ratio=compare_x_chain_ratio,
     )
 
 

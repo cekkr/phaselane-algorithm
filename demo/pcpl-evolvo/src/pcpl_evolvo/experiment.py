@@ -3124,15 +3124,21 @@ def _metrics_rows(metrics: Sequence[Any]) -> List[Dict[str, Any]]:
 
 def _scenario_table(metrics: Sequence[Any]) -> str:
     lines = []
-    lines.append("| scenario | total | principle | sync | security | cost | op-cost | attacker-adv |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append(
+        "| scenario | total | principle | sync | stability | security | qft | linear-rank | compare-x | cost | op-cost | attacker-adv |"
+    )
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for metric in metrics:
         if isinstance(metric, dict):
             scenario = str(metric.get("scenario", "n/a"))
             total = float(metric.get("total_score", 0.0))
             principle = float(metric.get("principle_score", 0.0))
             sync = float(metric.get("sync_score", 0.0))
+            stability = float(metric.get("stability_score", 0.0))
             security = float(metric.get("security_score", 0.0))
+            qft = float(metric.get("qft_score", 0.0))
+            linear_rank = float(metric.get("linear_rank_score", 0.0))
+            compare_x = float(metric.get("compare_x_score", 0.0))
             cost = float(metric.get("cost_score", 0.0))
             op_cost = float(metric.get("operation_cost_score", 0.0))
             attack_adv = float(metric.get("attacker_advantage_score", 0.0))
@@ -3141,17 +3147,25 @@ def _scenario_table(metrics: Sequence[Any]) -> str:
             total = float(getattr(metric, "total_score", 0.0))
             principle = float(getattr(metric, "principle_score", 0.0))
             sync = float(getattr(metric, "sync_score", 0.0))
+            stability = float(getattr(metric, "stability_score", 0.0))
             security = float(getattr(metric, "security_score", 0.0))
+            qft = float(getattr(metric, "qft_score", 0.0))
+            linear_rank = float(getattr(metric, "linear_rank_score", 0.0))
+            compare_x = float(getattr(metric, "compare_x_score", 0.0))
             cost = float(getattr(metric, "cost_score", 0.0))
             op_cost = float(getattr(metric, "operation_cost_score", 0.0))
             attack_adv = float(getattr(metric, "attacker_advantage_score", 0.0))
         lines.append(
-            "| {name} | {total:.4f} | {principle:.4f} | {sync:.4f} | {security:.4f} | {cost:.4f} | {op_cost:.4f} | {attack_adv:.4f} |".format(
+            "| {name} | {total:.4f} | {principle:.4f} | {sync:.4f} | {stability:.4f} | {security:.4f} | {qft:.4f} | {linear_rank:.4f} | {compare_x:.4f} | {cost:.4f} | {op_cost:.4f} | {attack_adv:.4f} |".format(
                 name=scenario,
                 total=total,
                 principle=principle,
                 sync=sync,
+                stability=stability,
                 security=security,
+                qft=qft,
+                linear_rank=linear_rank,
+                compare_x=compare_x,
                 cost=cost,
                 op_cost=op_cost,
                 attack_adv=attack_adv,
@@ -3525,6 +3539,9 @@ def _build_round_report(
                 ("cost_score", "cost"),
                 ("runtime_score", "runtime"),
                 ("stability_score", "stability"),
+                ("qft_score", "qft"),
+                ("linear_rank_score", "linear-rank"),
+                ("compare_x_score", "compare-x"),
                 ("attacker_advantage_score", "attacker-adv"),
             ]
             for key, label in key_specs:
@@ -3767,6 +3784,24 @@ def _pcpl_improvement_findings(
             "Reduce controller-fail paths by specifying safe fallback transitions and bounded state-churn rules.",
         ),
         (
+            "qft_score",
+            True,
+            "QFT Period Margin",
+            "Increase public period headroom and couple long-horizon timing assumptions with explicit QFT-visible bounds.",
+        ),
+        (
+            "linear_rank_score",
+            True,
+            "Linear-Rank Difficulty",
+            "Increase pre-hash exponent linear independence (mod 2 / mod 65537) and document expected rank floors.",
+        ),
+        (
+            "compare_x_score",
+            True,
+            "Compare-X Scalability",
+            "Validate stronger cross-x behavior by preserving one-of-x/per-block guarantees while x grows.",
+        ),
+        (
             "attacker_advantage_score",
             False,
             "Attacker Advantage",
@@ -3917,21 +3952,29 @@ def _write_view_outputs(
         defender_mean = _mean_metrics_row(best_metrics_rows)
         conclusion_lines.append("## Best Defender Summary")
         conclusion_lines.append(
-            "- score={score:.6f}, principle={principle:.4f}, security={security:.4f}, sync={sync:.4f}, cost={cost:.4f}".format(
+            "- score={score:.6f}, principle={principle:.4f}, security={security:.4f}, sync={sync:.4f}, stability={stability:.4f}, qft={qft:.4f}, linear_rank={linear_rank:.4f}, compare_x={compare_x:.4f}, cost={cost:.4f}".format(
                 score=float(best_defender[0].get("score", 0.0)),
                 principle=float(defender_mean.get("principle_score", 0.0)),
                 security=float(defender_mean.get("security_score", 0.0)),
                 sync=float(defender_mean.get("sync_score", 0.0)),
+                stability=float(defender_mean.get("stability_score", 0.0)),
+                qft=float(defender_mean.get("qft_score", 0.0)),
+                linear_rank=float(defender_mean.get("linear_rank_score", 0.0)),
+                compare_x=float(defender_mean.get("compare_x_score", 0.0)),
                 cost=float(defender_mean.get("cost_score", 0.0)),
             )
         )
         conclusion_lines.append(
-            "- brute_force_resistance={bf:.4f}, reverse_hack_resistance={rh:.4f}, sync_loss={sl:.4f}, projected_sync_loss_10s={psl:.4f}, horizon_sync={hs:.4f}".format(
+            "- brute_force_resistance={bf:.4f}, reverse_hack_resistance={rh:.4f}, sync_loss={sl:.4f}, projected_sync_loss_10s={psl:.4f}, horizon_sync={hs:.4f}, qft_bits={qft_bits:.1f}, linear_rank_mod2={lr2:.4f}, linear_rank_mod65537={lrp:.4f}, compare_x_period={cxp:.4f}".format(
                 bf=float(defender_mean.get("brute_force_resistance_score", 0.0)),
                 rh=float(defender_mean.get("reverse_hack_resistance_score", 0.0)),
                 sl=float(defender_mean.get("sync_loss_rate", 0.0)),
                 psl=float(defender_mean.get("projected_sync_loss_rate", 0.0)),
                 hs=float(defender_mean.get("horizon_sync_score", 0.0)),
+                qft_bits=float(defender_mean.get("qft_period_bits", 0.0)),
+                lr2=float(defender_mean.get("linear_rank_mod2_ratio", 0.0)),
+                lrp=float(defender_mean.get("linear_rank_mod65537_ratio", 0.0)),
+                cxp=float(defender_mean.get("compare_x_period_ratio", 0.0)),
             )
         )
         if reference_baseline is not None:
