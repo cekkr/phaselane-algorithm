@@ -112,6 +112,11 @@ ATTACKER_STAGE_TIMEOUT_MID_SECONDS = 6.0
 ATTACKER_STAGE_TIMEOUT_FULL_SECONDS = 9.0
 PROCESS_EVAL_TIMEOUT_GRACE_SECONDS = 2.0
 PROCESS_EVAL_WATCHDOG_POLL_SECONDS = 0.25
+MUTATION_IMPROVEMENT_DECAY_STEP_MULTIPLIER = 0.30
+MUTATION_STAGNATION_BOOST_STEP_MULTIPLIER = 1.30
+MUTATION_SIGNATURE_STALL_BOOST_STEP_MULTIPLIER = 0.45
+MUTATION_FORCE_THRESHOLD = 0.45
+MUTATION_FORCE_CHANCE = 0.82
 
 
 def _complexity_limits(role: str) -> Tuple[int, int]:
@@ -734,6 +739,15 @@ class SafeGFSLEvolver(GFSLEvolver):
         self.stagnation_count = 0
         self.best_signature_tracker = ""
         self.signature_stagnation_count = 0
+        self.mutation_rate = clamp(
+            max(
+                float(self.mutation_floor),
+                float(self.mutation_rate),
+                float(self.mutation_floor) + (0.35 * float(self.mutation_step)),
+            ),
+            float(self.mutation_floor),
+            float(self.mutation_ceiling),
+        )
 
     def _enforce_complexity_budget(self, genome: GFSLGenome) -> None:
         max_total = max(8, int(self.max_instruction_count))
@@ -838,9 +852,14 @@ class SafeGFSLEvolver(GFSLEvolver):
             max(1, self.stagnation_patience)
         )
         signature_pressure = float(self.signature_stagnation_count) / float(
-            max(1, self.stagnation_patience * 2)
+            max(1.0, float(self.stagnation_patience) * 1.5)
         )
-        return clamp(max(fitness_pressure, signature_pressure), 0.0, 1.0)
+        coupled_pressure = (0.60 * fitness_pressure) + (0.55 * signature_pressure)
+        return clamp(
+            max(fitness_pressure, 1.10 * signature_pressure, coupled_pressure),
+            0.0,
+            1.0,
+        )
 
     def _mutate_slot_fast(
         self,
@@ -1038,22 +1057,45 @@ class SafeGFSLEvolver(GFSLEvolver):
                 self.stagnation_count = 0
                 self.mutation_rate = max(
                     self.mutation_floor,
-                    self.mutation_rate - (0.5 * self.mutation_step),
+                    self.mutation_rate
+                    - (MUTATION_IMPROVEMENT_DECAY_STEP_MULTIPLIER * self.mutation_step),
                 )
             else:
                 self.stagnation_count += 1
                 if self.stagnation_count >= self.stagnation_patience:
+                    signature_plateau = min(
+                        1.0,
+                        float(self.signature_stagnation_count)
+                        / float(max(1, self.stagnation_patience)),
+                    )
+                    mutation_boost = float(self.mutation_step) * (
+                        MUTATION_STAGNATION_BOOST_STEP_MULTIPLIER
+                        + (0.35 * signature_plateau)
+                    )
                     self.mutation_rate = min(
                         self.mutation_ceiling,
-                        self.mutation_rate + self.mutation_step,
+                        self.mutation_rate + mutation_boost,
                     )
-                    self.stagnation_count = 0
+                    self.stagnation_count = max(0, self.stagnation_patience - 1)
 
             if current_signature == self.best_signature_tracker:
                 self.signature_stagnation_count += 1
             else:
                 self.best_signature_tracker = current_signature
                 self.signature_stagnation_count = 0
+            if self.signature_stagnation_count >= max(1, self.stagnation_patience):
+                self.mutation_rate = min(
+                    self.mutation_ceiling,
+                    max(
+                        self.mutation_floor,
+                        self.mutation_rate
+                        + max(
+                            0.01,
+                            MUTATION_SIGNATURE_STALL_BOOST_STEP_MULTIPLIER
+                            * float(self.mutation_step),
+                        ),
+                    ),
+                )
 
             stagnation_pressure = self._stagnation_pressure()
             if self.supervised_guide:
@@ -1104,7 +1146,7 @@ class SafeGFSLEvolver(GFSLEvolver):
             parent_pool_size = max(2, int(len(self.population) * self.parent_pool_ratio))
             parent_pool = self.population[: parent_pool_size]
             # Under stagnation we bias towards diversity, not local micro-tweaks.
-            local_refine_chance = clamp(0.40 - (0.28 * stagnation_pressure), 0.08, 0.40)
+            local_refine_chance = clamp(0.34 - (0.26 * stagnation_pressure), 0.05, 0.34)
             guide_sizes = [
                 max(1, len(genome.extract_effective_algorithm()))
                 for genome in parent_pool[: max(4, min(len(parent_pool), elite_size + 2))]
@@ -1146,7 +1188,10 @@ class SafeGFSLEvolver(GFSLEvolver):
                 child.generation = gen + 1
                 self._enforce_complexity_budget(child)
 
-                force_mutation = stagnation_pressure >= 0.55 and random.random() < 0.70
+                force_mutation = (
+                    stagnation_pressure >= float(MUTATION_FORCE_THRESHOLD)
+                    and random.random() < float(MUTATION_FORCE_CHANCE)
+                )
                 if force_mutation or random.random() < self.mutation_rate:
                     if self.supervised_guide:
                         child = self.supervised_guide.propose_mutation(self, child)
@@ -2195,7 +2240,7 @@ def _should_stop_by_runtime_stats(
     avg_batch_seconds = float(stats["avg_batch_seconds"])
     target_secs = float(stats["target_seconds"])
     slow_batches = float(stats["slow_batches"])
-    plateau_floor = max(10, int(math.ceil(float(total_generations) * 0.35)))
+    plateau_floor = max(8, int(math.ceil(float(total_generations) * 0.25)))
 
     top_n = max(4, min(len(population), int(math.ceil(len(population) * 0.20))))
     top_slice = list(population[:top_n])
@@ -2205,11 +2250,11 @@ def _should_stop_by_runtime_stats(
         len({_evaluation_signature(genome) for genome in top_slice})
     ) / float(max(1, len(top_slice)))
 
-    identical_floor = max(8, int(math.ceil(float(total_generations) * 0.20)))
+    identical_floor = max(6, int(math.ceil(float(total_generations) * 0.16)))
     if len(generation_log) >= identical_floor:
         ident_window = min(
             len(generation_log),
-            max(5, int(math.ceil(float(total_generations) * 0.12))),
+            max(4, int(math.ceil(float(total_generations) * 0.10))),
         )
         recent_ident = list(generation_log[-ident_window:])
         fingerprints = {
@@ -2233,11 +2278,11 @@ def _should_stop_by_runtime_stats(
         if len(fingerprints) == 1 and probe_win_rate <= 0.08:
             return True, "identical-generations"
 
-    signature_floor = max(10, int(math.ceil(float(total_generations) * 0.25)))
+    signature_floor = max(8, int(math.ceil(float(total_generations) * 0.18)))
     if len(generation_log) >= signature_floor:
         sig_window = min(
             len(generation_log),
-            max(6, int(math.ceil(float(total_generations) * 0.18))),
+            max(5, int(math.ceil(float(total_generations) * 0.14))),
         )
         recent_sig = list(generation_log[-sig_window:])
         score_levels = {
@@ -2254,35 +2299,45 @@ def _should_stop_by_runtime_stats(
 
     if (
         score_gain <= float(min_gain)
-        and probe_win_rate <= 0.05
-        and reuse_ratio >= 0.90
-        and uniqueness_ratio <= 0.55
-        and top_unique_ratio <= 0.68
+        and probe_win_rate <= 0.08
+        and reuse_ratio >= 0.82
+        and uniqueness_ratio <= 0.62
+        and top_unique_ratio <= 0.74
     ):
         return True, "plateau-reuse"
 
     if (
-        score_gain <= (0.45 * float(min_gain))
-        and probe_win_rate <= 0.03
-        and reuse_ratio >= 1.10
+        score_gain <= (0.55 * float(min_gain))
+        and probe_win_rate <= 0.06
+        and reuse_ratio >= 0.95
         and len(generation_log) >= plateau_floor
     ):
         return True, "deep-plateau-reuse"
 
+    no_improve_floor = max(8, int(math.ceil(float(total_generations) * 0.18)))
     if (
-        score_gain <= (0.50 * float(min_gain))
-        and slow_batches >= max(2.0, float(stats["window"]) - 1.0)
-        and reuse_ratio >= 0.75
-        and avg_batch_seconds > (0.95 * target_secs)
+        score_gain <= (0.25 * float(min_gain))
+        and probe_win_rate <= 0.10
+        and reuse_ratio >= 0.92
+        and top_unique_ratio <= 0.62
+        and len(generation_log) >= no_improve_floor
+    ):
+        return True, "no-improvement-window"
+
+    if (
+        score_gain <= (0.65 * float(min_gain))
+        and slow_batches >= max(2.0, float(stats["window"]) - 2.0)
+        and reuse_ratio >= 0.65
+        and avg_batch_seconds > (0.85 * target_secs)
         and len(generation_log) >= plateau_floor
     ):
         return True, "runtime-budget-pressure"
 
-    flat_floor = max(16, int(math.ceil(float(total_generations) * 0.45)))
+    flat_floor = max(12, int(math.ceil(float(total_generations) * 0.32)))
     if len(generation_log) >= flat_floor:
         flat_window = min(
             len(generation_log),
-            max(10, int(math.ceil(float(total_generations) * 0.30))),
+            max(8, int(math.ceil(float(total_generations) * 0.24))),
         )
         recent_flat = list(generation_log[-flat_window:])
         recent_scores = [float(row.get(score_key, -float("inf"))) for row in recent_flat]
@@ -2291,11 +2346,11 @@ def _should_stop_by_runtime_stats(
             flat_gain = float(max(finite_scores) - min(finite_scores))
             score_levels = {round(score, 8) for score in finite_scores}
             if (
-                flat_gain <= max(0.00025, 0.40 * float(min_gain))
-                and len(score_levels) <= 2
-                and probe_win_rate <= 0.12
-                and avg_batch_seconds > (0.80 * target_secs)
-                and slow_batches >= max(3.0, 0.60 * float(flat_window))
+                flat_gain <= max(0.00020, 0.55 * float(min_gain))
+                and len(score_levels) <= 3
+                and probe_win_rate <= 0.16
+                and avg_batch_seconds > (0.72 * target_secs)
+                and slow_batches >= max(2.0, 0.45 * float(flat_window))
             ):
                 return True, "flat-score-window"
 
@@ -4072,7 +4127,7 @@ def _run_defender_round(
             population=population,
             total_generations=int(config.generations),
             score_key="best_score",
-            min_gain=0.00035,
+            min_gain=0.00050,
             target_generation_seconds=float(config.target_generation_seconds),
         )
 
@@ -4848,7 +4903,7 @@ def _run_attacker_round(
             population=population,
             total_generations=int(config.attacker_generations),
             score_key="attack_score",
-            min_gain=0.00045,
+            min_gain=0.00060,
             target_generation_seconds=float(config.target_generation_seconds),
         )
 
