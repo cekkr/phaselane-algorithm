@@ -12,6 +12,7 @@ import os
 import platform
 import random
 import signal
+import statistics
 import threading
 import time
 from collections import OrderedDict
@@ -117,6 +118,11 @@ MUTATION_STAGNATION_BOOST_STEP_MULTIPLIER = 1.30
 MUTATION_SIGNATURE_STALL_BOOST_STEP_MULTIPLIER = 0.45
 MUTATION_FORCE_THRESHOLD = 0.45
 MUTATION_FORCE_CHANCE = 0.82
+KEY_VARIANT_FLOOR = 2
+TARGET_CALIBRATION_MIN_OBSERVATIONS = 3
+TARGET_CALIBRATION_MAX_OBSERVATIONS = 6
+TARGET_CALIBRATION_MEDIAN_SCALE = 0.85
+TARGET_CALIBRATION_MAX_MULTIPLIER = 16.0
 
 
 def _complexity_limits(role: str) -> Tuple[int, int]:
@@ -348,7 +354,7 @@ class PredictiveStageController:
         self.quick_keep_ratio = clamp(self.quick_keep_ratio, 0.24, 0.92)
         self.mid_keep_ratio = clamp(self.mid_keep_ratio, 0.12, 0.80)
         self.mid_keep_ratio = min(self.mid_keep_ratio, max(0.12, self.quick_keep_ratio - 0.03))
-        self.key_variant_count = max(1, min(6, int(self.key_variant_count)))
+        self.key_variant_count = max(int(KEY_VARIANT_FLOOR), min(6, int(self.key_variant_count)))
 
     def apply_feedback(self, stats: Dict[str, float]) -> None:
         self.clamp()
@@ -397,8 +403,6 @@ class PredictiveStageController:
             self.mid_keep_ratio -= min(0.16, 0.035 * over)
             self.quick_cycle_fraction -= min(0.16, 0.040 * over)
             self.mid_cycle_fraction -= min(0.12, 0.030 * over)
-            if over > 1.4 and self.key_variant_count > 1:
-                self.key_variant_count -= 1
             self.clamp()
             return
 
@@ -421,7 +425,7 @@ class PredictiveStageController:
             self.mid_keep_ratio -= 0.04
             self.quick_cycle_fraction -= 0.03
             self.mid_cycle_fraction -= 0.03
-            if self.key_variant_count > 2:
+            if self.key_variant_count > int(KEY_VARIANT_FLOOR):
                 self.key_variant_count -= 1
         else:
             # Softly converge to target stage-throughput.
@@ -589,7 +593,7 @@ class TorchRuntimeTuner:
             (0.00, 0.00, 0.00, 0.00, 0, "neutral"),
             (0.03, 0.04, 0.05, 0.04, 1, "up"),
             (0.02, 0.03, 0.03, 0.03, 0, "up-soft"),
-            (-0.02, -0.03, -0.04, -0.03, -1, "down"),
+            (-0.02, -0.03, -0.04, -0.03, 0, "down"),
             (-0.01, -0.02, -0.02, -0.02, 0, "down-soft"),
         ]
 
@@ -599,7 +603,7 @@ class TorchRuntimeTuner:
             qk = clamp(qk, 0.24, 0.92)
             mk = clamp(mk, 0.12, 0.80)
             mk = min(mk, max(0.12, qk - 0.03))
-            kv = max(1, min(6, int(kv)))
+            kv = max(int(KEY_VARIANT_FLOOR), min(6, int(kv)))
             return float(qf), float(mf), float(qk), float(mk), int(kv)
 
         best = None
@@ -616,7 +620,7 @@ class TorchRuntimeTuner:
             qk_scale = qk / max(1e-6, base_qk)
             mf_scale = mf / max(1e-6, base_mf)
             mk_scale = mk / max(1e-6, base_mk)
-            kv_scale = float(kv) / float(max(1, base_kv))
+            kv_scale = float(kv) / float(max(int(KEY_VARIANT_FLOOR), base_kv))
             est_quick = quick_eval * qf_scale * (0.60 + (0.40 * kv_scale))
             est_mid = mid_eval * qk_scale * mf_scale
             est_full = full_eval * mk_scale * (0.75 + (0.25 * kv_scale))
@@ -1519,7 +1523,7 @@ def _build_stage_scenarios(
 ) -> List[ScenarioConfig]:
     stage_scenarios: List[ScenarioConfig] = []
     fraction = max(0.05, min(1.0, float(cycle_fraction)))
-    variants = max(1, int(key_variant_count))
+    variants = max(int(KEY_VARIANT_FLOOR), int(key_variant_count))
     for scenario in scenarios:
         stage_cycles = max(6, int(round(float(scenario.cycles) * fraction)))
         for idx in range(variants):
@@ -2152,6 +2156,61 @@ def _mark_duplicate_genomes(
             seen[signature] = genome
             continue
         genome.fitness = _predictive_cut_score(float(genome.fitness or -float("inf")), stage, penalty + 0.015)
+
+
+@dataclass
+class RuntimeTargetCalibrator:
+    """Auto-calibrate target generation seconds from first local batches."""
+
+    base_target_seconds: float
+    label: str = ""
+    min_observations: int = TARGET_CALIBRATION_MIN_OBSERVATIONS
+    max_observations: int = TARGET_CALIBRATION_MAX_OBSERVATIONS
+    median_scale: float = TARGET_CALIBRATION_MEDIAN_SCALE
+    max_multiplier: float = TARGET_CALIBRATION_MAX_MULTIPLIER
+    target_seconds: float = field(init=False)
+    observations: List[float] = field(default_factory=list)
+    calibrated: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        self.target_seconds = max(0.25, float(self.base_target_seconds))
+
+    def observe(self, batch_seconds: float) -> float:
+        seconds = float(batch_seconds)
+        if not math.isfinite(seconds) or seconds <= 0.0:
+            return float(self.target_seconds)
+        if self.calibrated:
+            return float(self.target_seconds)
+
+        self.observations.append(seconds)
+        if len(self.observations) < max(1, int(self.min_observations)):
+            return float(self.target_seconds)
+
+        sample = self.observations[: max(1, int(self.max_observations))]
+        median_seconds = float(statistics.median(sample))
+        scaled = max(
+            float(self.base_target_seconds),
+            float(self.median_scale) * median_seconds,
+        )
+        upper = max(
+            float(self.base_target_seconds) * float(self.max_multiplier),
+            float(self.base_target_seconds) + 1.0,
+        )
+        previous = float(self.target_seconds)
+        self.target_seconds = clamp(scaled, 0.25, upper)
+        self.calibrated = True
+        if abs(self.target_seconds - previous) >= 0.10:
+            role = str(self.label).strip() or "evolution"
+            print(
+                "[pcpl-evolvo] runtime auto-calibration role={role} target_gen_s {prev:.2f}->{curr:.2f} sample_median={median:.2f}s n={count}".format(
+                    role=role,
+                    prev=previous,
+                    curr=float(self.target_seconds),
+                    median=median_seconds,
+                    count=len(sample),
+                )
+            )
+        return float(self.target_seconds)
 
 
 def _runtime_window_stats(
@@ -3999,6 +4058,10 @@ def _run_defender_round(
         config=config,
         resource_plan=resource_plan,
     )
+    target_calibrator = RuntimeTargetCalibrator(
+        base_target_seconds=float(config.target_generation_seconds),
+        label="defender",
+    )
     stage_stats: Dict[str, float] = {}
     stage_cache: "OrderedDict[str, Tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
     cache_limit = max(500, int(config.max_eval_cache_entries))
@@ -4007,15 +4070,15 @@ def _run_defender_round(
     def make_scenarios(stage: str) -> List[ScenarioConfig]:
         if stage == "quick":
             frac = controller.quick_cycle_fraction
-            key_variants = min(2, max(1, controller.key_variant_count))
+            key_variants = min(2, max(int(KEY_VARIANT_FLOOR), controller.key_variant_count))
             complexity = "quick"
         elif stage == "mid":
             frac = controller.mid_cycle_fraction
-            key_variants = min(3, max(1, controller.key_variant_count))
+            key_variants = min(3, max(int(KEY_VARIANT_FLOOR), controller.key_variant_count))
             complexity = "mid"
         else:
             frac = _full_stage_fraction(controller.mid_cycle_fraction)
-            key_variants = max(1, controller.key_variant_count)
+            key_variants = max(int(KEY_VARIANT_FLOOR), controller.key_variant_count)
             complexity = "hard"
         stage_scenarios = _build_stage_scenarios(
             scenarios,
@@ -4041,6 +4104,11 @@ def _run_defender_round(
             full_scenarios = make_scenarios("full")
             _, metrics = evaluate_across_scenarios(full_scenarios, best, attacker=attacker)
             best._pcpl_metrics = metrics
+        observed_batch_seconds = float(stage_stats.get("batch_seconds", 0.0))
+        if observed_batch_seconds > 0.0:
+            stage_stats["target_batch_seconds"] = float(
+                target_calibrator.observe(observed_batch_seconds)
+            )
 
         row = {
             "generation": int(gen),
@@ -4083,6 +4151,9 @@ def _run_defender_round(
             "underutilization_boost": float(stage_stats.get("underutilization_boost", 0.0)),
             "mutation_rate": float(stage_stats.get("mutation_rate", evolver.mutation_rate)),
             "batch_seconds": float(stage_stats.get("batch_seconds", 0.0)),
+            "target_batch_seconds": float(
+                stage_stats.get("target_batch_seconds", target_calibrator.target_seconds)
+            ),
         }
         generation_log.append(row)
         print(
@@ -4128,7 +4199,7 @@ def _run_defender_round(
             total_generations=int(config.generations),
             score_key="best_score",
             min_gain=0.00050,
-            target_generation_seconds=float(config.target_generation_seconds),
+            target_generation_seconds=float(target_calibrator.target_seconds),
         )
 
     def batch_eval(population: List[GFSLGenome]) -> None:
@@ -4141,6 +4212,7 @@ def _run_defender_round(
             return
 
         eval_started = time.perf_counter()
+        target_seconds = float(target_calibrator.target_seconds)
         local_stage: Dict[str, float] = {
             "population": float(len(pending)),
             "workers": float(resource_plan.parallel_workers),
@@ -4162,7 +4234,7 @@ def _run_defender_round(
             "underutilization_boost": 0.0,
             "mutation_rate": float(evolver.mutation_rate),
             "quick_throttle": 1.0,
-            "target_batch_seconds": float(config.target_generation_seconds),
+            "target_batch_seconds": float(target_seconds),
             "batch_seconds": 0.0,
         }
         batch_controller_state = controller.to_dict()
@@ -4187,7 +4259,7 @@ def _run_defender_round(
                 controller.mid_keep_ratio -= 0.05 * factor
                 controller.quick_cycle_fraction -= 0.035 * factor
                 controller.mid_cycle_fraction -= 0.028 * factor
-                if pressure > 3.0 and controller.key_variant_count > 1:
+                if pressure > 3.0 and controller.key_variant_count > int(KEY_VARIANT_FLOOR):
                     controller.key_variant_count -= 1
                 controller.clamp()
             _enforce_parallel_load_floor(
@@ -4234,7 +4306,7 @@ def _run_defender_round(
                 full_eval=local_stage["full_eval"],
                 probe_samples=0.0,
                 elapsed_seconds=float(time.perf_counter() - eval_started),
-                target_seconds=float(config.target_generation_seconds),
+                target_seconds=float(target_seconds),
                 backend=resource_plan.parallel_backend,
                 executor=shared_executor,
                 worker_fn=_defender_eval_worker,
@@ -4262,6 +4334,9 @@ def _run_defender_round(
             local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
             local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+            local_stage["target_batch_seconds"] = float(
+                target_calibrator.observe(local_stage["batch_seconds"])
+            )
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             local_stage["underutilization_boost"] = _runtime_underutilization_boost(
                 controller=controller,
@@ -4381,7 +4456,7 @@ def _run_defender_round(
                 full_eval=local_stage["full_eval"],
                 probe_samples=0.0,
                 elapsed_seconds=float(time.perf_counter() - eval_started),
-                target_seconds=float(config.target_generation_seconds),
+                target_seconds=float(target_seconds),
                 backend=resource_plan.parallel_backend,
                 executor=shared_executor,
                 worker_fn=_defender_eval_worker,
@@ -4409,6 +4484,9 @@ def _run_defender_round(
             local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
             local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+            local_stage["target_batch_seconds"] = float(
+                target_calibrator.observe(local_stage["batch_seconds"])
+            )
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
             torch_tuner.tune(controller, stats=local_stage)
@@ -4506,7 +4584,7 @@ def _run_defender_round(
                 full_eval=local_stage["full_eval"],
                 probe_samples=0.0,
                 elapsed_seconds=float(time.perf_counter() - eval_started),
-                target_seconds=float(config.target_generation_seconds),
+                target_seconds=float(target_seconds),
                 backend=resource_plan.parallel_backend,
                 executor=shared_executor,
                 worker_fn=_defender_eval_worker,
@@ -4534,6 +4612,9 @@ def _run_defender_round(
             local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
             local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+            local_stage["target_batch_seconds"] = float(
+                target_calibrator.observe(local_stage["batch_seconds"])
+            )
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
             torch_tuner.tune(controller, stats=local_stage)
@@ -4638,7 +4719,7 @@ def _run_defender_round(
             full_eval=local_stage["full_eval"],
             probe_samples=local_stage["probe_samples"],
             elapsed_seconds=float(time.perf_counter() - eval_started),
-            target_seconds=float(config.target_generation_seconds),
+            target_seconds=float(target_seconds),
             backend=resource_plan.parallel_backend,
             executor=shared_executor,
             worker_fn=_defender_eval_worker,
@@ -4667,6 +4748,9 @@ def _run_defender_round(
         local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
 
         local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+        local_stage["target_batch_seconds"] = float(
+            target_calibrator.observe(local_stage["batch_seconds"])
+        )
         torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
         controller.apply_feedback(local_stage)
         torch_tuner.tune(controller, stats=local_stage)
@@ -4772,6 +4856,10 @@ def _run_attacker_round(
         config=config,
         resource_plan=resource_plan,
     )
+    target_calibrator = RuntimeTargetCalibrator(
+        base_target_seconds=float(config.target_generation_seconds),
+        label="attacker",
+    )
     stage_stats: Dict[str, float] = {}
     stage_cache: "OrderedDict[str, Tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
     cache_limit = max(500, int(config.max_eval_cache_entries))
@@ -4780,15 +4868,15 @@ def _run_attacker_round(
     def make_scenarios(stage: str) -> List[ScenarioConfig]:
         if stage == "quick":
             frac = controller.quick_cycle_fraction
-            key_variants = min(2, max(1, controller.key_variant_count))
+            key_variants = min(2, max(int(KEY_VARIANT_FLOOR), controller.key_variant_count))
             complexity = "quick"
         elif stage == "mid":
             frac = controller.mid_cycle_fraction
-            key_variants = min(3, max(1, controller.key_variant_count))
+            key_variants = min(3, max(int(KEY_VARIANT_FLOOR), controller.key_variant_count))
             complexity = "mid"
         else:
             frac = _full_stage_fraction(controller.mid_cycle_fraction)
-            key_variants = max(1, controller.key_variant_count)
+            key_variants = max(int(KEY_VARIANT_FLOOR), controller.key_variant_count)
             complexity = "hard"
         stage_scenarios = _build_stage_scenarios(
             scenarios,
@@ -4821,6 +4909,11 @@ def _run_attacker_round(
             full_scenarios = make_scenarios("full")
             _, metrics = evaluate_across_scenarios(full_scenarios, defender, attacker=best)
             best._attack_metrics = metrics
+        observed_batch_seconds = float(stage_stats.get("batch_seconds", 0.0))
+        if observed_batch_seconds > 0.0:
+            stage_stats["target_batch_seconds"] = float(
+                target_calibrator.observe(observed_batch_seconds)
+            )
         row = {
             "generation": int(gen),
             "attack_score": float(best_fitness),
@@ -4860,6 +4953,9 @@ def _run_attacker_round(
             "underutilization_boost": float(stage_stats.get("underutilization_boost", 0.0)),
             "mutation_rate": float(stage_stats.get("mutation_rate", evolver.mutation_rate)),
             "batch_seconds": float(stage_stats.get("batch_seconds", 0.0)),
+            "target_batch_seconds": float(
+                stage_stats.get("target_batch_seconds", target_calibrator.target_seconds)
+            ),
         }
         generation_log.append(row)
         print(
@@ -4904,7 +5000,7 @@ def _run_attacker_round(
             total_generations=int(config.attacker_generations),
             score_key="attack_score",
             min_gain=0.00060,
-            target_generation_seconds=float(config.target_generation_seconds),
+            target_generation_seconds=float(target_calibrator.target_seconds),
         )
 
     def batch_eval(population: List[GFSLGenome]) -> None:
@@ -4917,6 +5013,7 @@ def _run_attacker_round(
             return
 
         eval_started = time.perf_counter()
+        target_seconds = float(target_calibrator.target_seconds)
         local_stage: Dict[str, float] = {
             "population": float(len(pending)),
             "workers": float(resource_plan.parallel_workers),
@@ -4938,7 +5035,7 @@ def _run_attacker_round(
             "underutilization_boost": 0.0,
             "mutation_rate": float(evolver.mutation_rate),
             "quick_throttle": 1.0,
-            "target_batch_seconds": float(config.target_generation_seconds),
+            "target_batch_seconds": float(target_seconds),
             "batch_seconds": 0.0,
         }
         batch_controller_state = controller.to_dict()
@@ -4962,7 +5059,7 @@ def _run_attacker_round(
                 controller.mid_keep_ratio -= 0.05 * factor
                 controller.quick_cycle_fraction -= 0.035 * factor
                 controller.mid_cycle_fraction -= 0.028 * factor
-                if pressure > 3.0 and controller.key_variant_count > 1:
+                if pressure > 3.0 and controller.key_variant_count > int(KEY_VARIANT_FLOOR):
                     controller.key_variant_count -= 1
                 controller.clamp()
             _enforce_parallel_load_floor(
@@ -5009,7 +5106,7 @@ def _run_attacker_round(
                 full_eval=local_stage["full_eval"],
                 probe_samples=0.0,
                 elapsed_seconds=float(time.perf_counter() - eval_started),
-                target_seconds=float(config.target_generation_seconds),
+                target_seconds=float(target_seconds),
                 backend=resource_plan.parallel_backend,
                 executor=shared_executor,
                 worker_fn=_attacker_eval_worker,
@@ -5037,6 +5134,9 @@ def _run_attacker_round(
             local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
             local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+            local_stage["target_batch_seconds"] = float(
+                target_calibrator.observe(local_stage["batch_seconds"])
+            )
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             local_stage["underutilization_boost"] = _runtime_underutilization_boost(
                 controller=controller,
@@ -5155,7 +5255,7 @@ def _run_attacker_round(
                 full_eval=local_stage["full_eval"],
                 probe_samples=0.0,
                 elapsed_seconds=float(time.perf_counter() - eval_started),
-                target_seconds=float(config.target_generation_seconds),
+                target_seconds=float(target_seconds),
                 backend=resource_plan.parallel_backend,
                 executor=shared_executor,
                 worker_fn=_attacker_eval_worker,
@@ -5183,6 +5283,9 @@ def _run_attacker_round(
             local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
             local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+            local_stage["target_batch_seconds"] = float(
+                target_calibrator.observe(local_stage["batch_seconds"])
+            )
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
             torch_tuner.tune(controller, stats=local_stage)
@@ -5279,7 +5382,7 @@ def _run_attacker_round(
                 full_eval=local_stage["full_eval"],
                 probe_samples=0.0,
                 elapsed_seconds=float(time.perf_counter() - eval_started),
-                target_seconds=float(config.target_generation_seconds),
+                target_seconds=float(target_seconds),
                 backend=resource_plan.parallel_backend,
                 executor=shared_executor,
                 worker_fn=_attacker_eval_worker,
@@ -5307,6 +5410,9 @@ def _run_attacker_round(
             local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
             local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+            local_stage["target_batch_seconds"] = float(
+                target_calibrator.observe(local_stage["batch_seconds"])
+            )
             torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
             controller.apply_feedback(local_stage)
             torch_tuner.tune(controller, stats=local_stage)
@@ -5409,7 +5515,7 @@ def _run_attacker_round(
             full_eval=local_stage["full_eval"],
             probe_samples=local_stage["probe_samples"],
             elapsed_seconds=float(time.perf_counter() - eval_started),
-            target_seconds=float(config.target_generation_seconds),
+            target_seconds=float(target_seconds),
             backend=resource_plan.parallel_backend,
             executor=shared_executor,
             worker_fn=_attacker_eval_worker,
@@ -5438,6 +5544,9 @@ def _run_attacker_round(
         local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
 
         local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
+        local_stage["target_batch_seconds"] = float(
+            target_calibrator.observe(local_stage["batch_seconds"])
+        )
         torch_tuner.observe(controller_state=batch_controller_state, stats=local_stage)
         controller.apply_feedback(local_stage)
         torch_tuner.tune(controller, stats=local_stage)
@@ -5599,7 +5708,7 @@ def run_continuous_experiment(
             if attacker_profile:
                 predictive_profile["attacker"] = attacker_profile
             selection_key_variants = max(
-                1,
+                int(KEY_VARIANT_FLOOR),
                 int(defender_profile.get("key_variant_count", config.key_variant_count)),
                 int(attacker_profile.get("key_variant_count", config.key_variant_count)),
             )
