@@ -100,10 +100,18 @@ MAX_DEFENDER_TOTAL_INSTRUCTIONS = 128
 MAX_DEFENDER_EFFECTIVE_INSTRUCTIONS = 72
 MAX_ATTACKER_TOTAL_INSTRUCTIONS = 96
 MAX_ATTACKER_EFFECTIVE_INSTRUCTIONS = 56
-DEFENDER_EVAL_TIMEOUT_SECONDS = 45.0
-ATTACKER_EVAL_TIMEOUT_SECONDS = 35.0
-QUICK_KEEP_PARALLEL_FLOOR_MULTIPLIER = 1.35
-MID_KEEP_PARALLEL_FLOOR_MULTIPLIER = 1.10
+DEFENDER_EVAL_TIMEOUT_SECONDS = 14.0
+ATTACKER_EVAL_TIMEOUT_SECONDS = 10.0
+QUICK_KEEP_PARALLEL_FLOOR_MULTIPLIER = 1.85
+MID_KEEP_PARALLEL_FLOOR_MULTIPLIER = 1.55
+DEFENDER_STAGE_TIMEOUT_QUICK_SECONDS = 4.0
+DEFENDER_STAGE_TIMEOUT_MID_SECONDS = 8.0
+DEFENDER_STAGE_TIMEOUT_FULL_SECONDS = 12.0
+ATTACKER_STAGE_TIMEOUT_QUICK_SECONDS = 3.0
+ATTACKER_STAGE_TIMEOUT_MID_SECONDS = 6.0
+ATTACKER_STAGE_TIMEOUT_FULL_SECONDS = 9.0
+PROCESS_EVAL_TIMEOUT_GRACE_SECONDS = 2.0
+PROCESS_EVAL_WATCHDOG_POLL_SECONDS = 0.25
 
 
 def _complexity_limits(role: str) -> Tuple[int, int]:
@@ -171,6 +179,57 @@ def _is_genome_over_complexity_budget(genome: GFSLGenome, *, role: str) -> Tuple
 
 def _timeout_cut_score(*, role: str) -> float:
     return -3.00 if str(role).lower() == "defender" else -1.50
+
+
+def _normalize_eval_stage(stage: Optional[str]) -> str:
+    stage_norm = str(stage or "").strip().lower()
+    if stage_norm in {"quick", "mid", "full"}:
+        return stage_norm
+    return "full"
+
+
+def _stage_eval_timeout_seconds(*, role: str, stage: Optional[str]) -> float:
+    role_norm = str(role).strip().lower()
+    stage_norm = _normalize_eval_stage(stage)
+    if role_norm == "attacker":
+        if stage_norm == "quick":
+            return float(ATTACKER_STAGE_TIMEOUT_QUICK_SECONDS)
+        if stage_norm == "mid":
+            return float(ATTACKER_STAGE_TIMEOUT_MID_SECONDS)
+        return float(ATTACKER_STAGE_TIMEOUT_FULL_SECONDS)
+    if stage_norm == "quick":
+        return float(DEFENDER_STAGE_TIMEOUT_QUICK_SECONDS)
+    if stage_norm == "mid":
+        return float(DEFENDER_STAGE_TIMEOUT_MID_SECONDS)
+    return float(DEFENDER_STAGE_TIMEOUT_FULL_SECONDS)
+
+
+def _task_eval_stage(task: Any) -> str:
+    if not isinstance(task, tuple):
+        return "full"
+    if len(task) >= 5 and isinstance(task[4], str):
+        return _normalize_eval_stage(task[4])
+    if len(task) >= 4 and isinstance(task[3], str):
+        return _normalize_eval_stage(task[3])
+    return "full"
+
+
+def _task_timeout_seconds(task: Any, *, worker_fn) -> float:
+    stage = _task_eval_stage(task)
+    if worker_fn is _defender_eval_worker:
+        return _stage_eval_timeout_seconds(role="defender", stage=stage)
+    if worker_fn is _attacker_eval_worker:
+        return _stage_eval_timeout_seconds(role="attacker", stage=stage)
+    return max(float(DEFENDER_EVAL_TIMEOUT_SECONDS), float(ATTACKER_EVAL_TIMEOUT_SECONDS))
+
+
+def _timeout_fallback_result(task: Any, *, worker_fn) -> Tuple[float, List[Dict[str, Any]]]:
+    _ = task
+    if worker_fn is _defender_eval_worker:
+        return _timeout_cut_score(role="defender"), []
+    if worker_fn is _attacker_eval_worker:
+        return _timeout_cut_score(role="attacker"), []
+    return -1e9, []
 
 
 def _can_use_eval_timeout() -> bool:
@@ -1897,7 +1956,7 @@ def _idle_random_trial_budget(
     _ = (elapsed_seconds, target_seconds)
 
     current_load = max(0.0, float(full_eval) + float(probe_samples))
-    desired_load = max(float(lanes) * 1.25, min(float(pending_count), float(lanes) * 2.0))
+    desired_load = max(float(lanes) * 1.60, min(float(pending_count), float(lanes) * 2.60))
     gap = int(math.ceil(desired_load - current_load))
     if gap <= 0:
         return 0
@@ -2334,14 +2393,25 @@ def _shutdown_shared_executor(executor: Optional[concurrent.futures.Executor]) -
 
 
 def _defender_eval_worker(
-    task: Tuple[GFSLGenome, Sequence[ScenarioConfig], Optional[GFSLGenome], bool]
+    task: Tuple[GFSLGenome, Sequence[ScenarioConfig], Optional[GFSLGenome], bool, str]
+    | Tuple[GFSLGenome, Sequence[ScenarioConfig], Optional[GFSLGenome], bool]
+    | Tuple[GFSLGenome, Sequence[ScenarioConfig], Optional[GFSLGenome], str]
     | Tuple[GFSLGenome, Sequence[ScenarioConfig], Optional[GFSLGenome]]
 ) -> Tuple[float, List[Dict[str, Any]]]:
+    stage = "full"
     if len(task) == 3:
         genome, scenarios, attacker = task
         emit_rows = True
+    elif len(task) == 4:
+        genome, scenarios, attacker, fourth = task
+        if isinstance(fourth, bool):
+            emit_rows = bool(fourth)
+        else:
+            emit_rows = True
+            stage = _normalize_eval_stage(str(fourth))
     else:
-        genome, scenarios, attacker, emit_rows = task
+        genome, scenarios, attacker, emit_rows, stage_raw = task[0], task[1], task[2], task[3], task[4]
+        stage = _normalize_eval_stage(str(stage_raw))
     ensure_genome_io(genome)
     over_budget, cut_score = _is_genome_over_complexity_budget(genome, role="defender")
     if over_budget:
@@ -2353,7 +2423,7 @@ def _defender_eval_worker(
             scenarios,
             genome,
             attacker=attacker,
-            timeout_seconds=float(DEFENDER_EVAL_TIMEOUT_SECONDS),
+            timeout_seconds=_stage_eval_timeout_seconds(role="defender", stage=stage),
         )
     except TimeoutError:
         return _timeout_cut_score(role="defender"), []
@@ -2363,14 +2433,31 @@ def _defender_eval_worker(
 
 
 def _attacker_eval_worker(
-    task: Tuple[GFSLGenome, GFSLGenome, Sequence[ScenarioConfig], bool]
+    task: Tuple[GFSLGenome, GFSLGenome, Sequence[ScenarioConfig], bool, str]
+    | Tuple[GFSLGenome, GFSLGenome, Sequence[ScenarioConfig], bool]
+    | Tuple[GFSLGenome, GFSLGenome, Sequence[ScenarioConfig], str]
     | Tuple[GFSLGenome, GFSLGenome, Sequence[ScenarioConfig]]
 ) -> Tuple[float, List[Dict[str, Any]]]:
+    stage = "full"
     if len(task) == 3:
         attacker, defender, scenarios = task
         emit_rows = True
+    elif len(task) == 4:
+        attacker, defender, scenarios, fourth = task
+        if isinstance(fourth, bool):
+            emit_rows = bool(fourth)
+        else:
+            emit_rows = True
+            stage = _normalize_eval_stage(str(fourth))
     else:
-        attacker, defender, scenarios, emit_rows = task
+        attacker, defender, scenarios, emit_rows, stage_raw = (
+            task[0],
+            task[1],
+            task[2],
+            task[3],
+            task[4],
+        )
+        stage = _normalize_eval_stage(str(stage_raw))
     ensure_attacker_genome_io(attacker)
     over_budget, cut_score = _is_genome_over_complexity_budget(attacker, role="attacker")
     if over_budget:
@@ -2381,7 +2468,7 @@ def _attacker_eval_worker(
             scenarios,
             defender,
             attacker=attacker,
-            timeout_seconds=float(ATTACKER_EVAL_TIMEOUT_SECONDS),
+            timeout_seconds=_stage_eval_timeout_seconds(role="attacker", stage=stage),
         )
     except TimeoutError:
         return _timeout_cut_score(role="attacker"), []
@@ -2400,14 +2487,31 @@ def _attacker_eval_worker(
 
 
 def _defender_eval_worker_batch(
-    task: Tuple[List[GFSLGenome], Sequence[ScenarioConfig], Optional[GFSLGenome], bool]
+    task: Tuple[List[GFSLGenome], Sequence[ScenarioConfig], Optional[GFSLGenome], bool, str]
+    | Tuple[List[GFSLGenome], Sequence[ScenarioConfig], Optional[GFSLGenome], bool]
+    | Tuple[List[GFSLGenome], Sequence[ScenarioConfig], Optional[GFSLGenome], str]
     | Tuple[List[GFSLGenome], Sequence[ScenarioConfig], Optional[GFSLGenome]]
 ) -> List[Tuple[float, List[Dict[str, Any]]]]:
+    stage = "full"
     if len(task) == 3:
         genomes, scenarios, attacker = task
         emit_rows = True
+    elif len(task) == 4:
+        genomes, scenarios, attacker, fourth = task
+        if isinstance(fourth, bool):
+            emit_rows = bool(fourth)
+        else:
+            emit_rows = True
+            stage = _normalize_eval_stage(str(fourth))
     else:
-        genomes, scenarios, attacker, emit_rows = task
+        genomes, scenarios, attacker, emit_rows, stage_raw = (
+            task[0],
+            task[1],
+            task[2],
+            task[3],
+            task[4],
+        )
+        stage = _normalize_eval_stage(str(stage_raw))
     if attacker is not None:
         ensure_attacker_genome_io(attacker)
     results: List[Tuple[float, List[Dict[str, Any]]]] = []
@@ -2422,7 +2526,7 @@ def _defender_eval_worker_batch(
                 scenarios,
                 genome,
                 attacker=attacker,
-                timeout_seconds=float(DEFENDER_EVAL_TIMEOUT_SECONDS),
+                timeout_seconds=_stage_eval_timeout_seconds(role="defender", stage=stage),
             )
         except TimeoutError:
             results.append((_timeout_cut_score(role="defender"), []))
@@ -2433,14 +2537,31 @@ def _defender_eval_worker_batch(
 
 
 def _attacker_eval_worker_batch(
-    task: Tuple[List[GFSLGenome], GFSLGenome, Sequence[ScenarioConfig], bool]
+    task: Tuple[List[GFSLGenome], GFSLGenome, Sequence[ScenarioConfig], bool, str]
+    | Tuple[List[GFSLGenome], GFSLGenome, Sequence[ScenarioConfig], bool]
+    | Tuple[List[GFSLGenome], GFSLGenome, Sequence[ScenarioConfig], str]
     | Tuple[List[GFSLGenome], GFSLGenome, Sequence[ScenarioConfig]]
 ) -> List[Tuple[float, List[Dict[str, Any]]]]:
+    stage = "full"
     if len(task) == 3:
         attackers, defender, scenarios = task
         emit_rows = True
+    elif len(task) == 4:
+        attackers, defender, scenarios, fourth = task
+        if isinstance(fourth, bool):
+            emit_rows = bool(fourth)
+        else:
+            emit_rows = True
+            stage = _normalize_eval_stage(str(fourth))
     else:
-        attackers, defender, scenarios, emit_rows = task
+        attackers, defender, scenarios, emit_rows, stage_raw = (
+            task[0],
+            task[1],
+            task[2],
+            task[3],
+            task[4],
+        )
+        stage = _normalize_eval_stage(str(stage_raw))
     ensure_genome_io(defender)
     results: List[Tuple[float, List[Dict[str, Any]]]] = []
     for attacker in attackers:
@@ -2454,7 +2575,7 @@ def _attacker_eval_worker_batch(
                 scenarios,
                 defender,
                 attacker=attacker,
-                timeout_seconds=float(ATTACKER_EVAL_TIMEOUT_SECONDS),
+                timeout_seconds=_stage_eval_timeout_seconds(role="attacker", stage=stage),
             )
         except TimeoutError:
             results.append((_timeout_cut_score(role="attacker"), []))
@@ -2541,6 +2662,132 @@ def _balanced_task_chunks(
     return [chunk for chunk in chunks if chunk]
 
 
+def _force_shutdown_process_executor(executor: concurrent.futures.ProcessPoolExecutor) -> None:
+    processes = getattr(executor, "_processes", None)
+    if isinstance(processes, dict):
+        for process in list(processes.values()):
+            if process is None:
+                continue
+            try:
+                process.terminate()
+            except Exception:
+                pass
+        time.sleep(0.05)
+        for process in list(processes.values()):
+            if process is None:
+                continue
+            try:
+                if process.is_alive():
+                    process.kill()
+            except Exception:
+                pass
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+
+def _run_process_tasks_with_watchdog(
+    *,
+    tasks: Sequence[Any],
+    worker_fn,
+    workers: int,
+) -> List[Tuple[float, List[Dict[str, Any]]]]:
+    if not tasks:
+        return []
+
+    worker_count = max(1, int(workers))
+    timeouts = [
+        max(
+            0.5,
+            float(_task_timeout_seconds(task, worker_fn=worker_fn))
+            + float(PROCESS_EVAL_TIMEOUT_GRACE_SECONDS),
+        )
+        for task in tasks
+    ]
+    fallback_results = [
+        _timeout_fallback_result(task, worker_fn=worker_fn)
+        for task in tasks
+    ]
+
+    executor = _create_process_pool_executor(max_workers=worker_count)
+    resolved: List[Optional[Tuple[float, List[Dict[str, Any]]]]] = [None for _ in tasks]
+    pending: Dict[concurrent.futures.Future, Tuple[int, float, float]] = {}
+    watchdog_abort = False
+    next_idx = 0
+
+    def _submit_next() -> bool:
+        nonlocal next_idx
+        if next_idx >= len(tasks):
+            return False
+        task_idx = int(next_idx)
+        next_idx += 1
+        future = executor.submit(worker_fn, tasks[task_idx])
+        pending[future] = (task_idx, time.perf_counter(), timeouts[task_idx])
+        return True
+
+    try:
+        while len(pending) < worker_count and _submit_next():
+            pass
+
+        while pending:
+            done, _ = concurrent.futures.wait(
+                tuple(pending.keys()),
+                timeout=float(PROCESS_EVAL_WATCHDOG_POLL_SECONDS),
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in done:
+                idx, _, _ = pending.pop(future)
+                try:
+                    result = future.result()
+                    if (
+                        isinstance(result, tuple)
+                        and len(result) == 2
+                        and isinstance(result[1], list)
+                    ):
+                        resolved[idx] = (float(result[0]), result[1])
+                    else:
+                        resolved[idx] = fallback_results[idx]
+                except Exception:
+                    resolved[idx] = fallback_results[idx]
+                while len(pending) < worker_count and _submit_next():
+                    pass
+
+            now = time.perf_counter()
+            overdue = [
+                (future, info[0])
+                for future, info in pending.items()
+                if (now - info[1]) > info[2]
+            ]
+            if overdue:
+                watchdog_abort = True
+                for future, idx in overdue:
+                    pending.pop(future, None)
+                    resolved[idx] = fallback_results[idx]
+                for future, (idx, _, _) in list(pending.items()):
+                    pending.pop(future, None)
+                    resolved[idx] = fallback_results[idx]
+                for idx in range(next_idx, len(tasks)):
+                    resolved[idx] = fallback_results[idx]
+                break
+    finally:
+        if watchdog_abort:
+            _force_shutdown_process_executor(executor)
+        else:
+            try:
+                executor.shutdown(wait=True, cancel_futures=False)
+            except Exception:
+                pass
+
+    out: List[Tuple[float, List[Dict[str, Any]]]] = []
+    for idx, result in enumerate(resolved):
+        if result is None:
+            out.append(fallback_results[idx])
+        else:
+            out.append(result)
+    return out
+
+
 def _evaluate_pending_parallel(
     *,
     pending: Sequence[Tuple[int, GFSLGenome]],
@@ -2576,9 +2823,13 @@ def _evaluate_pending_parallel(
                 normalized_tasks.append(task)
                 continue
             if len(task) >= 4:
-                normalized_tasks.append((task[0], task[1], task[2], bool(task[3]) and bool(store_metrics)))
+                if isinstance(task[3], bool):
+                    normalized = (task[0], task[1], task[2], bool(task[3]) and bool(store_metrics), *task[4:])
+                else:
+                    normalized = (task[0], task[1], task[2], bool(store_metrics), *task[3:])
+                normalized_tasks.append(normalized)
             else:
-                normalized_tasks.append((*task, bool(store_metrics)))
+                normalized_tasks.append((task[0], task[1], task[2], bool(store_metrics)))
         tasks = normalized_tasks
     if backend == "process" and workers > 1:
         # Keep process scheduling fine-grained enough to avoid long tail stalls.
@@ -2611,6 +2862,20 @@ def _evaluate_pending_parallel(
             elif hasattr(genome, attr_name):
                 delattr(genome, attr_name)
             genome.fitness = float(score)
+
+    if (
+        backend == "process"
+        and workers > 1
+        and worker_fn in {_defender_eval_worker, _attacker_eval_worker}
+    ):
+        # Guard against rare evaluator hangs by hard-cutting overdue tasks and recycling the pool.
+        results = _run_process_tasks_with_watchdog(
+            tasks=tasks,
+            worker_fn=worker_fn,
+            workers=workers,
+        )
+        assign(results)
+        return
 
     # Process backend benefits from batch-chunked tasks to reduce pickle/IPC overhead.
     use_batch_chunks = (
@@ -3887,10 +4152,11 @@ def _run_defender_round(
                 executor=shared_executor,
                 worker_fn=_defender_eval_worker,
                 build_task=lambda g: (
-                    g,
-                    full_scenarios,
-                    attacker,
-                ),
+                g,
+                full_scenarios,
+                attacker,
+                "full",
+            ),
                 attr_name="_pcpl_metrics",
                 cache=stage_cache,
                 cache_key_fn=lambda g, sf=full_fp: "def:full:{sf}:{att}:{sig}".format(
@@ -3918,10 +4184,11 @@ def _run_defender_round(
                 executor=shared_executor,
                 worker_fn=_defender_eval_worker,
                 build_task=lambda g: (
-                    g,
-                    full_scenarios,
-                    attacker,
-                ),
+                g,
+                full_scenarios,
+                attacker,
+                "full",
+            ),
                 attr_name="_pcpl_metrics",
                 cache=stage_cache,
                 cache_key_fn=lambda g, sf=full_fp: "def:trial:{sf}:{att}:{sig}".format(
@@ -3991,6 +4258,7 @@ def _run_defender_round(
                 g,
                 quick_scenarios,
                 attacker,
+                "quick",
             ),
             attr_name="_pcpl_metrics",
             cache=stage_cache,
@@ -4063,10 +4331,11 @@ def _run_defender_round(
                 executor=shared_executor,
                 worker_fn=_defender_eval_worker,
                 build_task=lambda g: (
-                    g,
-                    full_scenarios,
-                    attacker,
-                ),
+                g,
+                full_scenarios,
+                attacker,
+                "full",
+            ),
                 attr_name="_pcpl_metrics",
                 cache=stage_cache,
                 cache_key_fn=lambda g, sf=full_fp: "def:trial-early-mid:{sf}:{att}:{sig}".format(
@@ -4113,6 +4382,7 @@ def _run_defender_round(
                 g,
                 mid_scenarios,
                 attacker,
+                "mid",
             ),
             attr_name="_pcpl_metrics",
             cache=stage_cache,
@@ -4186,10 +4456,11 @@ def _run_defender_round(
                 executor=shared_executor,
                 worker_fn=_defender_eval_worker,
                 build_task=lambda g: (
-                    g,
-                    full_scenarios,
-                    attacker,
-                ),
+                g,
+                full_scenarios,
+                attacker,
+                "full",
+            ),
                 attr_name="_pcpl_metrics",
                 cache=stage_cache,
                 cache_key_fn=lambda g, sf=full_fp: "def:trial-early-full:{sf}:{att}:{sig}".format(
@@ -4236,6 +4507,7 @@ def _run_defender_round(
                 g,
                 full_scenarios,
                 attacker,
+                "full",
             ),
             attr_name="_pcpl_metrics",
             cache=stage_cache,
@@ -4272,10 +4544,11 @@ def _run_defender_round(
                 executor=shared_executor,
                 worker_fn=_defender_eval_worker,
                 build_task=lambda g: (
-                    g,
-                    full_scenarios,
-                    attacker,
-                ),
+                g,
+                full_scenarios,
+                attacker,
+                "full",
+            ),
                 attr_name="_pcpl_metrics",
                 cache=stage_cache,
                 cache_key_fn=lambda g, sf=full_fp: "def:full:{sf}:{att}:{sig}".format(
@@ -4318,6 +4591,7 @@ def _run_defender_round(
                 g,
                 full_scenarios,
                 attacker,
+                "full",
             ),
             attr_name="_pcpl_metrics",
             cache=stage_cache,
@@ -4653,10 +4927,11 @@ def _run_attacker_round(
                 executor=shared_executor,
                 worker_fn=_attacker_eval_worker,
                 build_task=lambda attacker_genome: (
-                    attacker_genome,
-                    defender,
-                    full_scenarios,
-                ),
+                attacker_genome,
+                defender,
+                full_scenarios,
+                "full",
+            ),
                 attr_name="_attack_metrics",
                 cache=stage_cache,
                 cache_key_fn=lambda g, sf=full_fp: "atk:full:{sf}:{def_sig}:{sig}".format(
@@ -4684,10 +4959,11 @@ def _run_attacker_round(
                 executor=shared_executor,
                 worker_fn=_attacker_eval_worker,
                 build_task=lambda attacker_genome: (
-                    attacker_genome,
-                    defender,
-                    full_scenarios,
-                ),
+                attacker_genome,
+                defender,
+                full_scenarios,
+                "full",
+            ),
                 attr_name="_attack_metrics",
                 cache=stage_cache,
                 cache_key_fn=lambda g, sf=full_fp: "atk:trial:{sf}:{def_sig}:{sig}".format(
@@ -4756,6 +5032,7 @@ def _run_attacker_round(
                 attacker_genome,
                 defender,
                 quick_scenarios,
+                "quick",
             ),
             attr_name="_attack_metrics",
             cache=stage_cache,
@@ -4828,10 +5105,11 @@ def _run_attacker_round(
                 executor=shared_executor,
                 worker_fn=_attacker_eval_worker,
                 build_task=lambda attacker_genome: (
-                    attacker_genome,
-                    defender,
-                    full_scenarios,
-                ),
+                attacker_genome,
+                defender,
+                full_scenarios,
+                "full",
+            ),
                 attr_name="_attack_metrics",
                 cache=stage_cache,
                 cache_key_fn=lambda g, sf=full_fp: "atk:trial-early-mid:{sf}:{def_sig}:{sig}".format(
@@ -4877,6 +5155,7 @@ def _run_attacker_round(
                 attacker_genome,
                 defender,
                 mid_scenarios,
+                "mid",
             ),
             attr_name="_attack_metrics",
             cache=stage_cache,
@@ -4950,10 +5229,11 @@ def _run_attacker_round(
                 executor=shared_executor,
                 worker_fn=_attacker_eval_worker,
                 build_task=lambda attacker_genome: (
-                    attacker_genome,
-                    defender,
-                    full_scenarios,
-                ),
+                attacker_genome,
+                defender,
+                full_scenarios,
+                "full",
+            ),
                 attr_name="_attack_metrics",
                 cache=stage_cache,
                 cache_key_fn=lambda g, sf=full_fp: "atk:trial-early-full:{sf}:{def_sig}:{sig}".format(
@@ -4999,6 +5279,7 @@ def _run_attacker_round(
                 attacker_genome,
                 defender,
                 full_scenarios,
+                "full",
             ),
             attr_name="_attack_metrics",
             cache=stage_cache,
@@ -5034,10 +5315,11 @@ def _run_attacker_round(
                 executor=shared_executor,
                 worker_fn=_attacker_eval_worker,
                 build_task=lambda attacker_genome: (
-                    attacker_genome,
-                    defender,
-                    full_scenarios,
-                ),
+                attacker_genome,
+                defender,
+                full_scenarios,
+                "full",
+            ),
                 attr_name="_attack_metrics",
                 cache=stage_cache,
                 cache_key_fn=lambda g, sf=full_fp: "atk:full:{sf}:{def_sig}:{sig}".format(
@@ -5080,6 +5362,7 @@ def _run_attacker_round(
                 attacker_genome,
                 defender,
                 full_scenarios,
+                "full",
             ),
             attr_name="_attack_metrics",
             cache=stage_cache,
@@ -5297,6 +5580,7 @@ def run_continuous_experiment(
                     g,
                     selection_scenarios,
                     best_attacker,
+                    "full",
                 ),
                 attr_name="_pcpl_metrics",
                 store_metrics=False,
