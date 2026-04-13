@@ -102,6 +102,8 @@ MAX_ATTACKER_TOTAL_INSTRUCTIONS = 96
 MAX_ATTACKER_EFFECTIVE_INSTRUCTIONS = 56
 DEFENDER_EVAL_TIMEOUT_SECONDS = 45.0
 ATTACKER_EVAL_TIMEOUT_SECONDS = 35.0
+QUICK_KEEP_PARALLEL_FLOOR_MULTIPLIER = 1.35
+MID_KEEP_PARALLEL_FLOOR_MULTIPLIER = 1.10
 
 
 def _complexity_limits(role: str) -> Tuple[int, int]:
@@ -1510,6 +1512,21 @@ def _stage_keep_count(total: int, ratio: float, *, min_keep: int) -> int:
     return max(1, keep)
 
 
+def _parallel_keep_floor(
+    *,
+    total: int,
+    workers: int,
+    multiplier: float,
+    minimum: int,
+) -> int:
+    count = max(0, int(total))
+    if count <= 0:
+        return 0
+    lanes = max(1, int(workers))
+    target = max(int(minimum), int(math.ceil(float(lanes) * float(multiplier))))
+    return max(1, min(count, target))
+
+
 def _full_stage_fraction(mid_cycle_fraction: float) -> float:
     """Full stage can stay below 100% because robust full checks happen at round selection."""
     return clamp(float(mid_cycle_fraction) + 0.10, 0.35, 0.70)
@@ -1527,7 +1544,7 @@ def _enforce_parallel_load_floor(
     if total <= 1 or lanes <= 1:
         return False
 
-    desired_full = max(2.0, min(float(total), float(lanes) * 0.95))
+    desired_full = max(2.0, min(float(total), float(lanes) * 1.10))
     expected_full = (
         float(total)
         * float(controller.quick_keep_ratio)
@@ -1886,10 +1903,10 @@ def _idle_random_trial_budget(
         return 0
 
     if pending_count < lanes:
-        cap = max(2, int(math.ceil(float(lanes) * 1.25)))
+        cap = max(2, int(math.ceil(float(lanes) * 1.50)))
     else:
-        cap = max(2, lanes)
-    cap = min(cap, max(2, pending_count * 2))
+        cap = max(2, int(math.ceil(float(lanes) * 1.75)))
+    cap = min(cap, max(2, pending_count * 3))
     return max(0, min(gap, cap))
 
 
@@ -3999,12 +4016,11 @@ def _run_defender_round(
             archive_signatures=archive_signatures,
             novelty_bonus=config.novelty_bonus,
         )
-        quick_min_keep = max(
-            2,
-            min(
-                len(ranked_quick),
-                int(math.ceil(max(2, resource_plan.parallel_workers) * 0.85)),
-            ),
+        quick_min_keep = _parallel_keep_floor(
+            total=len(ranked_quick),
+            workers=resource_plan.parallel_workers,
+            multiplier=float(QUICK_KEEP_PARALLEL_FLOOR_MULTIPLIER),
+            minimum=2,
         )
         keep_quick_n = _stage_keep_count(
             len(ranked_quick),
@@ -4123,12 +4139,11 @@ def _run_defender_round(
             archive_signatures=archive_signatures,
             novelty_bonus=max(0.0, 0.5 * config.novelty_bonus),
         )
-        mid_min_keep = max(
-            1,
-            min(
-                len(ranked_mid),
-                int(math.ceil(max(1, resource_plan.parallel_workers) * 0.85)),
-            ),
+        mid_min_keep = _parallel_keep_floor(
+            total=len(ranked_mid),
+            workers=resource_plan.parallel_workers,
+            multiplier=float(MID_KEEP_PARALLEL_FLOOR_MULTIPLIER),
+            minimum=1,
         )
         keep_mid_n = _stage_keep_count(
             len(ranked_mid),
@@ -4766,12 +4781,11 @@ def _run_attacker_round(
             archive_signatures=archive_signatures,
             novelty_bonus=config.novelty_bonus,
         )
-        quick_min_keep = max(
-            2,
-            min(
-                len(ranked_quick),
-                int(math.ceil(max(2, resource_plan.parallel_workers) * 0.85)),
-            ),
+        quick_min_keep = _parallel_keep_floor(
+            total=len(ranked_quick),
+            workers=resource_plan.parallel_workers,
+            multiplier=float(QUICK_KEEP_PARALLEL_FLOOR_MULTIPLIER),
+            minimum=2,
         )
         keep_quick_n = _stage_keep_count(
             len(ranked_quick),
@@ -4889,12 +4903,11 @@ def _run_attacker_round(
             archive_signatures=archive_signatures,
             novelty_bonus=max(0.0, 0.5 * config.novelty_bonus),
         )
-        mid_min_keep = max(
-            1,
-            min(
-                len(ranked_mid),
-                int(math.ceil(max(1, resource_plan.parallel_workers) * 0.85)),
-            ),
+        mid_min_keep = _parallel_keep_floor(
+            total=len(ranked_mid),
+            workers=resource_plan.parallel_workers,
+            multiplier=float(MID_KEEP_PARALLEL_FLOOR_MULTIPLIER),
+            minimum=1,
         )
         keep_mid_n = _stage_keep_count(
             len(ranked_mid),
