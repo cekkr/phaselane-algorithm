@@ -118,6 +118,7 @@ MUTATION_STAGNATION_BOOST_STEP_MULTIPLIER = 1.30
 MUTATION_SIGNATURE_STALL_BOOST_STEP_MULTIPLIER = 0.45
 MUTATION_FORCE_THRESHOLD = 0.45
 MUTATION_FORCE_CHANCE = 0.82
+RUNTIME_OVERBUDGET_TOLERANCE = 1.12
 KEY_VARIANT_FLOOR = 2
 TARGET_CALIBRATION_MIN_OBSERVATIONS = 3
 TARGET_CALIBRATION_MAX_OBSERVATIONS = 6
@@ -378,7 +379,7 @@ class PredictiveStageController:
         full_eval = max(0.0, float(stats.get("full_eval", 0.0)))
         eval_unique = max(0.0, float(stats.get("eval_unique", 0.0)))
 
-        over_budget = batch_seconds > target_seconds
+        over_budget = batch_seconds > (float(RUNTIME_OVERBUDGET_TOLERANCE) * target_seconds)
         underutilized = (
             batch_seconds > 0.0
             and batch_seconds < (0.72 * target_seconds)
@@ -1030,6 +1031,7 @@ class SafeGFSLEvolver(GFSLEvolver):
     ):
         self._early_stop_generation = None  # type: ignore[attr-defined]
         self._early_stop_reason = None  # type: ignore[attr-defined]
+        self._last_stall_immigrants = 0  # type: ignore[attr-defined]
         for gen in range(generations):
             self.generation = gen
 
@@ -1211,15 +1213,15 @@ class SafeGFSLEvolver(GFSLEvolver):
                 seen.add(signature)
                 new_population.append(child)
 
-            # Inject random immigrants when the top signature is stuck for too long.
+            # Inject/replace with random immigrants when the top signature is stuck.
             if self.signature_stagnation_count >= max(1, self.stagnation_patience):
                 immigrant_ratio = 0.22 + (0.33 * stagnation_pressure)
                 immigrant_target = max(1, int(round(self.population_size * immigrant_ratio)))
                 injected = 0
                 inject_attempts = 0
+                preserve = max(1, int(elite_size))
                 while (
-                    len(new_population) < self.population_size
-                    and injected < immigrant_target
+                    injected < immigrant_target
                     and inject_attempts < (immigrant_target * 12)
                 ):
                     inject_attempts += 1
@@ -1229,9 +1231,19 @@ class SafeGFSLEvolver(GFSLEvolver):
                     signature = _evaluation_signature(immigrant)
                     if signature in seen:
                         continue
+                    if len(new_population) >= self.population_size:
+                        replace_idx = len(new_population) - 1 - injected
+                        if replace_idx < preserve:
+                            break
+                        replaced_sig = _evaluation_signature(new_population[replace_idx])
+                        if replaced_sig in seen:
+                            seen.discard(replaced_sig)
+                        new_population[replace_idx] = immigrant
+                    else:
+                        new_population.append(immigrant)
                     seen.add(signature)
-                    new_population.append(immigrant)
                     injected += 1
+                self._last_stall_immigrants = int(injected)  # type: ignore[attr-defined]
 
             while len(new_population) < self.population_size:
                 fallback = copy.deepcopy(random.choice(self.population[:elite_size]))
@@ -2344,6 +2356,10 @@ def _should_stop_by_runtime_stats(
             max(5, int(math.ceil(float(total_generations) * 0.14))),
         )
         recent_sig = list(generation_log[-sig_window:])
+        recent_stall_immigrants = sum(
+            max(0.0, float(row.get("stall_immigrants", 0.0)))
+            for row in recent_sig
+        )
         score_levels = {
             round(float(row.get(score_key, 0.0)), 8)
             for row in recent_sig
@@ -2353,7 +2369,12 @@ def _should_stop_by_runtime_stats(
             for row in recent_sig
             if str(row.get("best_signature", ""))
         }
-        if len(score_levels) == 1 and len(signatures) == 1 and probe_win_rate <= 0.08:
+        if (
+            len(score_levels) == 1
+            and len(signatures) == 1
+            and probe_win_rate <= 0.08
+            and recent_stall_immigrants <= 0.0
+        ):
             return True, "same-signature-stall"
 
     if (
@@ -4154,10 +4175,11 @@ def _run_defender_round(
             "target_batch_seconds": float(
                 stage_stats.get("target_batch_seconds", target_calibrator.target_seconds)
             ),
+            "stall_immigrants": int(getattr(evolver, "_last_stall_immigrants", 0)),
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
+            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} imm={imm} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 security=row["security"],
@@ -4180,6 +4202,7 @@ def _run_defender_round(
                 reb=row["parallel_rebalanced"],
                 rt=row["random_trials"],
                 ri=row["random_injected"],
+                imm=row["stall_immigrants"],
                 ub=row["underutilization_boost"],
                 mut=row["mutation_rate"],
                 secs=row["batch_seconds"],
@@ -4253,8 +4276,18 @@ def _run_defender_round(
         if config.statistical_predictive and config.auto_statistical_tuning:
             # Preemptively tighten staged load when pending genomes outnumber workers.
             pressure = float(len(pending)) / float(max(1, resource_plan.parallel_workers))
-            if pressure > 2.0:
-                factor = min(2.0, pressure - 2.0)
+            prev_batch_seconds = float(stage_stats.get("batch_seconds", 0.0)) if stage_stats else 0.0
+            prev_target_seconds = max(
+                0.25,
+                float(stage_stats.get("target_batch_seconds", target_seconds)) if stage_stats else float(target_seconds),
+            )
+            runtime_pressure = (
+                prev_batch_seconds / prev_target_seconds
+                if prev_batch_seconds > 0.0
+                else 1.0
+            )
+            if pressure > 2.0 and runtime_pressure > float(RUNTIME_OVERBUDGET_TOLERANCE):
+                factor = min(2.0, pressure - 2.0) * min(1.0, runtime_pressure - 1.0)
                 controller.quick_keep_ratio -= 0.06 * factor
                 controller.mid_keep_ratio -= 0.05 * factor
                 controller.quick_cycle_fraction -= 0.035 * factor
@@ -4956,10 +4989,11 @@ def _run_attacker_round(
             "target_batch_seconds": float(
                 stage_stats.get("target_batch_seconds", target_calibrator.target_seconds)
             ),
+            "stall_immigrants": int(getattr(evolver, "_last_stall_immigrants", 0)),
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
+            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} imm={imm} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 lane=row["lane_success"],
@@ -4981,6 +5015,7 @@ def _run_attacker_round(
                 reb=row["parallel_rebalanced"],
                 rt=row["random_trials"],
                 ri=row["random_injected"],
+                imm=row["stall_immigrants"],
                 ub=row["underutilization_boost"],
                 mut=row["mutation_rate"],
                 secs=row["batch_seconds"],
@@ -5053,8 +5088,18 @@ def _run_attacker_round(
 
         if config.statistical_predictive and config.auto_statistical_tuning:
             pressure = float(len(pending)) / float(max(1, resource_plan.parallel_workers))
-            if pressure > 2.0:
-                factor = min(2.0, pressure - 2.0)
+            prev_batch_seconds = float(stage_stats.get("batch_seconds", 0.0)) if stage_stats else 0.0
+            prev_target_seconds = max(
+                0.25,
+                float(stage_stats.get("target_batch_seconds", target_seconds)) if stage_stats else float(target_seconds),
+            )
+            runtime_pressure = (
+                prev_batch_seconds / prev_target_seconds
+                if prev_batch_seconds > 0.0
+                else 1.0
+            )
+            if pressure > 2.0 and runtime_pressure > float(RUNTIME_OVERBUDGET_TOLERANCE):
+                factor = min(2.0, pressure - 2.0) * min(1.0, runtime_pressure - 1.0)
                 controller.quick_keep_ratio -= 0.06 * factor
                 controller.mid_keep_ratio -= 0.05 * factor
                 controller.quick_cycle_fraction -= 0.035 * factor
