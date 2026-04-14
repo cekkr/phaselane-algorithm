@@ -36,7 +36,7 @@ from .simulation import (
 
 ensure_evolvo_importable()
 
-from evolvo import GFSLGenome, GFSLInstruction, GFSLEvolver
+from evolvo import GFSLGenome, GFSLInstruction, GFSLEvolver, resolve_torch_accelerator
 
 
 @dataclass(frozen=True)
@@ -57,7 +57,7 @@ class ExperimentConfig:
     parallel_backend: str = "auto"  # auto|process|thread|off
     use_supervised_guide: bool = True
     supervised_end_round_only: bool = True
-    preferred_device: str = "auto"  # auto|cpu|cuda|mps
+    preferred_device: str = "auto"  # auto|cpu|cuda|rocm|mps
     parent_pool_ratio: float = 0.60
     stagnation_patience: int = 4
     mutation_floor: float = 0.12
@@ -1342,38 +1342,16 @@ def _utc_now_iso() -> str:
 
 
 def _detect_gpu_backend(preferred_device: str = "auto") -> Tuple[str, bool, bool]:
-    torch_available = False
-    backend = "none"
     try:
-        import torch  # type: ignore
-
-        torch_available = True
-        if preferred_device != "auto":
-            preferred = preferred_device.lower()
-            if preferred == "cuda" and torch.cuda.is_available():
-                backend = "cuda"
-            elif preferred == "mps":
-                mps_ok = bool(
-                    hasattr(torch.backends, "mps")
-                    and torch.backends.mps.is_available()
-                )
-                if mps_ok:
-                    backend = "mps"
-            elif preferred == "cpu":
-                backend = "none"
-        else:
-            if torch.cuda.is_available():
-                backend = "cuda"
-            elif (
-                hasattr(torch.backends, "mps")
-                and torch.backends.mps.is_available()
-            ):
-                backend = "mps"
+        backend, _device, accelerator_available, torch_available = resolve_torch_accelerator(
+            preferred_device
+        )
     except Exception:
-        torch_available = False
-        backend = "none"
+        return "none", False, False
 
-    return backend, backend != "none", torch_available
+    if not accelerator_available:
+        return "none", False, torch_available
+    return backend, True, torch_available
 
 
 def _resolve_resource_plan(config: ExperimentConfig, max_population: int) -> ResourcePlan:

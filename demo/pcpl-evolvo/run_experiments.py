@@ -676,7 +676,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        choices=("auto", "cpu", "cuda", "mps"),
+        choices=("auto", "cpu", "cuda", "rocm", "mps"),
         default=None,
         help="Preferred compute device for supervised guide.",
     )

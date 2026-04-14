@@ -150,7 +150,7 @@ PowerShell:
 - `--no-resume` (start fresh even if archive exists)
 - `--parallel-backend {auto,process,thread,off}`, `--workers` (`0` = all CPUs)
 - `--no-supervised-guide`
-- `--device {auto,cpu,cuda,mps}` (for optional supervised guide acceleration)
+- `--device {auto,cpu,cuda,rocm,mps}` (for optional supervised guide acceleration)
 - `--parent-pool-ratio`, `--stagnation-patience`, `--mutation-floor`, `--mutation-ceiling`, `--mutation-step`
 - `--quick-cycle-fraction`, `--mid-cycle-fraction`, `--quick-keep-ratio`, `--mid-keep-ratio` (initial seeds, auto-tuned in real time)
 - `--key-variants`, `--novelty-bonus`, `--predictive-penalty`
