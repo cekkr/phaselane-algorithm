@@ -58,6 +58,10 @@ class ExperimentConfig:
     use_supervised_guide: bool = True
     supervised_end_round_only: bool = True
     preferred_device: str = "auto"  # auto|cpu|cuda|rocm|mps
+    supervised_hidden_layers: Tuple[int, ...] = ()
+    supervised_epochs: int = 0
+    supervised_candidate_pool: int = 0
+    supervised_capacity_auto_tune: bool = True
     parent_pool_ratio: float = 0.60
     stagnation_patience: int = 4
     mutation_floor: float = 0.12
@@ -1927,6 +1931,14 @@ def _build_supervised_guide_if_available(
         epochs = 4
         candidate_pool = 5
 
+    configured_layers = [int(width) for width in config.supervised_hidden_layers if int(width) > 0]
+    if configured_layers:
+        hidden_layers = configured_layers[:5]
+    if int(config.supervised_epochs) > 0:
+        epochs = int(config.supervised_epochs)
+    if int(config.supervised_candidate_pool) > 0:
+        candidate_pool = int(config.supervised_candidate_pool)
+
     min_buffer = max(24, min(192, int(round(float(config.population_size) * 0.55))))
     batch_size = max(16, min(96, int(round(float(min_buffer) * 0.75))))
     max_observations = max(16, min(64, int(round(float(config.population_size) * 0.60))))
@@ -1941,6 +1953,7 @@ def _build_supervised_guide_if_available(
             epochs=epochs,
             candidate_pool=candidate_pool,
             max_observations=max_observations,
+            capacity_auto_tune=bool(config.supervised_capacity_auto_tune),
         )
     except Exception:
         return None
@@ -5517,6 +5530,22 @@ def run_continuous_experiment(
                         else "per-generation"
                     )
                 )
+            )
+        )
+        report_lines.append(
+            "- supervised tuning: layers=`{layers}` epochs=`{epochs}` candidate_pool=`{pool}` capacity_auto_tune=`{capacity}`".format(
+                layers=(
+                    ",".join(str(int(width)) for width in config.supervised_hidden_layers)
+                    if config.supervised_hidden_layers
+                    else "auto"
+                ),
+                epochs=(int(config.supervised_epochs) if int(config.supervised_epochs) > 0 else "auto"),
+                pool=(
+                    int(config.supervised_candidate_pool)
+                    if int(config.supervised_candidate_pool) > 0
+                    else "auto"
+                ),
+                capacity=("enabled" if bool(config.supervised_capacity_auto_tune) else "disabled"),
             )
         )
         if bool(config.statistical_predictive):

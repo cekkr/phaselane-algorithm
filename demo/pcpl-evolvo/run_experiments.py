@@ -58,6 +58,39 @@ def _clamp_float(value: float, low: float, high: float) -> float:
     return max(float(low), min(float(high), float(value)))
 
 
+def _parse_hidden_layers_spec(value: Any) -> List[int]:
+    if value is None:
+        return []
+    raw_tokens: List[Any]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in {"auto", "default", "none", "off"}:
+            return []
+        raw_tokens = [chunk.strip() for chunk in text.split(",")]
+    elif isinstance(value, (list, tuple)):
+        raw_tokens = list(value)
+    else:
+        raw_tokens = [value]
+
+    parsed: List[int] = []
+    for token in raw_tokens:
+        if token is None:
+            continue
+        token_str = str(token).strip()
+        if not token_str:
+            continue
+        try:
+            width = int(token_str)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid hidden layer width `{token}` in supervised-hidden-layers."
+            ) from exc
+        if width <= 0:
+            raise ValueError("supervised-hidden-layers values must be > 0")
+        parsed.append(width)
+    return parsed[:5]
+
+
 def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, Any]]:
     mode = str(getattr(args, "mode", "")).lower()
     base = {
@@ -240,6 +273,10 @@ def _build_experiment_config(
         use_supervised_guide=bool(args.use_supervised_guide),
         supervised_end_round_only=bool(args.supervised_end_round_only),
         preferred_device=args.device,
+        supervised_hidden_layers=tuple(int(width) for width in args.supervised_hidden_layers),
+        supervised_epochs=int(args.supervised_epochs),
+        supervised_candidate_pool=int(args.supervised_candidate_pool),
+        supervised_capacity_auto_tune=bool(args.supervised_capacity_auto_tune),
         parent_pool_ratio=args.parent_pool_ratio if parent_pool_ratio is None else float(parent_pool_ratio),
         stagnation_patience=args.stagnation_patience if stagnation_patience is None else int(stagnation_patience),
         mutation_floor=args.mutation_floor if mutation_floor is None else float(mutation_floor),
@@ -346,6 +383,9 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "workers": "workers",
         "parallel_backend": "parallel_backend",
         "device": "preferred_device",
+        "supervised_hidden_layers": "supervised_hidden_layers",
+        "supervised_epochs": "supervised_epochs",
+        "supervised_candidate_pool": "supervised_candidate_pool",
         "parent_pool_ratio": "parent_pool_ratio",
         "stagnation_patience": "stagnation_patience",
         "mutation_floor": "mutation_floor",
@@ -379,8 +419,19 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         )
     else:
         resolved["supervised_end_round_only"] = bool(args.supervised_end_round_only)
+    if args.supervised_capacity_auto_tune is None:
+        resolved["supervised_capacity_auto_tune"] = bool(
+            defaults.get("supervised_capacity_auto_tune", True)
+        )
+    else:
+        resolved["supervised_capacity_auto_tune"] = bool(args.supervised_capacity_auto_tune)
     if not resolved["use_supervised_guide"]:
         resolved["supervised_end_round_only"] = False
+    resolved["supervised_hidden_layers"] = _parse_hidden_layers_spec(
+        resolved.get("supervised_hidden_layers")
+    )
+    resolved["supervised_epochs"] = max(0, int(resolved.get("supervised_epochs", 0)))
+    resolved["supervised_candidate_pool"] = max(0, int(resolved.get("supervised_candidate_pool", 0)))
     resolved["statistical_predictive"] = bool(defaults["statistical_predictive"]) and not bool(
         args.no_statistical_predictive
     )
@@ -409,6 +460,9 @@ def _apply_runtime_config(args: argparse.Namespace, resolved: Dict[str, Any]) ->
         "workers",
         "parallel_backend",
         "device",
+        "supervised_hidden_layers",
+        "supervised_epochs",
+        "supervised_candidate_pool",
         "parent_pool_ratio",
         "stagnation_patience",
         "mutation_floor",
@@ -433,6 +487,11 @@ def _apply_runtime_config(args: argparse.Namespace, resolved: Dict[str, Any]) ->
         args,
         "supervised_end_round_only",
         bool(resolved["supervised_end_round_only"]),
+    )
+    setattr(
+        args,
+        "supervised_capacity_auto_tune",
+        bool(resolved["supervised_capacity_auto_tune"]),
     )
     setattr(args, "statistical_predictive", bool(resolved["statistical_predictive"]))
     setattr(args, "auto_statistical_tuning", bool(resolved["auto_statistical_tuning"]))
@@ -486,6 +545,29 @@ def _print_effective_config(resolved: Dict[str, Any]) -> None:
             else "per-generation"
         )
     print(f"[pcpl-evolvo] supervised guide: {supervised_mode}")
+    print(
+        "[pcpl-evolvo] supervised tuning layers={layers} epochs={epochs} candidate_pool={pool} capacity_auto_tune={capacity}".format(
+            layers=(
+                ",".join(str(int(width)) for width in resolved.get("supervised_hidden_layers", []))
+                or "auto"
+            ),
+            epochs=(
+                int(resolved.get("supervised_epochs", 0))
+                if int(resolved.get("supervised_epochs", 0)) > 0
+                else "auto"
+            ),
+            pool=(
+                int(resolved.get("supervised_candidate_pool", 0))
+                if int(resolved.get("supervised_candidate_pool", 0)) > 0
+                else "auto"
+            ),
+            capacity=(
+                "enabled"
+                if bool(resolved.get("supervised_capacity_auto_tune", True))
+                else "disabled"
+            ),
+        )
+    )
     print(
         "[pcpl-evolvo] runtime target_gen_s={target:.2f} eval_cache={cache}".format(
             target=float(resolved["target_generation_seconds"]),
@@ -801,6 +883,41 @@ def parse_args() -> argparse.Namespace:
         help="Preferred compute device for supervised guide.",
     )
     parser.add_argument(
+        "--supervised-hidden-layers",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated hidden layer widths for supervised model "
+            "(example: 384,256,160,96). Use 'auto' to keep profile defaults."
+        ),
+    )
+    parser.add_argument(
+        "--supervised-epochs",
+        type=int,
+        default=None,
+        help="Override supervised training epochs per update (0/omit keeps auto defaults).",
+    )
+    parser.add_argument(
+        "--supervised-candidate-pool",
+        type=int,
+        default=None,
+        help="Override supervised mutation candidate pool size (0/omit keeps auto defaults).",
+    )
+    supervised_capacity_group = parser.add_mutually_exclusive_group()
+    supervised_capacity_group.add_argument(
+        "--supervised-capacity-auto-tune",
+        dest="supervised_capacity_auto_tune",
+        action="store_true",
+        default=None,
+        help="Enable adaptive supervised model capacity control (recommended).",
+    )
+    supervised_capacity_group.add_argument(
+        "--no-supervised-capacity-auto-tune",
+        dest="supervised_capacity_auto_tune",
+        action="store_false",
+        help="Disable adaptive supervised model capacity control.",
+    )
+    parser.add_argument(
         "--parent-pool-ratio",
         type=float,
         default=None,
@@ -971,6 +1088,10 @@ def main() -> None:
     )
     if int(args.replicate_seed_step) <= 0:
         raise ValueError("--replicate-seed-step must be > 0")
+    if int(args.supervised_epochs) < 0:
+        raise ValueError("--supervised-epochs must be >= 0")
+    if int(args.supervised_candidate_pool) < 0:
+        raise ValueError("--supervised-candidate-pool must be >= 0")
     resolved["fitness_schema_version"] = str(args.fitness_schema_version)
     resolved["analysis_tag"] = str(args.analysis_tag or "")
     resolved["replicates"] = int(args.replicates)
