@@ -1,101 +1,137 @@
-# Evolvo Conclusions (Run 20260406-140503-fast)
+# Evolvo Conclusions (External Archive Aggregate)
 
-Date: 2026-04-06  
-Run analyzed: `demo/pcpl-evolvo/runs/20260406-140503-fast`
+Date: 2026-04-14  
+Source scope: `demo/pcpl-evolvo/runs/external_archive` and `demo/pcpl-evolvo/runs/external_archive/runs`
 
-## Scope and data used
+## Data sufficiency verdict
 
-- Continuous mode snapshot analyzed at `2026-04-06T16:40:44`.
-- Iterations completed: `19`.
-- Grid size configured: `64` combinations.
-- Combinations with results/archives: `19`.
-- Each evaluated combination currently has `rounds_completed=1`.
+Yes, there is enough data to update conclusions with semantic findings, with two caveats:
 
-## Empirical findings
+- The dataset is strong for **directional conclusions** (23 completed rounds, 324 scenario metric rows, 1503 generation-log rows).
+- The dataset is not yet final for publication-level claims, because it mixes **two scoring eras** (before and after QFT/linear-rank/compare-x integration), so absolute score values are not directly comparable across all runs.
 
-### Pros
+## Runs included
 
-- Protocol correctness is consistently strong:
-  - mean `principle_score = 1.0000` across analyzed combinations.
-  - exact 1-of-x and block fairness constraints are satisfied in practice for evaluated runs.
-- Security behavior is generally good:
-  - mean `security_score = 0.9923` (min `0.9840`, max `0.9980`).
-  - `shared_device_match_rate = 0.0` in all analyzed best defenders.
-  - `brute_force_resistance_score = 1.0` in all analyzed best defenders.
-- Cost/performance tradeoff improved compared to fixed baselines:
-  - best defender score `0.946921` (`p18-g26-i18-ap12-ag10-e12`).
-  - baseline `minimal-cost` score is `0.9227`, so best observed gain is `+0.0242` (about `+2.62%` relative).
+- Included archives with valid `round-results.json`:  
+  `20260413-091027-full`, `20260413-150834-full`, `20260413-184702-full`, `runs/20260413-201028-full`, `runs/20260414-121658-full`
+- Excluded from stats (missing usable round results):  
+  `20260412-204828-full`
 
-### Cons and risks
+## Method (reproducible)
 
-- Synchronization robustness is still the weakest area:
-  - mean `sync_score = 0.8547`.
-  - mean `sync_loss_rate = 0.4150` (range `0.3167..0.4813`).
-  - `resync_success_rate = 1.0` indicates recovery works, but drift events are too frequent.
-- Adversarial pressure is non-zero and variable:
-  - mean `attacker_advantage_score = 0.0231` (max `0.0480`).
-  - indicates some evolved defenders still leak useful structure under attacker co-evolution.
-- Coverage is still partial:
-  - only `19/64` combinations were executed at this snapshot.
-  - no full sweep yet (`sweeps_completed=0`), so conclusions are promising but not final.
-- Depth is limited:
-  - one round per combination is insufficient for strong convergence claims.
+All statistics below were computed from per-round JSON artifacts (`round-results.json`) with a Python aggregation script run locally over the archive tree.  
+Round-level metric values are means across each round's scenario rows.
 
-## Suggested improvements for `papers/main-paper.md`
+## Aggregate empirical summary (23 rounds)
 
-These updates should be added in future revisions (especially sections 8, 9, and 10).
+| metric | mean | min | max |
+|---|---:|---:|---:|
+| defender_score | 0.8073 | 0.7801 | 0.8753 |
+| attacker_score | 0.0104 | 0.0000 | 0.0247 |
+| defender_delta_vs_reference | +0.0380 | +0.0322 | +0.0509 |
+| principle_score | 1.0000 | 1.0000 | 1.0000 |
+| sync_score | 0.4656 | 0.4615 | 0.5259 |
+| stability_score | 0.5400 | 0.5365 | 0.5900 |
+| security_score | 0.9965 | 0.9918 | 1.0000 |
+| cost_score | 0.9214 | 0.9214 | 0.9214 |
+| runtime_score | 1.0000 | 1.0000 | 1.0000 |
+| attacker_advantage_score | 0.0104 | 0.0000 | 0.0247 |
+| sync_loss_rate | 0.8793 | 0.8767 | 0.8954 |
+| projected_sync_loss_rate | 0.9472 | 0.7697 | 0.9569 |
+| horizon_sync_score | 0.0528 | 0.0431 | 0.2303 |
 
-1. Add a dedicated empirical methodology subsection in section 8.
-- Include co-evolution setup (defender vs attacker), scenario profiles, and archive/resume behavior.
-- Report how many combinations and rounds were executed before deriving conclusions.
+## Score-era split (important)
 
-2. Add a quantitative score breakdown table to section 8/10.
-- Include `principle`, `sync`, `security`, `cost`, `attacker_advantage`.
-- Publish min/mean/max across runs, not only single best snapshots.
+Because scoring changed during development, score magnitudes split into two regimes:
 
-3. Expand section 9 (limitations) with synchronization stress findings.
-- Explicitly state that observed `sync_loss_rate` remains material despite successful resync windows.
-- Clarify that this is currently a practical tuning target, not a solved property.
+- Pre QFT/linear-rank/compare-x scoring (7 rounds): mean defender score `0.8614`, mean delta vs reference `+0.0507`.
+- Post QFT/linear-rank/compare-x scoring (16 rounds): mean defender score `0.7836`, mean delta vs reference `+0.0325`.
 
-4. Add attacker-evolution limitations and open problems.
-- Mention that attacker advantage can still rise in some configurations.
-- Propose stronger anti-structure defenses (lane KDF hardening, schedule jitter constraints, stricter anti-collision penalties).
+Interpretation: the raw score drop is expected after scoring rebalance and additional terms; comparisons should be made **within the same scoring era**.
 
-5. Add reproducibility references.
-- Link to run artifact structure (`archive.json`, per-round reports, leaderboards, conclusions files).
-- Add exact command lines used for the published benchmark snapshot.
+## Mathematical semantics from the data
 
-## Engineering improvements applied after this analysis
+1. Protocol invariants are empirically robust.
+- `principle_score = 1.0` in all analyzed rounds.
+- `one_of_x_rate`, `block_once_rate`, `permutation_valid_rate`, and `attack_reject_rate` are effectively saturated.
+- This supports the core deterministic schedule correctness claims.
 
-To reduce random dispersivity and improve CPU utilization in future runs, the implementation was updated:
+2. Security envelope is strong, but not the active bottleneck.
+- `security_score` remains high (`0.9965` mean).
+- `attacker_advantage_score` is low (`0.0104` mean), but non-zero.
+- Security improvements are incremental, not the main driver of total score variance.
 
-- Persistent parallel worker pools are now reused across generations/rounds.
-  - reduces repeated process spawn overhead.
-  - measured benchmark on the same workload improved from `23.98s` to `18.87s` real time (~`21.3%` faster).
-- Focused evolution strategy added:
-  - adaptive mutation schedule based on stagnation,
-  - parent selection focused on top-ranked pool,
-  - local refinement pressure around high-quality genomes.
-- New tuning controls exposed in CLI:
-  - `--parent-pool-ratio`, `--stagnation-patience`, `--mutation-floor`, `--mutation-ceiling`, `--mutation-step`.
-- Statistical predictive staged evaluation added:
-  - quick/mid/full cycle fractions with predictive cuts (`--quick-cycle-fraction`, `--mid-cycle-fraction`, keep ratios),
-  - novelty-aware ranking to prioritize non-duplicate genomes and prune expected/no-new candidates.
-  - benchmark with staged mode and key variants: `off=36.55s` vs `process(8 workers)=18.93s` real time (~`48.2%` faster).
-- Multi-key validation added in staged evaluation:
-  - each scenario can be expanded to multiple key-generation/key-sharing variants (`--key-variants`) to stress validity and attacker resistance.
-- Long-horizon timing projection added:
-  - default `10s` projection with simulated frequencies (`--device-mhz=100`, `--provider-mhz=300`),
-  - projected sync-loss and horizon sync metrics are now tracked in scoring outputs.
+3. Synchronization remains the primary mathematical weakness.
+- `sync_score` and `stability_score` are much lower than principle/security.
+- `sync_loss_rate` and `projected_sync_loss_rate` stay high in long-horizon projection.
+- `horizon_sync_score` is low (`0.0528` mean), confirming timing/synchronization is the unresolved frontier.
 
-## Next recommended run protocol
+4. QFT / linear-rank / compare-x terms are currently stronger as diagnostics than gradients.
+- Available in 16 post-update rounds:
+  - `qft_score = 0.4112` (constant in this dataset)
+  - `qft_period_bits ≈ 64.94` (constant)
+  - `linear_rank_score = 1.0` (constant)
+  - `compare_x_score = 0.9535` (constant)
+- These terms confirm paper-alignment checks, but their near-constant behavior in this archive means they currently add limited intra-run selection pressure.
 
-1. Complete at least one full sweep (`64/64`) before drawing comparative claims.
-2. For top combinations, run at least `3-5` rounds each to test stability and attacker adaptation.
-3. Track and publish:
-- score variance over rounds,
-- sync-loss trend over rounds,
-- attacker-advantage trend over rounds,
-- runtime/cost trend with process workers enabled.
+5. Compare-x behavior shows better envelope with larger x in this dataset.
+- Aggregated by scenario family:
+  - `x4-fixed`: total `0.7870`, attacker_adv `0.0151`
+  - `x6-generated`: total `0.7918`, attacker_adv `0.0117`
+  - `x8-generated`: total `0.7999`, attacker_adv `0.0060`
+- In these runs, larger x trends toward lower attacker advantage and slightly better total score, while sync/horizon still need work.
 
-This file is intentionally incremental and should be revised after each major continuous run.
+## Algorithmic-evolution semantics from generation logs
+
+1. Plateau behavior is real and quantifiable.
+- Defender logs: average 50 generations per round.
+- Average best-score improvement events per round: `1.70`.
+- Mean same-score step ratio: `96.44%`.
+- Mean longest same-score streak: `45.7` generations (max `51`).
+
+2. Mutation pressure is already very high during stalls.
+- Defender mutation rate mean `0.918` (often near ceiling `0.99`).
+- High mutation alone is not sufficient to escape flat fitness neighborhoods.
+
+3. Staged evaluation is aggressive and throughput-oriented.
+- Defender means: `quick_fraction 0.054`, `mid_fraction 0.199`, `quick_keep 0.762`, `mid_keep 0.150`.
+- Logs show frequent quick-stage pruning and high unique evaluations.
+- Despite this, late-generation score progress remains sparse.
+
+4. Versus-reference gains come mostly from cost shaping, not sync breakthroughs.
+- Mean per-round delta vs reference by component:
+  - `cost_score: +0.3143`
+  - `sync_score: +0.0021`
+  - `stability_score: +0.0018`
+  - `security_score: +0.0002`
+  - `attacker_advantage_score: -0.0007` (lower is better)
+- Practical meaning: evolver reliably finds cheaper/stable-enough policies, but has not yet materially reduced sync-loss dynamics.
+
+## Notes to incorporate in `papers/main-paper.md`
+
+1. Separate what is proven by invariants from what remains empirical.
+- Keep strong claims for schedule/permutation/1-of-x correctness.
+- Frame long-horizon synchronization as an open optimization problem, not solved.
+
+2. Add a score-era/versioning note in empirical sections.
+- Report that scoring changed (new paper-alignment terms + weight rebalance).
+- Avoid cross-era absolute-score comparisons.
+
+3. Clarify QFT/linear-rank/compare-x interpretation.
+- In current evolvo runs these are mostly compliance diagnostics.
+- To make them evolutionary drivers, they need scenario/genome variability (otherwise they saturate).
+
+4. Emphasize horizon-sync as the top research objective.
+- The largest weakness in this archive is projected sync loss.
+- Main-paper future-work should prioritize drift modeling, resync policy tuning, and time-reference robustness.
+
+5. Include parameter-scale caveat for QFT period.
+- Observed period bits here are around 65 in the tested evolvo settings.
+- Distinguish benchmark-scale parameters from larger production/paper parameter examples.
+
+## Practical next protocol for stronger paper-grade evidence
+
+1. Run post-update scoring campaigns only, then publish that subset as canonical.
+2. Increase rounds per configuration and report confidence intervals across repeated seeds.
+3. Add explicit sync-stress scenarios (clock drift, jitter, resync-window sweeps) and track reductions in projected sync-loss as the primary KPI.
+4. Keep QFT/linear-rank/compare-x in reports, but inject parameter variability so those terms contribute meaningful selection gradients.
