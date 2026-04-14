@@ -1916,8 +1916,32 @@ def _build_supervised_guide_if_available(
         device = plan.gpu_backend
     else:
         device = "cpu"
+
+    profile = str(config.profile).strip().lower()
+    if profile == "full":
+        hidden_layers = [384, 256, 160, 96]
+        epochs = 5
+        candidate_pool = 6
+    else:
+        hidden_layers = [256, 160, 96]
+        epochs = 4
+        candidate_pool = 5
+
+    min_buffer = max(24, min(192, int(round(float(config.population_size) * 0.55))))
+    batch_size = max(16, min(96, int(round(float(min_buffer) * 0.75))))
+    max_observations = max(16, min(64, int(round(float(config.population_size) * 0.60))))
+    buffer_size = max(512, int(round(float(config.population_size) * 10.0)))
     try:
-        return GFSLSupervisedGuide(device=device)
+        return GFSLSupervisedGuide(
+            device=device,
+            hidden_layers=hidden_layers,
+            buffer_size=buffer_size,
+            min_buffer=min_buffer,
+            batch_size=batch_size,
+            epochs=epochs,
+            candidate_pool=candidate_pool,
+            max_observations=max_observations,
+        )
     except Exception:
         return None
 
