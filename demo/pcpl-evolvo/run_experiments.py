@@ -38,7 +38,7 @@ except Exception:
 
 from pcpl_evolvo.experiment import ExperimentConfig, run_experiment
 
-DEFAULT_FITNESS_SCHEMA_VERSION = "pcpl-evolvo-2026-04-13-qft-linear-comparex-v1"
+DEFAULT_FITNESS_SCHEMA_VERSION = "auto"
 
 
 def _safe_int(value: int, minimum: int = 1) -> int:
@@ -492,6 +492,15 @@ def _print_effective_config(resolved: Dict[str, Any]) -> None:
             cache=int(resolved["max_eval_cache_entries"]),
         )
     )
+    if "fitness_schema_version" in resolved:
+        print(
+            "[pcpl-evolvo] conclusions fitness_schema={schema} analysis_tag={tag} replicates={reps} replicate_ref={rep_ref}".format(
+                schema=str(resolved.get("fitness_schema_version", "")),
+                tag=str(resolved.get("analysis_tag", "")),
+                reps=int(resolved.get("replicates", 1)),
+                rep_ref=str(resolved.get("replicate_reference", "best")),
+            )
+        )
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -521,6 +530,36 @@ def _git_revision() -> str:
         return str(output) if output else "unknown"
     except Exception:
         return "unknown"
+
+
+def _score_schema_fingerprint() -> str:
+    import hashlib
+
+    hasher = hashlib.blake2b(digest_size=8)
+    schema_sources = [
+        SRC_DIR / "pcpl_evolvo" / "simulation.py",
+        SRC_DIR / "pcpl_evolvo" / "experiment.py",
+    ]
+    for path in schema_sources:
+        hasher.update(str(path.name).encode("utf-8"))
+        if path.exists():
+            hasher.update(path.read_bytes())
+        else:
+            hasher.update(b"<missing>")
+    return hasher.hexdigest()
+
+
+def _resolve_fitness_schema_version(
+    *,
+    requested: str,
+    mode: str,
+    profile: str,
+) -> str:
+    value = str(requested or "").strip()
+    if value and value.lower() != "auto":
+        return value
+    fp = _score_schema_fingerprint()
+    return f"auto-{mode}-{profile}-{fp}"
 
 
 def _run_metadata_payload(
@@ -560,6 +599,24 @@ def _run_once(
     )
     summary["run_metadata_path"] = str(run_meta_path)
     return summary
+
+
+def _select_replicate_reference_index(
+    summaries: List[Dict[str, Any]],
+    *,
+    policy: str,
+) -> int:
+    if not summaries:
+        return 0
+    normalized = str(policy or "best").strip().lower()
+    if normalized == "first":
+        return 0
+    indexed = list(enumerate(summaries))
+    if normalized == "median":
+        ordered = sorted(indexed, key=lambda item: float(item[1].get("best_score", float("-inf"))))
+        return int(ordered[len(ordered) // 2][0])
+    best = max(indexed, key=lambda item: float(item[1].get("best_score", float("-inf"))))
+    return int(best[0])
 
 
 def _print_summary(summary: Dict[str, Any]) -> None:
@@ -865,19 +922,33 @@ def parse_args() -> argparse.Namespace:
         "--fitness-schema-version",
         type=str,
         default=DEFAULT_FITNESS_SCHEMA_VERSION,
-        help="Fitness/scoring schema label stored with each run for cross-era comparability.",
+        help=(
+            "Fitness/scoring schema label stored with each run. "
+            "Use 'auto' (default) to derive a deterministic schema reference from current scoring sources."
+        ),
     )
     parser.add_argument(
         "--replicates",
         type=int,
         default=1,
-        help="Number of independent replicated single-run executions (separate out dirs).",
+        help=(
+            "Number of independent single-run replications (same config, different seeds, separate out dirs)."
+        ),
     )
     parser.add_argument(
         "--replicate-seed-step",
         type=int,
         default=7919,
         help="Seed increment between replicates when --replicates > 1.",
+    )
+    parser.add_argument(
+        "--replicate-reference",
+        choices=("best", "median", "first"),
+        default="best",
+        help=(
+            "Canonical replicate selector for multi-run campaigns: "
+            "best (max score), median (middle score), or first (rep-000)."
+        ),
     )
     return parser.parse_args()
 
@@ -893,6 +964,17 @@ def main() -> None:
 
     resolved = _resolve_runtime_config(args)
     _apply_runtime_config(args, resolved)
+    args.fitness_schema_version = _resolve_fitness_schema_version(
+        requested=str(args.fitness_schema_version),
+        mode=str(args.mode),
+        profile=str(args.profile),
+    )
+    if int(args.replicate_seed_step) <= 0:
+        raise ValueError("--replicate-seed-step must be > 0")
+    resolved["fitness_schema_version"] = str(args.fitness_schema_version)
+    resolved["analysis_tag"] = str(args.analysis_tag or "")
+    resolved["replicates"] = int(args.replicates)
+    resolved["replicate_reference"] = str(args.replicate_reference)
     if args.continuous and str(args.mode).lower() == "paper" and not rounds_explicit:
         # In continuous paper sweeps, prioritize cadence across many combos/strategies.
         args.rounds = 1
@@ -903,6 +985,9 @@ def main() -> None:
     _print_effective_config(resolved)
     if args.print_effective_config:
         return
+
+    if args.continuous and int(args.replicates) != 1:
+        print("[pcpl-evolvo] warning: --replicates is ignored in --continuous mode")
 
     if args.out_dir:
         out_dir = Path(args.out_dir).expanduser().resolve()
@@ -919,6 +1004,7 @@ def main() -> None:
             "fitness_schema_version": str(args.fitness_schema_version),
             "mode": str(args.mode),
             "profile": str(args.profile),
+            "replicate_reference_policy": str(args.replicate_reference),
             "resolved_config": resolved,
             "continuous": False,
             "launcher": "run_experiments.py",
@@ -986,6 +1072,11 @@ def main() -> None:
         best_scores = [float(item["best_score"]) for item in replicate_summaries]
         attacker_scores = [float(item["best_attacker_score"]) for item in replicate_summaries]
         round_counts = [int(item.get("rounds_completed", 0)) for item in replicate_summaries]
+        ref_idx = _select_replicate_reference_index(
+            replicate_summaries,
+            policy=str(args.replicate_reference),
+        )
+        ref_summary = replicate_summaries[ref_idx]
         campaign_summary: Dict[str, Any] = {
             "timestamp": datetime.now().isoformat(),
             "analysis_tag": str(args.analysis_tag or ""),
@@ -995,6 +1086,10 @@ def main() -> None:
             "replicate_count": int(args.replicates),
             "base_seed": base_seed,
             "seed_step": seed_step,
+            "reference_policy": str(args.replicate_reference),
+            "reference_replicate_index": int(ref_idx),
+            "reference_out_dir": str(ref_summary.get("out_dir", "")),
+            "reference_best_score": float(ref_summary.get("best_score", float("-inf"))),
             "best_score_mean": sum(best_scores) / float(max(1, len(best_scores))),
             "best_score_min": min(best_scores) if best_scores else None,
             "best_score_max": max(best_scores) if best_scores else None,
@@ -1015,7 +1110,20 @@ def main() -> None:
         }
         campaign_path = out_dir / "replicates-summary.json"
         _write_json(campaign_path, campaign_summary)
+        reference_path = out_dir / "reference-run.json"
+        _write_json(
+            reference_path,
+            {
+                "timestamp": datetime.now().isoformat(),
+                "analysis_tag": str(args.analysis_tag or ""),
+                "fitness_schema_version": str(args.fitness_schema_version),
+                "policy": str(args.replicate_reference),
+                "replicate_index": int(ref_idx),
+                "summary": ref_summary,
+            },
+        )
         print(f"[pcpl-evolvo] replicates_summary={campaign_path}")
+        print(f"[pcpl-evolvo] replicate_reference={reference_path}")
         return
 
     if args.no_resume:
@@ -1150,6 +1258,7 @@ def main() -> None:
                             "fitness_schema_version": str(args.fitness_schema_version),
                             "mode": str(args.mode),
                             "profile": str(args.profile),
+                            "replicate_reference_policy": "single",
                             "strategy": str(combo.get("strategy", "base")),
                             "combo_label": combo_name,
                             "continuous": True,
