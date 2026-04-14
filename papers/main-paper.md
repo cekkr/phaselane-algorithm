@@ -883,6 +883,8 @@ A simulator was implemented cycle-by-cycle to validate correctness. The demo ver
 
 Repository: [cekkr/phaselane-algorithm@github.com](https://github.com/cekkr/phaselane-algorithm).
 
+For scientific interpretation, two distinctions are important. First, this section validates **protocol behavior** (schedule correctness, one-of-$x$, deterministic recomputation). Second, evolutionary scoring is a **model-dependent lens** on protocol quality: when score components or weights change, absolute scores should be compared only within the same scoring family, while invariant-level correctness claims remain comparable.
+
 ### 8.1 Sample token trace (x=4, seed=1337)
 For PDF export, the original wide table was replaced with an A4-friendly summary table and a sequence diagram (tokens truncated for readability; the matched provider’s recomputed token equals the device token by construction).
 
@@ -967,16 +969,24 @@ flowchart TB
 
 Full multi-configuration outputs (additional compound modes and seeds) are in `papers/pcpl-results.md`.
 
+### 8.5 Evolutionary interpretation (qualitative)
+Across long co-evolution campaigns, invariant metrics tend to saturate early (principle and permutation consistency), while most residual optimization pressure shifts toward synchronization robustness and long-horizon stability. In practical terms, this means many later generations explore structurally distinct genomes with small numerical score deltas, rather than producing frequent large jumps.
+
+The QFT/linear-rank/compare-$x$ terms are useful as protocol-alignment checks, but their contribution to search pressure depends on scenario variability. When these terms are nearly constant across candidate genomes, they operate primarily as compliance diagnostics rather than differentiating objectives. This is acceptable for validation, but future optimization studies should pair them with parameter sweeps that restore discriminatory power.
+
 ## 9. Discussion and limitations
 - Parameter choice matters; $P, Q, R, M$ must be prime and pairwise coprime.
 - The permutation schedule is device-only; leakage of the permutation key can reveal lane order, but not lane tokens.
 - The security of the scheme relies on the strength of $H(\cdot)$ and the secrecy of bouquets, not on the hardness of factoring revealed integers.
 - The public period $\mathrm{lcm}(P,Q,R,x)$ is visible (and QFT-recoverable), so period size should be chosen large enough for the deployment horizon.
 - For testing, primes and compound bases can be generated from a seeded stream to avoid arbitrary constants. [6][7]
+- Long-horizon synchronization remains the dominant practical weakness in current evolutionary studies: resynchronization can recover state, but projected drift-loss can still dominate the residual error budget.
+- Empirical score values are not absolute physical constants; they depend on the chosen objective set and weights. For this reason, cross-run comparisons should include explicit scoring-schema metadata.
+- Some auxiliary terms (for example QFT/linear-rank/compare-$x$) can become near-constant under fixed scenario families; when this happens, they validate constraints but provide limited evolutionary gradient.
 - This paper was developed and formatted with the help of OpenAI models.
 
 ## 10. Conclusion
-PCPL provides a deterministic, no-handshake token protocol with exact 1-of-$x$ matching and a device-only chaining mechanism. Combined with symmetric continuous tokenizer devices, it supports both provider validation and peer-to-peer isolation with dynamic, evolving secrets. The included simulation and trace demonstrate the protocol’s behavior cycle by cycle.
+PCPL provides a deterministic, no-handshake token protocol with exact 1-of-$x$ matching and a device-only chaining mechanism. Combined with symmetric continuous tokenizer devices, it supports both provider validation and peer-to-peer isolation with dynamic, evolving secrets. The simulation results support the core invariants and provide a clear optimization direction: future work should prioritize long-horizon synchronization robustness, while preserving the already stable correctness and security envelope.
 
 ## References
 1. [NIST FIPS 180-4 (Update 1), *Secure Hash Standard (SHS)*](https://csrc.nist.gov/pubs/fips/180-4/upd1/final)

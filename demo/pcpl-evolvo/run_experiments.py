@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import dataclasses
 import itertools
 import json
 import multiprocessing
 import os
 import random
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,6 +37,8 @@ except Exception:
     pass
 
 from pcpl_evolvo.experiment import ExperimentConfig, run_experiment
+
+DEFAULT_FITNESS_SCHEMA_VERSION = "pcpl-evolvo-2026-04-13-qft-linear-comparex-v1"
 
 
 def _safe_int(value: int, minimum: int = 1) -> int:
@@ -494,10 +498,67 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def _run_once(config: ExperimentConfig) -> Dict[str, Any]:
+def _normalize_json(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if dataclasses.is_dataclass(value):
+        return _normalize_json(dataclasses.asdict(value))
+    if isinstance(value, dict):
+        return {str(k): _normalize_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_json(item) for item in value]
+    return value
+
+
+def _git_revision() -> str:
+    try:
+        output = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(PROJECT_DIR.parent),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        return str(output) if output else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _run_metadata_payload(
+    *,
+    config: ExperimentConfig,
+    summary: Dict[str, Any],
+    meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(),
+        "git_revision": _git_revision(),
+        "experiment_config": _normalize_json(dataclasses.asdict(config)),
+        "summary": _normalize_json(summary),
+    }
+    if meta:
+        payload["launcher_meta"] = _normalize_json(meta)
+    return payload
+
+
+def _run_once(
+    config: ExperimentConfig,
+    *,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     summary = run_experiment(config)
-    summary_path = Path(summary["out_dir"]) / "summary.json"
+    out_dir = Path(summary["out_dir"])
+    summary_path = out_dir / "summary.json"
     _write_json(summary_path, summary)
+    run_meta_path = out_dir / "run-metadata.json"
+    _write_json(
+        run_meta_path,
+        _run_metadata_payload(
+            config=config,
+            summary=summary,
+            meta=meta,
+        ),
+    )
+    summary["run_metadata_path"] = str(run_meta_path)
     return summary
 
 
@@ -527,6 +588,8 @@ def _print_summary(summary: Dict[str, Any]) -> None:
         print(f"[pcpl-evolvo] index={summary['index_path']}")
     if "conclusion_path" in summary:
         print(f"[pcpl-evolvo] conclusions={summary['conclusion_path']}")
+    if "run_metadata_path" in summary:
+        print(f"[pcpl-evolvo] run_metadata={summary['run_metadata_path']}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -792,6 +855,30 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Long-horizon timing projection target (seconds).",
     )
+    parser.add_argument(
+        "--analysis-tag",
+        type=str,
+        default="",
+        help="Optional label stored in run metadata for later conclusion aggregation.",
+    )
+    parser.add_argument(
+        "--fitness-schema-version",
+        type=str,
+        default=DEFAULT_FITNESS_SCHEMA_VERSION,
+        help="Fitness/scoring schema label stored with each run for cross-era comparability.",
+    )
+    parser.add_argument(
+        "--replicates",
+        type=int,
+        default=1,
+        help="Number of independent replicated single-run executions (separate out dirs).",
+    )
+    parser.add_argument(
+        "--replicate-seed-step",
+        type=int,
+        default=7919,
+        help="Seed increment between replicates when --replicates > 1.",
+    )
     return parser.parse_args()
 
 
@@ -824,24 +911,111 @@ def main() -> None:
         out_dir = (PROJECT_DIR / "runs" / f"{stamp}-{args.profile}").resolve()
 
     if not args.continuous:
-        config = _build_experiment_config(
-            args,
-            out_dir=out_dir,
-            seed=args.seed,
-            population_size=args.population_size,
-            generations=args.generations,
-            initial_instructions=args.initial_instructions,
-            rounds=args.rounds,
-            attacker_population_size=args.attacker_population_size,
-            attacker_generations=args.attacker_generations,
-            elite_pool=args.elite_pool,
-            archive_limit=args.archive_limit,
-            resume=bool(args.resume),
-            workers=args.workers,
-        )
+        if int(args.replicates) < 1:
+            raise ValueError("--replicates must be >= 1")
 
-        summary = _run_once(config)
-        _print_summary(summary)
+        base_meta = {
+            "analysis_tag": str(args.analysis_tag or ""),
+            "fitness_schema_version": str(args.fitness_schema_version),
+            "mode": str(args.mode),
+            "profile": str(args.profile),
+            "resolved_config": resolved,
+            "continuous": False,
+            "launcher": "run_experiments.py",
+        }
+
+        if int(args.replicates) == 1:
+            config = _build_experiment_config(
+                args,
+                out_dir=out_dir,
+                seed=args.seed,
+                population_size=args.population_size,
+                generations=args.generations,
+                initial_instructions=args.initial_instructions,
+                rounds=args.rounds,
+                attacker_population_size=args.attacker_population_size,
+                attacker_generations=args.attacker_generations,
+                elite_pool=args.elite_pool,
+                archive_limit=args.archive_limit,
+                resume=bool(args.resume),
+                workers=args.workers,
+            )
+
+            summary = _run_once(config, meta=base_meta)
+            _print_summary(summary)
+            return
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        replicate_summaries: List[Dict[str, Any]] = []
+        base_seed = int(args.seed)
+        seed_step = int(args.replicate_seed_step)
+        print(
+            "[pcpl-evolvo] replicate campaign: n={n} base_seed={seed} step={step} root={root}".format(
+                n=int(args.replicates),
+                seed=base_seed,
+                step=seed_step,
+                root=out_dir,
+            )
+        )
+        for rep in range(int(args.replicates)):
+            rep_seed = base_seed + (rep * seed_step)
+            rep_out_dir = (out_dir / f"rep-{rep:03d}").resolve()
+            config = _build_experiment_config(
+                args,
+                out_dir=rep_out_dir,
+                seed=rep_seed,
+                population_size=args.population_size,
+                generations=args.generations,
+                initial_instructions=args.initial_instructions,
+                rounds=args.rounds,
+                attacker_population_size=args.attacker_population_size,
+                attacker_generations=args.attacker_generations,
+                elite_pool=args.elite_pool,
+                archive_limit=args.archive_limit,
+                resume=False,
+                workers=args.workers,
+            )
+            rep_meta = dict(base_meta)
+            rep_meta["replicate_index"] = rep
+            rep_meta["replicate_seed"] = rep_seed
+            rep_meta["replicate_count"] = int(args.replicates)
+            summary = _run_once(config, meta=rep_meta)
+            _print_summary(summary)
+            replicate_summaries.append(summary)
+
+        best_scores = [float(item["best_score"]) for item in replicate_summaries]
+        attacker_scores = [float(item["best_attacker_score"]) for item in replicate_summaries]
+        round_counts = [int(item.get("rounds_completed", 0)) for item in replicate_summaries]
+        campaign_summary: Dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(),
+            "analysis_tag": str(args.analysis_tag or ""),
+            "fitness_schema_version": str(args.fitness_schema_version),
+            "mode": str(args.mode),
+            "profile": str(args.profile),
+            "replicate_count": int(args.replicates),
+            "base_seed": base_seed,
+            "seed_step": seed_step,
+            "best_score_mean": sum(best_scores) / float(max(1, len(best_scores))),
+            "best_score_min": min(best_scores) if best_scores else None,
+            "best_score_max": max(best_scores) if best_scores else None,
+            "best_attacker_score_mean": sum(attacker_scores) / float(max(1, len(attacker_scores))),
+            "rounds_completed_mean": sum(round_counts) / float(max(1, len(round_counts))),
+            "runs": [
+                {
+                    "out_dir": item.get("out_dir"),
+                    "best_score": item.get("best_score"),
+                    "best_attacker_score": item.get("best_attacker_score"),
+                    "rounds_completed": item.get("rounds_completed"),
+                    "archive_path": item.get("archive_path"),
+                    "report_path": item.get("report_path"),
+                    "run_metadata_path": item.get("run_metadata_path"),
+                }
+                for item in replicate_summaries
+            ],
+        }
+        campaign_path = out_dir / "replicates-summary.json"
+        _write_json(campaign_path, campaign_summary)
+        print(f"[pcpl-evolvo] replicates_summary={campaign_path}")
         return
 
     if args.no_resume:
@@ -971,7 +1145,17 @@ def main() -> None:
                                 cache=int(combo.get("max_eval_cache_entries", args.max_eval_cache_entries)),
                             )
                         )
-                        future = combo_pool.submit(_run_once, config)
+                        combo_meta = {
+                            "analysis_tag": str(args.analysis_tag or ""),
+                            "fitness_schema_version": str(args.fitness_schema_version),
+                            "mode": str(args.mode),
+                            "profile": str(args.profile),
+                            "strategy": str(combo.get("strategy", "base")),
+                            "combo_label": combo_name,
+                            "continuous": True,
+                            "launcher": "run_experiments.py",
+                        }
+                        future = combo_pool.submit(_run_once, config, meta=combo_meta)
                         pending[future] = {
                             "combo": combo,
                             "combo_name": combo_name,
@@ -1038,6 +1222,9 @@ def main() -> None:
                         state_payload = {
                             "continuous": True,
                             "profile": args.profile,
+                            "mode": str(args.mode),
+                            "analysis_tag": str(args.analysis_tag or ""),
+                            "fitness_schema_version": str(args.fitness_schema_version),
                             "iterations_completed": total_iterations + 1,
                             "sweeps_completed": total_sweeps,
                             "grid_size": len(grid),
@@ -1050,6 +1237,8 @@ def main() -> None:
                             leaderboard_path,
                             {
                                 "updated_at": datetime.now().isoformat(),
+                                "analysis_tag": str(args.analysis_tag or ""),
+                                "fitness_schema_version": str(args.fitness_schema_version),
                                 "leaders": top,
                             },
                         )
