@@ -2139,12 +2139,20 @@ def _adaptive_attacker_config_from_defender_log(
 def _build_supervised_guide_if_available(
     config: ExperimentConfig,
     plan: ResourcePlan,
+    *,
+    role: str,
 ):
-    if not config.use_supervised_guide or not plan.torch_available:
+    role_label = str(role).strip().lower() or "role"
+    if not config.use_supervised_guide:
+        print(f"[pcpl-evolvo] {role_label} supervised guide disabled by config")
+        return None
+    if not plan.torch_available:
+        print(f"[pcpl-evolvo] {role_label} supervised guide unavailable: torch not available")
         return None
     try:
         from evolvo.supervised import GFSLSupervisedGuide
-    except Exception:
+    except Exception as exc:
+        print(f"[pcpl-evolvo] {role_label} supervised guide import failed: {exc}")
         return None
 
     if config.preferred_device.lower() != "auto":
@@ -2176,9 +2184,10 @@ def _build_supervised_guide_if_available(
     batch_size = max(16, min(96, int(round(float(min_buffer) * 0.75))))
     max_observations = max(16, min(64, int(round(float(config.population_size) * 0.60))))
     buffer_size = max(512, int(round(float(config.population_size) * 10.0)))
-    try:
+
+    def _create_guide(device_name: str):
         return GFSLSupervisedGuide(
-            device=device,
+            device=device_name,
             hidden_layers=hidden_layers,
             buffer_size=buffer_size,
             min_buffer=min_buffer,
@@ -2188,8 +2197,107 @@ def _build_supervised_guide_if_available(
             max_observations=max_observations,
             capacity_auto_tune=bool(config.supervised_capacity_auto_tune),
         )
-    except Exception:
-        return None
+
+    creation_error: Optional[str] = None
+    guide = None
+    active_device = str(device)
+    try:
+        guide = _create_guide(active_device)
+    except Exception as exc:
+        creation_error = str(exc)
+        if active_device != "cpu":
+            print(
+                "[pcpl-evolvo] {role} supervised guide failed on `{device}` ({error}); retrying on cpu".format(
+                    role=role_label,
+                    device=active_device,
+                    error=creation_error,
+                )
+            )
+            active_device = "cpu"
+            try:
+                guide = _create_guide(active_device)
+                creation_error = None
+            except Exception as cpu_exc:
+                creation_error = str(cpu_exc)
+                guide = None
+        if guide is None:
+            print(
+                "[pcpl-evolvo] {role} supervised guide disabled: {error}".format(
+                    role=role_label,
+                    error=creation_error or "unknown error",
+                )
+            )
+            return None
+
+    runtime = {}
+    if hasattr(guide, "runtime_summary"):
+        try:
+            runtime = guide.runtime_summary()
+        except Exception:
+            runtime = {}
+    probe_payload = runtime.get("probe", {}) if isinstance(runtime, dict) else {}
+    if not isinstance(probe_payload, dict):
+        probe_payload = {}
+    probe_ok = bool(probe_payload.get("probe_ok", False))
+    requested_device = str(runtime.get("requested_device", device)) if isinstance(runtime, dict) else str(device)
+    resolved_backend = str(runtime.get("resolved_backend", "unknown")) if isinstance(runtime, dict) else "unknown"
+    resolved_device = str(runtime.get("resolved_device", active_device)) if isinstance(runtime, dict) else str(active_device)
+    model_device = str(runtime.get("model_device", resolved_device)) if isinstance(runtime, dict) else str(resolved_device)
+    print(
+        "[pcpl-evolvo] {role} supervised guide enabled mode={mode} request={req} backend={backend} resolved={resolved} model={model} probe={probe}".format(
+            role=role_label,
+            mode=(
+                "end-round-only"
+                if bool(config.supervised_end_round_only)
+                else "per-generation"
+            ),
+            req=requested_device,
+            backend=resolved_backend,
+            resolved=resolved_device,
+            model=model_device,
+            probe=("ok" if probe_ok else "failed"),
+        )
+    )
+    if not probe_ok and probe_payload.get("error"):
+        print(
+            "[pcpl-evolvo] {role} supervised probe error: {error}".format(
+                role=role_label,
+                error=str(probe_payload.get("error", "")),
+            )
+        )
+    return guide
+
+
+def _supervised_guide_state(
+    guide: Any,
+    *,
+    role: str,
+    config: ExperimentConfig,
+    plan: ResourcePlan,
+) -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "role": str(role),
+        "enabled": bool(guide is not None),
+        "mode": (
+            "end-round-only"
+            if bool(config.supervised_end_round_only)
+            else "per-generation"
+        ),
+        "requested_device": str(config.preferred_device),
+        "resource_gpu_backend": str(plan.gpu_backend),
+        "resource_gpu_available": bool(plan.gpu_available),
+        "resource_torch_available": bool(plan.torch_available),
+    }
+    if guide is None:
+        return state
+    if hasattr(guide, "runtime_summary"):
+        try:
+            runtime = guide.runtime_summary()
+            if isinstance(runtime, dict):
+                state["runtime"] = runtime
+        except Exception:
+            pass
+    return state
 
 
 def _create_shared_executor(plan: ResourcePlan) -> Optional[concurrent.futures.Executor]:
@@ -3794,8 +3902,12 @@ def _run_defender_round(
     archive: Dict[str, Any],
     attacker: Optional[GFSLGenome],
 ) -> Tuple[GFSLEvolver, List[Dict[str, Any]]]:
-    guide = _build_supervised_guide_if_available(config, resource_plan)
-    evolver_guide = None if bool(config.supervised_end_round_only) else guide
+    guide = _build_supervised_guide_if_available(
+        config,
+        resource_plan,
+        role="defender",
+    )
+    evolver_guide = guide
     defender_instruction_cap = max(
         64,
         min(
@@ -3813,6 +3925,7 @@ def _run_defender_round(
     evolver = GFSLEvolver(
         population_size=config.population_size,
         supervised_guide=evolver_guide,
+        guide_observe_each_generation=not bool(config.supervised_end_round_only),
         parent_pool_ratio=config.parent_pool_ratio,
         stagnation_patience=config.stagnation_patience,
         mutation_floor=config.mutation_floor,
@@ -3837,6 +3950,11 @@ def _run_defender_round(
     for genome in evolver.population:
         evolver._enforce_complexity_budget(genome)
         _invalidate_genome_caches(genome)
+    if guide is not None and bool(config.supervised_end_round_only):
+        try:
+            guide.observe_population(evolver.population)
+        except Exception as exc:
+            print(f"[pcpl-evolvo] defender supervised warmup failed: {exc}")
 
     generation_log: List[Dict[str, Any]] = []
     archive_signatures = {
@@ -4626,11 +4744,6 @@ def _run_defender_round(
         batch_evaluator=batch_eval,
         should_stop=should_stop,
     )
-    if guide is not None and bool(config.supervised_end_round_only):
-        try:
-            guide.observe_population(evolver.population)
-        except Exception:
-            pass
     stop_reason = getattr(evolver, "_early_stop_reason", None)
     stop_generation = getattr(evolver, "_early_stop_generation", None)
     if generation_log:
@@ -4639,6 +4752,12 @@ def _run_defender_round(
     controller_state = controller.to_dict()
     controller_state["torch_tuner"] = torch_tuner.to_dict()
     evolver._predictive_controller_state = controller_state  # type: ignore[attr-defined]
+    evolver._supervised_guide_state = _supervised_guide_state(  # type: ignore[attr-defined]
+        guide,
+        role="defender",
+        config=config,
+        plan=resource_plan,
+    )
     return evolver, generation_log
 
 
@@ -4651,8 +4770,12 @@ def _run_attacker_round(
     archive: Dict[str, Any],
     defender: GFSLGenome,
 ) -> Tuple[GFSLEvolver, List[Dict[str, Any]]]:
-    guide = _build_supervised_guide_if_available(config, resource_plan)
-    evolver_guide = None if bool(config.supervised_end_round_only) else guide
+    guide = _build_supervised_guide_if_available(
+        config,
+        resource_plan,
+        role="attacker",
+    )
+    evolver_guide = guide
     attacker_seed_budget = max(4, config.initial_instructions // 2)
     attacker_instruction_cap = max(
         40,
@@ -4671,6 +4794,7 @@ def _run_attacker_round(
     evolver = GFSLEvolver(
         population_size=config.attacker_population_size,
         supervised_guide=evolver_guide,
+        guide_observe_each_generation=not bool(config.supervised_end_round_only),
         parent_pool_ratio=config.parent_pool_ratio,
         stagnation_patience=config.stagnation_patience,
         mutation_floor=config.mutation_floor,
@@ -4691,6 +4815,11 @@ def _run_attacker_round(
     for attacker_genome in evolver.population:
         evolver._enforce_complexity_budget(attacker_genome)
         _invalidate_genome_caches(attacker_genome)
+    if guide is not None and bool(config.supervised_end_round_only):
+        try:
+            guide.observe_population(evolver.population)
+        except Exception as exc:
+            print(f"[pcpl-evolvo] attacker supervised warmup failed: {exc}")
 
     generation_log: List[Dict[str, Any]] = []
     archive_signatures = {
@@ -5434,11 +5563,6 @@ def _run_attacker_round(
         batch_evaluator=batch_eval,
         should_stop=should_stop,
     )
-    if guide is not None and bool(config.supervised_end_round_only):
-        try:
-            guide.observe_population(evolver.population)
-        except Exception:
-            pass
     stop_reason = getattr(evolver, "_early_stop_reason", None)
     stop_generation = getattr(evolver, "_early_stop_generation", None)
     if generation_log:
@@ -5447,6 +5571,12 @@ def _run_attacker_round(
     controller_state = controller.to_dict()
     controller_state["torch_tuner"] = torch_tuner.to_dict()
     evolver._predictive_controller_state = controller_state  # type: ignore[attr-defined]
+    evolver._supervised_guide_state = _supervised_guide_state(  # type: ignore[attr-defined]
+        guide,
+        role="attacker",
+        config=config,
+        plan=resource_plan,
+    )
     return evolver, generation_log
 
 
@@ -5566,11 +5696,21 @@ def run_continuous_experiment(
             attacker_profile = getattr(attacker_evolver, "_predictive_controller_state", {})
             if not isinstance(attacker_profile, dict):
                 attacker_profile = {}
+            defender_supervised = getattr(defender_evolver, "_supervised_guide_state", {})
+            if not isinstance(defender_supervised, dict):
+                defender_supervised = {}
+            attacker_supervised = getattr(attacker_evolver, "_supervised_guide_state", {})
+            if not isinstance(attacker_supervised, dict):
+                attacker_supervised = {}
             predictive_profile = archive.setdefault("predictive_profile", {})
             if defender_profile:
                 predictive_profile["defender"] = defender_profile
             if attacker_profile:
                 predictive_profile["attacker"] = attacker_profile
+            if defender_supervised:
+                predictive_profile["defender_supervised"] = defender_supervised
+            if attacker_supervised:
+                predictive_profile["attacker_supervised"] = attacker_supervised
             selection_key_variants = max(
                 int(KEY_VARIANT_FLOOR),
                 int(defender_profile.get("key_variant_count", config.key_variant_count)),
@@ -5797,6 +5937,8 @@ def run_continuous_experiment(
                 "predictive_profile": {
                     "defender": defender_profile,
                     "attacker": attacker_profile,
+                    "defender_supervised": defender_supervised,
+                    "attacker_supervised": attacker_supervised,
                     "selection_key_variants": selection_key_variants,
                 },
                 "adaptive_attacker_budget": attacker_budget_meta,
@@ -5878,6 +6020,12 @@ def run_continuous_experiment(
         attacker_profile = predictive_profile.get("attacker", {})
         if not isinstance(attacker_profile, dict):
             attacker_profile = {}
+        defender_supervised = predictive_profile.get("defender_supervised", {})
+        if not isinstance(defender_supervised, dict):
+            defender_supervised = {}
+        attacker_supervised = predictive_profile.get("attacker_supervised", {})
+        if not isinstance(attacker_supervised, dict):
+            attacker_supervised = {}
 
         final_summary = {
             "config": {
@@ -5984,6 +6132,45 @@ def run_continuous_experiment(
                 capacity=("enabled" if bool(config.supervised_capacity_auto_tune) else "disabled"),
             )
         )
+        if defender_supervised or attacker_supervised:
+            d_runtime = defender_supervised.get("runtime", {})
+            a_runtime = attacker_supervised.get("runtime", {})
+            if not isinstance(d_runtime, dict):
+                d_runtime = {}
+            if not isinstance(a_runtime, dict):
+                a_runtime = {}
+            d_probe = d_runtime.get("probe", {})
+            a_probe = a_runtime.get("probe", {})
+            if not isinstance(d_probe, dict):
+                d_probe = {}
+            if not isinstance(a_probe, dict):
+                a_probe = {}
+            report_lines.append(
+                "- supervised runtime: defender(enabled={de}, backend={db}, device={dd}, model={dm}, probe={dp}, train_calls={dt}, predict_calls={dpc}) attacker(enabled={ae}, backend={ab}, device={ad}, model={am}, probe={ap}, train_calls={at}, predict_calls={apc})".format(
+                    de=bool(defender_supervised.get("enabled", False)),
+                    db=str(d_runtime.get("resolved_backend", "n/a")),
+                    dd=str(d_runtime.get("resolved_device", "n/a")),
+                    dm=str(d_runtime.get("model_device", "n/a")),
+                    dp=(
+                        "ok"
+                        if bool(d_probe.get("probe_ok", False))
+                        else ("failed" if d_probe else "n/a")
+                    ),
+                    dt=int(d_runtime.get("train_calls", 0)),
+                    dpc=int(d_runtime.get("predict_calls", 0)),
+                    ae=bool(attacker_supervised.get("enabled", False)),
+                    ab=str(a_runtime.get("resolved_backend", "n/a")),
+                    ad=str(a_runtime.get("resolved_device", "n/a")),
+                    am=str(a_runtime.get("model_device", "n/a")),
+                    ap=(
+                        "ok"
+                        if bool(a_probe.get("probe_ok", False))
+                        else ("failed" if a_probe else "n/a")
+                    ),
+                    at=int(a_runtime.get("train_calls", 0)),
+                    apc=int(a_runtime.get("predict_calls", 0)),
+                )
+            )
         if bool(config.statistical_predictive):
             report_lines.append(
                 "- tuned defender: quick={quick:.2f} mid={mid:.2f} keep={keep_q:.2f}/{keep_m:.2f} key_variants={key_vars}".format(

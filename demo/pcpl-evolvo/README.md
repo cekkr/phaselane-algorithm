@@ -81,6 +81,27 @@ python3 demo/pcpl-evolvo/run_experiments.py --mode dynamic --print-effective-con
 python3 demo/pcpl-evolvo/run_experiments.py --profile fast --mode dynamic --rounds 1
 ```
 
+### Verify torch accelerator usage (ROCm/CUDA/MPS)
+
+```bash
+python3 demo/pcpl-evolvo/run_experiments.py \
+  --profile fast \
+  --mode dynamic \
+  --rounds 1 \
+  --device rocm \
+  --supervised-end-round-only
+```
+
+Look for logs like:
+
+- `supervised guide enabled ... backend=rocm resolved=cuda ... probe=ok`
+
+and the `report.md` line:
+
+- `supervised runtime: defender(... device=..., probe=ok, train_calls=..., predict_calls=...)`
+
+If probe is `failed`, the run will print the probe error and fallback behavior.
+
 ### Continuous/resumable rounds
 
 ```bash
@@ -150,6 +171,7 @@ PowerShell:
 - `--no-resume` (start fresh even if archive exists)
 - `--parallel-backend {auto,process,thread,off}`, `--workers` (`0` = all CPUs)
 - `--no-supervised-guide`
+- `--supervised-end-round-only`, `--no-supervised-end-round-only`
 - `--device {auto,cpu,cuda,rocm,mps}` (for optional supervised guide acceleration)
 - `--parent-pool-ratio`, `--stagnation-patience`, `--mutation-floor`, `--mutation-ceiling`, `--mutation-step`
 - `--quick-cycle-fraction`, `--mid-cycle-fraction`, `--quick-keep-ratio`, `--mid-keep-ratio` (initial seeds, auto-tuned in real time)
@@ -165,6 +187,7 @@ Notes:
 - The adaptive parent-pool + mutation schedule reduces random dispersivity and focuses search around top genomes while preserving exploration.
 - Staged statistical mode (default) now applies dynamic quick-stage budgeting under pressure (see `qskip=` in logs), so only the most novel/promising genomes proceed when populations are large.
 - Stage fractions/keep ratios/key-variants are auto-tuned from runtime statistics (probe false-negative rate, novelty rate, keep-throughput) and persisted in `archive.json` for following rounds.
+- In `--supervised-end-round-only` mode, the guide is now warmed once at round start and reused for proposal (no per-generation retraining).
 - Duplicate genomes are collapsed before stage execution and cached by fast evaluation signature + scenario fingerprint + opponent signature, so repeated candidates are not re-executed.
 - Process evaluation dispatch uses chunked batch workers to reduce per-genome IPC/pickling overhead in `process` backend.
 - For `--profile full`, startup tuning is automatically leaner and generation-time budgeted (target ~3s) without extra flags.
