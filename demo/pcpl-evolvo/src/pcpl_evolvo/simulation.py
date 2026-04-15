@@ -275,6 +275,8 @@ class ScenarioMetrics:
     compare_x_score: float = 0.0
     compare_x_period_ratio: float = 0.0
     compare_x_chain_ratio: float = 0.0
+    phase_error_control_score: float = 0.0
+    control_flow_score: float = 0.0
 
     def to_dict(self) -> Dict[str, float]:
         return asdict(self)
@@ -1444,12 +1446,37 @@ def evaluate_scenario(
         + 0.20 * permutation_valid_rate
         + 0.20 * attack_reject_rate
     )
+
+    phase_error_level = clamp(
+        (0.55 * sync_loss_rate) + (0.45 * projected_sync_loss_rate),
+        0.0,
+        1.0,
+    )
+    phase_recovery_score = clamp(
+        (0.58 * resync_success_rate) + (0.42 * twin_sync_rate),
+        0.0,
+        1.0,
+    )
+    phase_oscillation = clamp(
+        controller_fail_rate + abs(projected_sync_loss_rate - sync_loss_rate),
+        0.0,
+        1.0,
+    )
+    phase_error_control_score = clamp(
+        (0.46 * (1.0 - phase_error_level))
+        + (0.34 * phase_recovery_score)
+        + (0.20 * (1.0 - phase_oscillation)),
+        0.0,
+        1.0,
+    )
+
     sync_score = (
-        0.22 * twin_sync_rate
+        0.16 * twin_sync_rate
         + 0.08 * timing_reject_rate
-        + 0.22 * (1.0 - sync_loss_rate)
-        + 0.12 * resync_success_rate
-        + 0.36 * horizon_sync_score
+        + 0.16 * (1.0 - sync_loss_rate)
+        + 0.16 * resync_success_rate
+        + 0.26 * horizon_sync_score
+        + 0.18 * phase_error_control_score
     )
     security_score = (
         0.22 * (1.0 - clamp(cross_lane_collision_rate, 0.0, 1.0))
@@ -1470,6 +1497,48 @@ def evaluate_scenario(
 
     stability_score = 1.0 - clamp(
         controller_fail_rate + (0.20 * sync_loss_rate) + (0.30 * projected_sync_loss_rate),
+        0.0,
+        1.0,
+    )
+
+    effective_indices: List[int] = []
+    if genome is not None:
+        try:
+            effective_indices = list(genome.extract_effective_algorithm())
+        except Exception:
+            effective_indices = []
+    effective_size = len(effective_indices)
+    compare_ops = {
+        int(Operation.GT),
+        int(Operation.LT),
+        int(Operation.EQ),
+        int(Operation.GTE),
+        int(Operation.LTE),
+        int(Operation.NEQ),
+    }
+    branch_ops = {int(Operation.IF), int(Operation.WHILE)}
+    compare_count = 0
+    branch_count = 0
+    for idx in effective_indices:
+        if genome is None or idx >= len(genome.instructions):
+            continue
+        op_code = int(genome.instructions[idx].operation)
+        if op_code in compare_ops:
+            compare_count += 1
+        if op_code in branch_ops:
+            branch_count += 1
+    control_density = (
+        (float(branch_count) + (0.60 * float(compare_count))) / float(max(1, effective_size))
+        if effective_size > 0
+        else 0.0
+    )
+    target_density = 0.18
+    control_density_score = 1.0 - min(
+        1.0,
+        abs(control_density - target_density) / float(max(0.02, target_density)),
+    )
+    control_flow_score = clamp(
+        (0.65 * control_density_score) + (0.35 * phase_error_control_score),
         0.0,
         1.0,
     )
@@ -1521,15 +1590,17 @@ def evaluate_scenario(
     )
 
     total_score = (
-        0.22 * principle_score
-        + 0.25 * sync_score
-        + 0.20 * security_score
-        + 0.10 * cost_score
-        + 0.03 * runtime_score
-        + 0.10 * stability_score
+        0.17 * principle_score
+        + 0.27 * sync_score
+        + 0.18 * security_score
+        + 0.08 * cost_score
+        + 0.02 * runtime_score
+        + 0.12 * stability_score
         + 0.04 * qft_score
         + 0.03 * linear_rank_score
         + 0.03 * compare_x_score
+        + 0.04 * phase_error_control_score
+        + 0.02 * control_flow_score
     )
 
     if one_of_x_rate < 1.0:
@@ -1537,8 +1608,12 @@ def evaluate_scenario(
     if block_once_rate < 1.0:
         total_score -= 0.35 * (1.0 - block_once_rate)
 
+    if projected_sync_loss_rate > 0.72:
+        total_score -= min(0.25, 0.45 * (projected_sync_loss_rate - 0.72))
+    if horizon_sync_score < 0.30:
+        total_score -= min(0.18, 0.40 * (0.30 - horizon_sync_score))
+
     # Penalize degenerate defender circuits.
-    effective_size = len(genome.extract_effective_algorithm()) if genome is not None else 0
     if genome is not None and effective_size == 0:
         total_score -= 0.40
     elif genome is not None and effective_size < 3:
@@ -1584,6 +1659,8 @@ def evaluate_scenario(
         device_compound_ratio=device_compound_ratio,
         provider_compound_ratio=provider_compound_ratio,
         elapsed_seconds=elapsed,
+        phase_error_control_score=phase_error_control_score,
+        control_flow_score=control_flow_score,
         qft_score=qft_score,
         qft_period_bits=float(qft_period_bits),
         qft_period_ratio=qft_period_ratio,

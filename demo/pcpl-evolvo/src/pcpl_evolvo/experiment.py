@@ -81,6 +81,14 @@ class ExperimentConfig:
     max_test_time_seconds: float = 10.0
     target_generation_seconds: float = 2.4
     max_eval_cache_entries: int = 25000
+    sync_loss_gate_percentile: float = 0.60
+    sync_loss_gate_penalty: float = 0.10
+    sync_loss_gate_flat_boost: float = 0.06
+    anti_neutrality_window: int = 10
+    anti_neutrality_penalty: float = 0.030
+    anti_neutrality_bonus: float = 0.015
+    attacker_panel_size: int = 3
+    attacker_panel_penalty: float = 0.16
 
 
 @dataclass(frozen=True)
@@ -123,6 +131,9 @@ TARGET_CALIBRATION_MIN_OBSERVATIONS = 3
 TARGET_CALIBRATION_MAX_OBSERVATIONS = 6
 TARGET_CALIBRATION_MEDIAN_SCALE = 0.85
 TARGET_CALIBRATION_MAX_MULTIPLIER = 16.0
+SYNC_LOSS_GATE_MIN_PERCENTILE = 0.30
+SYNC_LOSS_GATE_MAX_PERCENTILE = 0.90
+ANTI_NEUTRALITY_MIN_WINDOW = 4
 
 
 def _complexity_limits(role: str) -> Tuple[int, int]:
@@ -1586,6 +1597,228 @@ def _mark_duplicate_genomes(
         genome.fitness = _predictive_cut_score(float(genome.fitness or -float("inf")), stage, penalty + 0.015)
 
 
+def _quantile(values: Sequence[float], q: float) -> float:
+    finite = sorted(float(value) for value in values if math.isfinite(float(value)))
+    if not finite:
+        return 0.0
+    if len(finite) == 1:
+        return float(finite[0])
+    qq = clamp(float(q), 0.0, 1.0)
+    pos = qq * float(len(finite) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return float(finite[lo])
+    blend = pos - float(lo)
+    return float((1.0 - blend) * float(finite[lo]) + blend * float(finite[hi]))
+
+
+def _recent_flatness_ratio(
+    generation_log: Sequence[Dict[str, Any]],
+    *,
+    score_key: str,
+    window: int,
+) -> float:
+    if not generation_log:
+        return 0.0
+    size = max(3, int(window))
+    recent = list(generation_log[-size:])
+    scores = [
+        float(row.get(score_key, -float("inf")))
+        for row in recent
+        if math.isfinite(float(row.get(score_key, -float("inf"))))
+    ]
+    if len(scores) < 2:
+        return 0.0
+    gain = max(scores) - min(scores)
+    levels = len({round(score, 8) for score in scores})
+    level_ratio = float(levels) / float(max(1, len(scores)))
+    gain_component = clamp(1.0 - (gain / 0.00090), 0.0, 1.0)
+    diversity_component = clamp(1.0 - level_ratio, 0.0, 1.0)
+    return clamp((0.60 * gain_component) + (0.40 * diversity_component), 0.0, 1.0)
+
+
+def _mean_metric_from_rows(
+    metrics_rows: Sequence[Dict[str, Any]],
+    key: str,
+    default: float = 0.0,
+) -> float:
+    if not metrics_rows:
+        return float(default)
+    values = [float(row.get(key, default)) for row in metrics_rows]
+    if not values:
+        return float(default)
+    return float(sum(values) / float(max(1, len(values))))
+
+
+def _defender_row_fingerprint(row: Dict[str, Any]) -> Optional[Tuple[float, ...]]:
+    required = (
+        "sync_score",
+        "horizon_sync",
+        "projected_sync_loss",
+        "attacker_adv",
+        "stability_score",
+    )
+    if any(key not in row for key in required):
+        return None
+    return (
+        round(float(row.get("sync_score", 0.0)), 3),
+        round(float(row.get("horizon_sync", 0.0)), 3),
+        round(float(row.get("projected_sync_loss", 0.0)), 3),
+        round(float(row.get("attacker_adv", 0.0)), 3),
+        round(float(row.get("stability_score", 0.0)), 3),
+    )
+
+
+def _defender_metrics_fingerprint(metrics_rows: Sequence[Dict[str, Any]]) -> Optional[Tuple[float, ...]]:
+    if not metrics_rows:
+        return None
+    return (
+        round(_mean_metric_from_rows(metrics_rows, "sync_score"), 3),
+        round(_mean_metric_from_rows(metrics_rows, "horizon_sync_score"), 3),
+        round(_mean_metric_from_rows(metrics_rows, "projected_sync_loss_rate"), 3),
+        round(_mean_metric_from_rows(metrics_rows, "attacker_advantage_score"), 3),
+        round(_mean_metric_from_rows(metrics_rows, "stability_score"), 3),
+    )
+
+
+def _apply_defender_sync_loss_gate(
+    *,
+    full_pending: Sequence[Tuple[int, GFSLGenome]],
+    generation_log: Sequence[Dict[str, Any]],
+    config: ExperimentConfig,
+) -> Dict[str, float]:
+    if not full_pending:
+        return {
+            "sync_gate_penalized": 0.0,
+            "sync_gate_threshold": 0.0,
+            "sync_gate_percentile": 0.0,
+            "sync_gate_flatness": 0.0,
+        }
+
+    losses: List[float] = []
+    by_genome: Dict[int, float] = {}
+    for _, genome in full_pending:
+        metrics = getattr(genome, "_pcpl_metrics", [])
+        rows = _metrics_rows(metrics)
+        if not rows:
+            continue
+        loss = _mean_metric_from_rows(rows, "projected_sync_loss_rate", default=1.0)
+        by_genome[id(genome)] = float(loss)
+        losses.append(float(loss))
+
+    if not losses:
+        return {
+            "sync_gate_penalized": 0.0,
+            "sync_gate_threshold": 0.0,
+            "sync_gate_percentile": 0.0,
+            "sync_gate_flatness": 0.0,
+        }
+
+    flatness = _recent_flatness_ratio(
+        generation_log,
+        score_key="best_score",
+        window=max(6, int(config.anti_neutrality_window)),
+    )
+    base_percentile = clamp(
+        float(config.sync_loss_gate_percentile),
+        float(SYNC_LOSS_GATE_MIN_PERCENTILE),
+        float(SYNC_LOSS_GATE_MAX_PERCENTILE),
+    )
+    dynamic_percentile = clamp(
+        base_percentile - (0.18 * flatness),
+        float(SYNC_LOSS_GATE_MIN_PERCENTILE),
+        float(SYNC_LOSS_GATE_MAX_PERCENTILE),
+    )
+    threshold = _quantile(losses, dynamic_percentile)
+    base_penalty = max(0.0, float(config.sync_loss_gate_penalty))
+    flat_boost = max(0.0, float(config.sync_loss_gate_flat_boost))
+
+    penalized = 0
+    for _, genome in full_pending:
+        loss = by_genome.get(id(genome))
+        if loss is None:
+            continue
+        if loss <= (threshold + 1e-9):
+            continue
+        overflow = max(0.0, float(loss - threshold))
+        penalty = base_penalty + (flat_boost * flatness) + min(0.20, 0.35 * overflow)
+        genome.fitness = float(genome.fitness or -float("inf")) - float(penalty)
+        penalized += 1
+
+    return {
+        "sync_gate_penalized": float(penalized),
+        "sync_gate_threshold": float(threshold),
+        "sync_gate_percentile": float(dynamic_percentile),
+        "sync_gate_flatness": float(flatness),
+    }
+
+
+def _apply_defender_anti_neutrality(
+    *,
+    full_pending: Sequence[Tuple[int, GFSLGenome]],
+    generation_log: Sequence[Dict[str, Any]],
+    config: ExperimentConfig,
+) -> Dict[str, float]:
+    if not full_pending:
+        return {
+            "neutrality_penalized": 0.0,
+            "neutrality_rewarded": 0.0,
+        }
+
+    window = max(int(ANTI_NEUTRALITY_MIN_WINDOW), int(config.anti_neutrality_window))
+    recent = list(generation_log[-window:])
+    recent_fingerprints = {
+        fp
+        for row in recent
+        for fp in [_defender_row_fingerprint(row)]
+        if fp is not None
+    }
+    recent_sync = [float(row.get("sync_score", 0.0)) for row in recent if "sync_score" in row]
+    recent_horizon = [float(row.get("horizon_sync", 0.0)) for row in recent if "horizon_sync" in row]
+    recent_loss = [float(row.get("projected_sync_loss", 1.0)) for row in recent if "projected_sync_loss" in row]
+    recent_attack = [float(row.get("attacker_adv", 1.0)) for row in recent if "attacker_adv" in row]
+    baseline_sync = float(sum(recent_sync) / float(max(1, len(recent_sync))))
+    baseline_horizon = float(sum(recent_horizon) / float(max(1, len(recent_horizon))))
+    baseline_loss = float(sum(recent_loss) / float(max(1, len(recent_loss))))
+    baseline_attack = float(sum(recent_attack) / float(max(1, len(recent_attack))))
+
+    penalty = max(0.0, float(config.anti_neutrality_penalty))
+    bonus = max(0.0, float(config.anti_neutrality_bonus))
+    penalized = 0
+    rewarded = 0
+    for _, genome in full_pending:
+        metrics = getattr(genome, "_pcpl_metrics", [])
+        rows = _metrics_rows(metrics)
+        if not rows:
+            continue
+        fingerprint = _defender_metrics_fingerprint(rows)
+        score = float(genome.fitness or -float("inf"))
+        if fingerprint is not None and fingerprint in recent_fingerprints:
+            genome.fitness = score - penalty
+            penalized += 1
+            continue
+
+        sync_score = _mean_metric_from_rows(rows, "sync_score", default=0.0)
+        horizon_score = _mean_metric_from_rows(rows, "horizon_sync_score", default=0.0)
+        projected_loss = _mean_metric_from_rows(rows, "projected_sync_loss_rate", default=1.0)
+        attacker_adv = _mean_metric_from_rows(rows, "attacker_advantage_score", default=1.0)
+        moved = (
+            (sync_score > (baseline_sync + 0.003))
+            or (horizon_score > (baseline_horizon + 0.003))
+            or (projected_loss < (baseline_loss - 0.004))
+            or (attacker_adv < (baseline_attack - 0.003))
+        )
+        if moved and bonus > 0.0:
+            genome.fitness = score + bonus
+            rewarded += 1
+
+    return {
+        "neutrality_penalized": float(penalized),
+        "neutrality_rewarded": float(rewarded),
+    }
+
+
 @dataclass
 class RuntimeTargetCalibrator:
     """Auto-calibrate target generation seconds from first local batches."""
@@ -2574,9 +2807,9 @@ def _metrics_rows(metrics: Sequence[Any]) -> List[Dict[str, Any]]:
 def _scenario_table(metrics: Sequence[Any]) -> str:
     lines = []
     lines.append(
-        "| scenario | total | principle | sync | stability | security | qft | linear-rank | compare-x | cost | op-cost | attacker-adv |"
+        "| scenario | total | principle | sync | stability | phase-error | ctrl-flow | security | qft | linear-rank | compare-x | cost | op-cost | attacker-adv |"
     )
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for metric in metrics:
         if isinstance(metric, dict):
             scenario = str(metric.get("scenario", "n/a"))
@@ -2584,6 +2817,8 @@ def _scenario_table(metrics: Sequence[Any]) -> str:
             principle = float(metric.get("principle_score", 0.0))
             sync = float(metric.get("sync_score", 0.0))
             stability = float(metric.get("stability_score", 0.0))
+            phase_error = float(metric.get("phase_error_control_score", 0.0))
+            control_flow = float(metric.get("control_flow_score", 0.0))
             security = float(metric.get("security_score", 0.0))
             qft = float(metric.get("qft_score", 0.0))
             linear_rank = float(metric.get("linear_rank_score", 0.0))
@@ -2597,6 +2832,8 @@ def _scenario_table(metrics: Sequence[Any]) -> str:
             principle = float(getattr(metric, "principle_score", 0.0))
             sync = float(getattr(metric, "sync_score", 0.0))
             stability = float(getattr(metric, "stability_score", 0.0))
+            phase_error = float(getattr(metric, "phase_error_control_score", 0.0))
+            control_flow = float(getattr(metric, "control_flow_score", 0.0))
             security = float(getattr(metric, "security_score", 0.0))
             qft = float(getattr(metric, "qft_score", 0.0))
             linear_rank = float(getattr(metric, "linear_rank_score", 0.0))
@@ -2605,12 +2842,14 @@ def _scenario_table(metrics: Sequence[Any]) -> str:
             op_cost = float(getattr(metric, "operation_cost_score", 0.0))
             attack_adv = float(getattr(metric, "attacker_advantage_score", 0.0))
         lines.append(
-            "| {name} | {total:.4f} | {principle:.4f} | {sync:.4f} | {stability:.4f} | {security:.4f} | {qft:.4f} | {linear_rank:.4f} | {compare_x:.4f} | {cost:.4f} | {op_cost:.4f} | {attack_adv:.4f} |".format(
+            "| {name} | {total:.4f} | {principle:.4f} | {sync:.4f} | {stability:.4f} | {phase_error:.4f} | {control_flow:.4f} | {security:.4f} | {qft:.4f} | {linear_rank:.4f} | {compare_x:.4f} | {cost:.4f} | {op_cost:.4f} | {attack_adv:.4f} |".format(
                 name=scenario,
                 total=total,
                 principle=principle,
                 sync=sync,
                 stability=stability,
+                phase_error=phase_error,
+                control_flow=control_flow,
                 security=security,
                 qft=qft,
                 linear_rank=linear_rank,
@@ -2733,6 +2972,7 @@ def _load_archive(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {
             "defender_elites": [],
+            "defender_anti_attacker_elites": [],
             "attacker_elites": [],
             "rounds": [],
             "predictive_profile": {},
@@ -2743,12 +2983,14 @@ def _load_archive(path: Path) -> Dict[str, Any]:
     except json.JSONDecodeError:
         return {
             "defender_elites": [],
+            "defender_anti_attacker_elites": [],
             "attacker_elites": [],
             "rounds": [],
             "predictive_profile": {},
             "updated_at": None,
         }
     payload.setdefault("defender_elites", [])
+    payload.setdefault("defender_anti_attacker_elites", [])
     payload.setdefault("attacker_elites", [])
     payload.setdefault("rounds", [])
     payload.setdefault("predictive_profile", {})
@@ -2766,6 +3008,9 @@ def _compact_round_summary_for_archive(entry: Dict[str, Any]) -> Dict[str, Any]:
     adaptive_payload = entry.get("adaptive_attacker_budget", {})
     if not isinstance(adaptive_payload, dict):
         adaptive_payload = {}
+    panel_payload = entry.get("selection_panel", {})
+    if not isinstance(panel_payload, dict):
+        panel_payload = {}
 
     compact: Dict[str, Any] = {
         "round": int(entry.get("round", -1)),
@@ -2779,6 +3024,14 @@ def _compact_round_summary_for_archive(entry: Dict[str, Any]) -> Dict[str, Any]:
         "attacker_stop_reason": str(entry.get("attacker_stop_reason", "")),
         "predictive_profile": predictor_payload,
         "adaptive_attacker_budget": adaptive_payload,
+        "selection_panel": {
+            "attacker_panel_size": int(panel_payload.get("attacker_panel_size", 0)),
+            "attacker_panel_penalty": float(panel_payload.get("attacker_panel_penalty", 0.0)),
+            "defender_robust_score": float(panel_payload.get("defender_robust_score", 0.0)),
+            "defender_panel_worst_score": float(panel_payload.get("defender_panel_worst_score", 0.0)),
+            "defender_panel_worst_attacker_adv": float(panel_payload.get("defender_panel_worst_attacker_adv", 0.0)),
+            "anti_attacker_slice": int(panel_payload.get("anti_attacker_slice", 0)),
+        },
         "reference_anchor": {
             "score": float(reference_payload.get("score", 0.0)),
             "signature": str(reference_payload.get("signature", "")),
@@ -2988,6 +3241,8 @@ def _build_round_report(
                 ("cost_score", "cost"),
                 ("runtime_score", "runtime"),
                 ("stability_score", "stability"),
+                ("phase_error_control_score", "phase-error"),
+                ("control_flow_score", "ctrl-flow"),
                 ("qft_score", "qft"),
                 ("linear_rank_score", "linear-rank"),
                 ("compare_x_score", "compare-x"),
@@ -3025,14 +3280,16 @@ def _build_round_report(
 
     lines.append("## Defender Evolution")
     lines.append("")
-    lines.append("| gen | best | principle | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe | q-thr | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | reb | t(s) | stop |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
+    lines.append("| gen | best | principle | sync | horizon | security | cost | sync-loss | attacker-adv | q frac/keep | m frac/keep | key var | probe | q-thr | eval q>m>f | keep q>m | probes | qskip | uniq | cache | dup | reb | gate | neu | t(s) | stop |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | --- |")
     for row in defender_log:
         lines.append(
-            "| {generation} | {best_score:.4f} | {principle:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {qthr:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {reb} | {secs:.2f} | {stop_reason} |".format(
+            "| {generation} | {best_score:.4f} | {principle:.4f} | {sync_score:.4f} | {horizon_sync:.4f} | {security:.4f} | {cost:.4f} | {sync_loss:.4f} | {attacker_adv:.4f} | {qf:.2f}/{qk:.2f} | {mf:.2f}/{mk:.2f} | {kv} | {probe:.2f} | {qthr:.2f} | {stage_eval} | {stage_keep} | {probe_n} | {qskip} | {uniq} | {cache} | {dup} | {reb} | {gate} | {neu} | {secs:.2f} | {stop_reason} |".format(
                 generation=row["generation"],
                 best_score=row["best_score"],
                 principle=row["principle"],
+                sync_score=float(row.get("sync_score", 0.0)),
+                horizon_sync=float(row.get("horizon_sync", 0.0)),
                 security=row["security"],
                 cost=row["cost"],
                 sync_loss=row["sync_loss"],
@@ -3052,6 +3309,15 @@ def _build_round_report(
                 cache=int(row.get("cache_hits", 0)),
                 dup=int(row.get("dup_reuse", 0)),
                 reb=int(row.get("parallel_rebalanced", 0)),
+                gate="{count}@{thr:.3f}/{pct:.2f}".format(
+                    count=int(row.get("sync_gate_penalized", 0)),
+                    thr=float(row.get("sync_gate_threshold", 0.0)),
+                    pct=float(row.get("sync_gate_percentile", 0.0)),
+                ),
+                neu="{pen}/{rew}".format(
+                    pen=int(row.get("neutrality_penalized", 0)),
+                    rew=int(row.get("neutrality_rewarded", 0)),
+                ),
                 secs=float(row.get("batch_seconds", 0.0)),
                 stop_reason=str(row.get("stop_reason", "")),
             )
@@ -3233,6 +3499,18 @@ def _pcpl_improvement_findings(
             "Reduce controller-fail paths by specifying safe fallback transitions and bounded state-churn rules.",
         ),
         (
+            "phase_error_control_score",
+            True,
+            "Phase-Error Control",
+            "Add explicit phase-error corrective loops with bounded overshoot and monotonic recovery criteria.",
+        ),
+        (
+            "control_flow_score",
+            True,
+            "Control-Flow Richness",
+            "Increase effective compare/branch logic for drift-aware switching between steady and recovery paths.",
+        ),
+        (
             "qft_score",
             True,
             "QFT Period Margin",
@@ -3401,12 +3679,14 @@ def _write_view_outputs(
         defender_mean = _mean_metrics_row(best_metrics_rows)
         conclusion_lines.append("## Best Defender Summary")
         conclusion_lines.append(
-            "- score={score:.6f}, principle={principle:.4f}, security={security:.4f}, sync={sync:.4f}, stability={stability:.4f}, qft={qft:.4f}, linear_rank={linear_rank:.4f}, compare_x={compare_x:.4f}, cost={cost:.4f}".format(
+            "- score={score:.6f}, principle={principle:.4f}, security={security:.4f}, sync={sync:.4f}, stability={stability:.4f}, phase_error={phase_error:.4f}, ctrl_flow={ctrl_flow:.4f}, qft={qft:.4f}, linear_rank={linear_rank:.4f}, compare_x={compare_x:.4f}, cost={cost:.4f}".format(
                 score=float(best_defender[0].get("score", 0.0)),
                 principle=float(defender_mean.get("principle_score", 0.0)),
                 security=float(defender_mean.get("security_score", 0.0)),
                 sync=float(defender_mean.get("sync_score", 0.0)),
                 stability=float(defender_mean.get("stability_score", 0.0)),
+                phase_error=float(defender_mean.get("phase_error_control_score", 0.0)),
+                ctrl_flow=float(defender_mean.get("control_flow_score", 0.0)),
                 qft=float(defender_mean.get("qft_score", 0.0)),
                 linear_rank=float(defender_mean.get("linear_rank_score", 0.0)),
                 compare_x=float(defender_mean.get("compare_x_score", 0.0)),
@@ -3541,9 +3821,13 @@ def _run_defender_round(
         max_instruction_count=defender_instruction_cap,
         max_effective_instruction_count=defender_effective_cap,
     )
+    defender_seed_elites = list(archive.get("defender_elites", []))
+    anti_attacker_elites = list(archive.get("defender_anti_attacker_elites", []))
+    if anti_attacker_elites:
+        defender_seed_elites.extend(anti_attacker_elites)
     _seed_population_from_archive(
         evolver=evolver,
-        archive_elites=archive.get("defender_elites", []),
+        archive_elites=defender_seed_elites,
         io_initializer=ensure_genome_io,
         reference_anchor_factory=build_reference_defender_genome,
         population_size=config.population_size,
@@ -3560,6 +3844,13 @@ def _run_defender_round(
         for entry in archive.get("defender_elites", [])
         if (entry.get("signature") or entry.get("canonical_signature"))
     }
+    archive_signatures.update(
+        {
+            str(entry.get("signature") or entry.get("canonical_signature"))
+            for entry in archive.get("defender_anti_attacker_elites", [])
+            if (entry.get("signature") or entry.get("canonical_signature"))
+        }
+    )
     if attacker is not None:
         ensure_attacker_genome_io(attacker)
     controller = PredictiveStageController.from_config(config)
@@ -3628,10 +3919,16 @@ def _run_defender_round(
             "best_score": float(best_fitness),
             "best_signature": _evaluation_signature(best),
             "principle": _mean_metric(metrics, "principle_score"),
+            "sync_score": _mean_metric(metrics, "sync_score"),
+            "stability_score": _mean_metric(metrics, "stability_score"),
             "security": _mean_metric(metrics, "security_score"),
             "cost": _mean_metric(metrics, "cost_score"),
             "sync_loss": _mean_metric(metrics, "sync_loss_rate"),
+            "projected_sync_loss": _mean_metric(metrics, "projected_sync_loss_rate"),
+            "horizon_sync": _mean_metric(metrics, "horizon_sync_score"),
             "attacker_adv": _mean_metric(metrics, "attacker_advantage_score"),
+            "phase_error_control": _mean_metric(metrics, "phase_error_control_score"),
+            "control_flow_score": _mean_metric(metrics, "control_flow_score"),
             "quick_fraction": float(controller.quick_cycle_fraction),
             "mid_fraction": float(controller.mid_cycle_fraction),
             "quick_keep": float(controller.quick_keep_ratio),
@@ -3662,6 +3959,11 @@ def _run_defender_round(
             "random_injected": int(stage_stats.get("random_injected", 0.0)),
             "parallel_rebalanced": int(stage_stats.get("parallel_rebalanced", 0.0)),
             "underutilization_boost": float(stage_stats.get("underutilization_boost", 0.0)),
+            "sync_gate_penalized": int(stage_stats.get("sync_gate_penalized", 0.0)),
+            "sync_gate_threshold": float(stage_stats.get("sync_gate_threshold", 0.0)),
+            "sync_gate_percentile": float(stage_stats.get("sync_gate_percentile", 0.0)),
+            "neutrality_penalized": int(stage_stats.get("neutrality_penalized", 0.0)),
+            "neutrality_rewarded": int(stage_stats.get("neutrality_rewarded", 0.0)),
             "mutation_rate": float(stage_stats.get("mutation_rate", evolver.mutation_rate)),
             "batch_seconds": float(stage_stats.get("batch_seconds", 0.0)),
             "target_batch_seconds": float(
@@ -3671,9 +3973,11 @@ def _run_defender_round(
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} imm={imm} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
+            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sync={sync:.4f} hs={hs:.4f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} gate={gate}@{gthr:.3f}/{gp:.2f} neu={np}/{nr} imm={imm} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
+                sync=row["sync_score"],
+                hs=row["horizon_sync"],
                 security=row["security"],
                 cost=row["cost"],
                 attack_adv=row["attacker_adv"],
@@ -3694,6 +3998,11 @@ def _run_defender_round(
                 reb=row["parallel_rebalanced"],
                 rt=row["random_trials"],
                 ri=row["random_injected"],
+                gate=row["sync_gate_penalized"],
+                gthr=row["sync_gate_threshold"],
+                gp=row["sync_gate_percentile"],
+                np=row["neutrality_penalized"],
+                nr=row["neutrality_rewarded"],
                 imm=row["stall_immigrants"],
                 ub=row["underutilization_boost"],
                 mut=row["mutation_rate"],
@@ -3747,6 +4056,12 @@ def _run_defender_round(
             "dup_reuse": 0.0,
             "parallel_rebalanced": 0.0,
             "underutilization_boost": 0.0,
+            "sync_gate_penalized": 0.0,
+            "sync_gate_threshold": 0.0,
+            "sync_gate_percentile": 0.0,
+            "sync_gate_flatness": 0.0,
+            "neutrality_penalized": 0.0,
+            "neutrality_rewarded": 0.0,
             "mutation_rate": float(evolver.mutation_rate),
             "quick_throttle": 1.0,
             "target_batch_seconds": float(target_seconds),
@@ -4183,6 +4498,18 @@ def _run_defender_round(
         local_stage["eval_unique"] += float(full_stats["unique_eval"])
         local_stage["cache_hits"] += float(full_stats["cache_hits"])
         local_stage["dup_reuse"] += float(full_stats["dup_reuse"])
+        gate_stats = _apply_defender_sync_loss_gate(
+            full_pending=full_pending,
+            generation_log=generation_log,
+            config=config,
+        )
+        local_stage.update(gate_stats)
+        neutrality_stats = _apply_defender_anti_neutrality(
+            full_pending=full_pending,
+            generation_log=generation_log,
+            config=config,
+        )
+        local_stage.update(neutrality_stats)
 
         # Probe a small random sample from cut genomes to estimate false negatives.
         survivor_ids = {id(genome) for _, genome in full_pending}
@@ -5266,31 +5593,94 @@ def run_continuous_experiment(
             ]
             if not top_candidates:
                 top_candidates = defender_evolver.population[:]
+            if not top_candidates:
+                raise RuntimeError("defender round produced empty candidate pool")
             top_candidates = top_candidates[: min(5, len(top_candidates))]
-            selected_defender = top_candidates[0]
-            candidate_pending = list(enumerate(top_candidates))
             for candidate in top_candidates:
                 ensure_genome_io(candidate)
-            _evaluate_pending_parallel(
-                pending=candidate_pending,
-                backend=resource_plan.parallel_backend,
-                workers=resource_plan.parallel_workers,
-                executor=shared_executor,
-                worker_fn=_defender_eval_worker,
-                build_task=lambda g: (
-                    g,
-                    selection_scenarios,
-                    best_attacker,
-                    "full",
-                ),
-                attr_name="_pcpl_metrics",
-                store_metrics=False,
-            )
-            selected_defender = max(
-                top_candidates,
-                key=lambda genome: float(genome.fitness or -float("inf")),
-            )
-            selected_score = float(selected_defender.fitness or -float("inf"))
+
+            attacker_panel: List[GFSLGenome] = []
+            panel_seen: set[str] = set()
+
+            ensure_attacker_genome_io(best_attacker)
+            attacker_panel.append(best_attacker)
+            panel_seen.add(_evaluation_signature(best_attacker))
+
+            panel_size = max(1, int(config.attacker_panel_size))
+            if panel_size > 1:
+                for entry in archive.get("attacker_elites", []):
+                    if len(attacker_panel) >= panel_size:
+                        break
+                    try:
+                        payload = entry.get("genome", {})
+                        if not isinstance(payload, dict):
+                            continue
+                        panel_attacker = _deserialize_genome(payload)
+                        ensure_attacker_genome_io(panel_attacker)
+                        signature = _evaluation_signature(panel_attacker)
+                        if signature in panel_seen:
+                            continue
+                        attacker_panel.append(panel_attacker)
+                        panel_seen.add(signature)
+                    except Exception:
+                        continue
+
+            panel_scores: Dict[int, List[float]] = {id(candidate): [] for candidate in top_candidates}
+            panel_advantages: Dict[int, List[float]] = {id(candidate): [] for candidate in top_candidates}
+            panel_primary_metrics: Dict[int, List[Dict[str, Any]]] = {}
+
+            for panel_index, panel_attacker in enumerate(attacker_panel):
+                candidate_pending = list(enumerate(top_candidates))
+                _evaluate_pending_parallel(
+                    pending=candidate_pending,
+                    backend=resource_plan.parallel_backend,
+                    workers=resource_plan.parallel_workers,
+                    executor=shared_executor,
+                    worker_fn=_defender_eval_worker,
+                    build_task=lambda g, atk=panel_attacker: (
+                        g,
+                        selection_scenarios,
+                        atk,
+                        "full",
+                    ),
+                    attr_name="_pcpl_metrics",
+                    store_metrics=True,
+                )
+                for candidate in top_candidates:
+                    score = float(candidate.fitness or -float("inf"))
+                    metrics = getattr(candidate, "_pcpl_metrics", [])
+                    panel_scores[id(candidate)].append(score)
+                    panel_advantages[id(candidate)].append(
+                        _mean_metric(metrics, "attacker_advantage_score")
+                    )
+                    if panel_index == 0:
+                        panel_primary_metrics[id(candidate)] = _metrics_rows(metrics)
+
+            panel_penalty = max(0.0, float(config.attacker_panel_penalty))
+            ranked_candidates: List[Tuple[float, GFSLGenome, float, float, float]] = []
+            for candidate in top_candidates:
+                scores = panel_scores.get(id(candidate), [])
+                advantages = panel_advantages.get(id(candidate), [])
+                if not scores:
+                    scores = [float(candidate.fitness or -float("inf"))]
+                if not advantages:
+                    advantages = [0.0]
+                base_score = float(scores[0])
+                worst_score = float(min(scores))
+                mean_score = float(sum(scores) / float(max(1, len(scores))))
+                worst_adv = float(max(advantages))
+                robust_score = (
+                    (0.42 * base_score)
+                    + (0.38 * worst_score)
+                    + (0.20 * mean_score)
+                    - (panel_penalty * worst_adv)
+                )
+                ranked_candidates.append(
+                    (robust_score, candidate, base_score, worst_score, worst_adv)
+                )
+
+            ranked_candidates.sort(key=lambda item: item[0], reverse=True)
+            selected_robust_score, selected_defender, selected_score, selected_panel_worst_score, selected_panel_worst_adv = ranked_candidates[0]
             _, selected_metrics = evaluate_across_scenarios(
                 selection_scenarios,
                 selected_defender,
@@ -5316,6 +5706,10 @@ def run_continuous_experiment(
                 "round": round_index,
                 "timestamp": _utc_now_iso(),
                 "score": float(selected_score),
+                "robust_score": float(selected_robust_score),
+                "panel_worst_score": float(selected_panel_worst_score),
+                "panel_worst_attacker_adv": float(selected_panel_worst_adv),
+                "panel_size": int(len(attacker_panel)),
                 "signature": defender_signature,
                 "canonical_signature": _canonical_signature(selected_defender),
                 "metrics": _metrics_rows(selected_metrics),
@@ -5342,6 +5736,34 @@ def run_continuous_experiment(
                 attacker_record,
                 limit=config.archive_limit,
             )
+            anti_limit = max(8, int(math.ceil(float(config.archive_limit) * 0.5)))
+            anti_slice_keep = min(
+                len(ranked_candidates),
+                max(1, min(3, int(math.ceil(float(config.elite_pool) * 0.08)))),
+            )
+            anti_entries = archive.get("defender_anti_attacker_elites", [])
+            if not isinstance(anti_entries, list):
+                anti_entries = []
+            for robust_score, candidate, base_score, worst_score, worst_adv in ranked_candidates[:anti_slice_keep]:
+                anti_record = {
+                    "role": "defender-anti-attacker",
+                    "round": round_index,
+                    "timestamp": _utc_now_iso(),
+                    "score": float(robust_score),
+                    "base_score": float(base_score),
+                    "worst_score": float(worst_score),
+                    "worst_attacker_adv": float(worst_adv),
+                    "signature": candidate.get_signature(),
+                    "canonical_signature": _canonical_signature(candidate),
+                    "metrics": panel_primary_metrics.get(id(candidate), []),
+                    "genome": _serialize_genome(candidate, role="defender"),
+                }
+                anti_entries = _insert_elite(
+                    anti_entries,
+                    anti_record,
+                    limit=anti_limit,
+                )
+            archive["defender_anti_attacker_elites"] = anti_entries
 
             round_summary = {
                 "round": round_index,
@@ -5350,6 +5772,14 @@ def run_continuous_experiment(
                 "defender_signature": defender_signature,
                 "attacker_score": float(attack_adv),
                 "attacker_signature": attacker_signature,
+                "selection_panel": {
+                    "attacker_panel_size": int(len(attacker_panel)),
+                    "attacker_panel_penalty": float(panel_penalty),
+                    "defender_robust_score": float(selected_robust_score),
+                    "defender_panel_worst_score": float(selected_panel_worst_score),
+                    "defender_panel_worst_attacker_adv": float(selected_panel_worst_adv),
+                    "anti_attacker_slice": int(anti_slice_keep),
+                },
                 "round_dir": str(round_dir),
                 "defender_log": defender_log,
                 "attacker_log": attacker_log,
@@ -5458,6 +5888,7 @@ def run_continuous_experiment(
             "baselines": baseline_rows,
             "rounds_completed": len(archive.get("rounds", [])),
             "best_defender": archive.get("defender_elites", [])[:1],
+            "best_defender_anti_attacker": archive.get("defender_anti_attacker_elites", [])[:1],
             "best_attacker": archive.get("attacker_elites", [])[:1],
             "predictive_profile": predictive_profile,
             "last_round": {
@@ -5493,6 +5924,11 @@ def run_continuous_experiment(
         report_lines.append(f"- rounds completed: `{len(archive.get('rounds', []))}`")
         report_lines.append(f"- best defender score: `{last_defender_score:.6f}`")
         report_lines.append(f"- best attacker score: `{last_attacker_score:.6f}`")
+        report_lines.append(
+            "- anti-attacker defender elites: `{count}`".format(
+                count=len(archive.get("defender_anti_attacker_elites", [])),
+            )
+        )
         report_lines.append(
             "- resources: backend={backend} workers={workers} gpu={gpu}".format(
                 backend=resource_plan.parallel_backend,
@@ -5597,6 +6033,18 @@ def run_continuous_experiment(
             "- runtime-governor: target_gen_s={target:.2f} eval_cache={cache}".format(
                 target=float(config.target_generation_seconds),
                 cache=int(config.max_eval_cache_entries),
+            )
+        )
+        report_lines.append(
+            "- phase-sync-governor: sync_loss_gate={pct:.2f}/{pen:.3f}+{flat:.3f} anti_neutrality={window}({npen:.3f}/{nbon:.3f}) attacker_panel={panel}@{panel_pen:.3f}".format(
+                pct=float(config.sync_loss_gate_percentile),
+                pen=float(config.sync_loss_gate_penalty),
+                flat=float(config.sync_loss_gate_flat_boost),
+                window=int(config.anti_neutrality_window),
+                npen=float(config.anti_neutrality_penalty),
+                nbon=float(config.anti_neutrality_bonus),
+                panel=int(config.attacker_panel_size),
+                panel_pen=float(config.attacker_panel_penalty),
             )
         )
         report_lines.append("")

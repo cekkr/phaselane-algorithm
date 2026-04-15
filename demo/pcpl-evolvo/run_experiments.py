@@ -107,6 +107,14 @@ def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, An
         "key_variants": int(args.key_variants),
         "novelty_bonus": float(args.novelty_bonus),
         "predictive_penalty": float(args.predictive_penalty),
+        "sync_loss_gate_percentile": float(args.sync_loss_gate_percentile),
+        "sync_loss_gate_penalty": float(args.sync_loss_gate_penalty),
+        "sync_loss_gate_flat_boost": float(args.sync_loss_gate_flat_boost),
+        "anti_neutrality_window": int(args.anti_neutrality_window),
+        "anti_neutrality_penalty": float(args.anti_neutrality_penalty),
+        "anti_neutrality_bonus": float(args.anti_neutrality_bonus),
+        "attacker_panel_size": int(args.attacker_panel_size),
+        "attacker_panel_penalty": float(args.attacker_panel_penalty),
         "target_generation_seconds": float(args.target_generation_seconds),
         "max_eval_cache_entries": int(args.max_eval_cache_entries),
     }
@@ -127,6 +135,14 @@ def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, An
         "key_variants": max(3, base["key_variants"]),
         "novelty_bonus": _clamp_float(max(0.10, base["novelty_bonus"]), 0.03, 0.30),
         "predictive_penalty": _clamp_float(max(0.06, base["predictive_penalty"]), 0.03, 0.22),
+        "sync_loss_gate_percentile": _clamp_float(min(base["sync_loss_gate_percentile"], 0.62), 0.30, 0.90),
+        "sync_loss_gate_penalty": _clamp_float(max(0.08, base["sync_loss_gate_penalty"]), 0.02, 0.35),
+        "sync_loss_gate_flat_boost": _clamp_float(max(0.05, base["sync_loss_gate_flat_boost"]), 0.00, 0.30),
+        "anti_neutrality_window": max(6, base["anti_neutrality_window"]),
+        "anti_neutrality_penalty": _clamp_float(max(0.02, base["anti_neutrality_penalty"]), 0.00, 0.20),
+        "anti_neutrality_bonus": _clamp_float(max(0.01, base["anti_neutrality_bonus"]), 0.00, 0.15),
+        "attacker_panel_size": max(2, base["attacker_panel_size"]),
+        "attacker_panel_penalty": _clamp_float(max(0.10, base["attacker_panel_penalty"]), 0.00, 0.40),
         "target_generation_seconds": _clamp_float(base["target_generation_seconds"] * 0.95, 0.70, 4.0),
         "max_eval_cache_entries": max(15000, int(round(base["max_eval_cache_entries"] * 1.10))),
     }
@@ -144,6 +160,14 @@ def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, An
         "key_variants": max(4, base["key_variants"]),
         "novelty_bonus": _clamp_float(max(0.14, base["novelty_bonus"]), 0.05, 0.35),
         "predictive_penalty": _clamp_float(max(0.10, base["predictive_penalty"]), 0.04, 0.25),
+        "sync_loss_gate_percentile": _clamp_float(min(base["sync_loss_gate_percentile"], 0.58), 0.30, 0.90),
+        "sync_loss_gate_penalty": _clamp_float(max(0.10, base["sync_loss_gate_penalty"]), 0.02, 0.35),
+        "sync_loss_gate_flat_boost": _clamp_float(max(0.06, base["sync_loss_gate_flat_boost"]), 0.00, 0.30),
+        "anti_neutrality_window": max(6, base["anti_neutrality_window"] - 1),
+        "anti_neutrality_penalty": _clamp_float(max(0.03, base["anti_neutrality_penalty"]), 0.00, 0.20),
+        "anti_neutrality_bonus": _clamp_float(max(0.01, base["anti_neutrality_bonus"]), 0.00, 0.15),
+        "attacker_panel_size": max(3, base["attacker_panel_size"]),
+        "attacker_panel_penalty": _clamp_float(max(0.12, base["attacker_panel_penalty"]), 0.00, 0.40),
         "target_generation_seconds": _clamp_float(base["target_generation_seconds"] * 0.88, 0.60, 4.0),
         "max_eval_cache_entries": max(15000, int(round(base["max_eval_cache_entries"] * 1.18))),
     }
@@ -214,6 +238,14 @@ def _build_continuous_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "key_variants": int(strategy["key_variants"]),
                     "novelty_bonus": float(strategy["novelty_bonus"]),
                     "predictive_penalty": float(strategy["predictive_penalty"]),
+                    "sync_loss_gate_percentile": float(strategy["sync_loss_gate_percentile"]),
+                    "sync_loss_gate_penalty": float(strategy["sync_loss_gate_penalty"]),
+                    "sync_loss_gate_flat_boost": float(strategy["sync_loss_gate_flat_boost"]),
+                    "anti_neutrality_window": int(strategy["anti_neutrality_window"]),
+                    "anti_neutrality_penalty": float(strategy["anti_neutrality_penalty"]),
+                    "anti_neutrality_bonus": float(strategy["anti_neutrality_bonus"]),
+                    "attacker_panel_size": int(strategy["attacker_panel_size"]),
+                    "attacker_panel_penalty": float(strategy["attacker_panel_penalty"]),
                     "target_generation_seconds": float(strategy["target_generation_seconds"]),
                     "max_eval_cache_entries": int(strategy["max_eval_cache_entries"]),
                 }
@@ -252,6 +284,14 @@ def _build_experiment_config(
     key_variants: Optional[int] = None,
     novelty_bonus: Optional[float] = None,
     predictive_penalty: Optional[float] = None,
+    sync_loss_gate_percentile: Optional[float] = None,
+    sync_loss_gate_penalty: Optional[float] = None,
+    sync_loss_gate_flat_boost: Optional[float] = None,
+    anti_neutrality_window: Optional[int] = None,
+    anti_neutrality_penalty: Optional[float] = None,
+    anti_neutrality_bonus: Optional[float] = None,
+    attacker_panel_size: Optional[int] = None,
+    attacker_panel_penalty: Optional[float] = None,
     target_generation_seconds: Optional[float] = None,
     max_eval_cache_entries: Optional[int] = None,
 ) -> ExperimentConfig:
@@ -290,6 +330,46 @@ def _build_experiment_config(
         key_variant_count=args.key_variants if key_variants is None else int(key_variants),
         novelty_bonus=args.novelty_bonus if novelty_bonus is None else float(novelty_bonus),
         predictive_penalty=args.predictive_penalty if predictive_penalty is None else float(predictive_penalty),
+        sync_loss_gate_percentile=(
+            args.sync_loss_gate_percentile
+            if sync_loss_gate_percentile is None
+            else float(sync_loss_gate_percentile)
+        ),
+        sync_loss_gate_penalty=(
+            args.sync_loss_gate_penalty
+            if sync_loss_gate_penalty is None
+            else float(sync_loss_gate_penalty)
+        ),
+        sync_loss_gate_flat_boost=(
+            args.sync_loss_gate_flat_boost
+            if sync_loss_gate_flat_boost is None
+            else float(sync_loss_gate_flat_boost)
+        ),
+        anti_neutrality_window=(
+            args.anti_neutrality_window
+            if anti_neutrality_window is None
+            else int(anti_neutrality_window)
+        ),
+        anti_neutrality_penalty=(
+            args.anti_neutrality_penalty
+            if anti_neutrality_penalty is None
+            else float(anti_neutrality_penalty)
+        ),
+        anti_neutrality_bonus=(
+            args.anti_neutrality_bonus
+            if anti_neutrality_bonus is None
+            else float(anti_neutrality_bonus)
+        ),
+        attacker_panel_size=(
+            args.attacker_panel_size
+            if attacker_panel_size is None
+            else int(attacker_panel_size)
+        ),
+        attacker_panel_penalty=(
+            args.attacker_panel_penalty
+            if attacker_panel_penalty is None
+            else float(attacker_panel_penalty)
+        ),
         auto_statistical_tuning=bool(args.auto_statistical_tuning),
         target_generation_seconds=(
             args.target_generation_seconds
@@ -398,6 +478,14 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "key_variants": "key_variants",
         "novelty_bonus": "novelty_bonus",
         "predictive_penalty": "predictive_penalty",
+        "sync_loss_gate_percentile": "sync_loss_gate_percentile",
+        "sync_loss_gate_penalty": "sync_loss_gate_penalty",
+        "sync_loss_gate_flat_boost": "sync_loss_gate_flat_boost",
+        "anti_neutrality_window": "anti_neutrality_window",
+        "anti_neutrality_penalty": "anti_neutrality_penalty",
+        "anti_neutrality_bonus": "anti_neutrality_bonus",
+        "attacker_panel_size": "attacker_panel_size",
+        "attacker_panel_penalty": "attacker_panel_penalty",
         "target_generation_seconds": "target_generation_seconds",
         "max_eval_cache_entries": "max_eval_cache_entries",
         "device_mhz": "device_mhz",
@@ -432,6 +520,39 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
     )
     resolved["supervised_epochs"] = max(0, int(resolved.get("supervised_epochs", 0)))
     resolved["supervised_candidate_pool"] = max(0, int(resolved.get("supervised_candidate_pool", 0)))
+    resolved["sync_loss_gate_percentile"] = _clamp_float(
+        float(resolved.get("sync_loss_gate_percentile", 0.60)),
+        0.0,
+        1.0,
+    )
+    resolved["sync_loss_gate_penalty"] = max(
+        0.0,
+        float(resolved.get("sync_loss_gate_penalty", 0.10)),
+    )
+    resolved["sync_loss_gate_flat_boost"] = max(
+        0.0,
+        float(resolved.get("sync_loss_gate_flat_boost", 0.06)),
+    )
+    resolved["anti_neutrality_window"] = max(
+        1,
+        int(resolved.get("anti_neutrality_window", 10)),
+    )
+    resolved["anti_neutrality_penalty"] = max(
+        0.0,
+        float(resolved.get("anti_neutrality_penalty", 0.03)),
+    )
+    resolved["anti_neutrality_bonus"] = max(
+        0.0,
+        float(resolved.get("anti_neutrality_bonus", 0.015)),
+    )
+    resolved["attacker_panel_size"] = max(
+        1,
+        int(resolved.get("attacker_panel_size", 3)),
+    )
+    resolved["attacker_panel_penalty"] = max(
+        0.0,
+        float(resolved.get("attacker_panel_penalty", 0.16)),
+    )
     resolved["statistical_predictive"] = bool(defaults["statistical_predictive"]) and not bool(
         args.no_statistical_predictive
     )
@@ -475,6 +596,14 @@ def _apply_runtime_config(args: argparse.Namespace, resolved: Dict[str, Any]) ->
         "key_variants",
         "novelty_bonus",
         "predictive_penalty",
+        "sync_loss_gate_percentile",
+        "sync_loss_gate_penalty",
+        "sync_loss_gate_flat_boost",
+        "anti_neutrality_window",
+        "anti_neutrality_penalty",
+        "anti_neutrality_bonus",
+        "attacker_panel_size",
+        "attacker_panel_penalty",
         "target_generation_seconds",
         "max_eval_cache_entries",
         "device_mhz",
@@ -535,6 +664,18 @@ def _print_effective_config(resolved: Dict[str, Any]) -> None:
             kv=int(resolved["key_variants"]),
             nov=float(resolved["novelty_bonus"]),
             pen=float(resolved["predictive_penalty"]),
+        )
+    )
+    print(
+        "[pcpl-evolvo] sync-gate pct={pct:.2f} penalty={pen:.3f}+{flat:.3f} anti-neutrality={aw}({ap:.3f}/{ab:.3f}) attacker-panel={panel}@{panel_pen:.3f}".format(
+            pct=float(resolved["sync_loss_gate_percentile"]),
+            pen=float(resolved["sync_loss_gate_penalty"]),
+            flat=float(resolved["sync_loss_gate_flat_boost"]),
+            aw=int(resolved["anti_neutrality_window"]),
+            ap=float(resolved["anti_neutrality_penalty"]),
+            ab=float(resolved["anti_neutrality_bonus"]),
+            panel=int(resolved["attacker_panel_size"]),
+            panel_pen=float(resolved["attacker_panel_penalty"]),
         )
     )
     supervised_mode = "disabled"
@@ -1000,6 +1141,54 @@ def parse_args() -> argparse.Namespace:
         help="Penalty applied when a genome is cut by predictive stages.",
     )
     parser.add_argument(
+        "--sync-loss-gate-percentile",
+        type=float,
+        default=None,
+        help="Defender full-stage percentile threshold for projected_sync_loss_rate gate.",
+    )
+    parser.add_argument(
+        "--sync-loss-gate-penalty",
+        type=float,
+        default=None,
+        help="Base fitness penalty for defenders above sync-loss gate threshold.",
+    )
+    parser.add_argument(
+        "--sync-loss-gate-flat-boost",
+        type=float,
+        default=None,
+        help="Extra sync-loss gate penalty added when recent generations are flat.",
+    )
+    parser.add_argument(
+        "--anti-neutrality-window",
+        type=int,
+        default=None,
+        help="Defender generations window used to detect repeated phenotype fingerprints.",
+    )
+    parser.add_argument(
+        "--anti-neutrality-penalty",
+        type=float,
+        default=None,
+        help="Penalty for defender candidates repeating recent phenotype fingerprint.",
+    )
+    parser.add_argument(
+        "--anti-neutrality-bonus",
+        type=float,
+        default=None,
+        help="Bonus for defender candidates improving sync/horizon while escaping repeats.",
+    )
+    parser.add_argument(
+        "--attacker-panel-size",
+        type=int,
+        default=None,
+        help="Round-selection attacker panel size used for defender robust ranking.",
+    )
+    parser.add_argument(
+        "--attacker-panel-penalty",
+        type=float,
+        default=None,
+        help="Penalty multiplier for worst attacker advantage in defender panel ranking.",
+    )
+    parser.add_argument(
         "--target-generation-seconds",
         type=float,
         default=None,
@@ -1092,6 +1281,22 @@ def main() -> None:
         raise ValueError("--supervised-epochs must be >= 0")
     if int(args.supervised_candidate_pool) < 0:
         raise ValueError("--supervised-candidate-pool must be >= 0")
+    if not (0.0 <= float(args.sync_loss_gate_percentile) <= 1.0):
+        raise ValueError("--sync-loss-gate-percentile must be in [0, 1]")
+    if float(args.sync_loss_gate_penalty) < 0.0:
+        raise ValueError("--sync-loss-gate-penalty must be >= 0")
+    if float(args.sync_loss_gate_flat_boost) < 0.0:
+        raise ValueError("--sync-loss-gate-flat-boost must be >= 0")
+    if int(args.anti_neutrality_window) < 1:
+        raise ValueError("--anti-neutrality-window must be >= 1")
+    if float(args.anti_neutrality_penalty) < 0.0:
+        raise ValueError("--anti-neutrality-penalty must be >= 0")
+    if float(args.anti_neutrality_bonus) < 0.0:
+        raise ValueError("--anti-neutrality-bonus must be >= 0")
+    if int(args.attacker_panel_size) < 1:
+        raise ValueError("--attacker-panel-size must be >= 1")
+    if float(args.attacker_panel_penalty) < 0.0:
+        raise ValueError("--attacker-panel-penalty must be >= 0")
     resolved["fitness_schema_version"] = str(args.fitness_schema_version)
     resolved["analysis_tag"] = str(args.analysis_tag or "")
     resolved["replicates"] = int(args.replicates)
@@ -1356,6 +1561,14 @@ def main() -> None:
                             key_variants=combo.get("key_variants"),
                             novelty_bonus=combo.get("novelty_bonus"),
                             predictive_penalty=combo.get("predictive_penalty"),
+                            sync_loss_gate_percentile=combo.get("sync_loss_gate_percentile"),
+                            sync_loss_gate_penalty=combo.get("sync_loss_gate_penalty"),
+                            sync_loss_gate_flat_boost=combo.get("sync_loss_gate_flat_boost"),
+                            anti_neutrality_window=combo.get("anti_neutrality_window"),
+                            anti_neutrality_penalty=combo.get("anti_neutrality_penalty"),
+                            anti_neutrality_bonus=combo.get("anti_neutrality_bonus"),
+                            attacker_panel_size=combo.get("attacker_panel_size"),
+                            attacker_panel_penalty=combo.get("attacker_panel_penalty"),
                             target_generation_seconds=combo.get("target_generation_seconds"),
                             max_eval_cache_entries=combo.get("max_eval_cache_entries"),
                         )

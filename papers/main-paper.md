@@ -226,7 +226,7 @@ flowchart TD
   Tok --> Send["Send token to provider idx_t"]
   Tok --> Evolve["Update W[idx_t], evolve S_{t+1}"]
   Evolve --> Loop
-  Tok --> Report["Reports: linear rank, QFT period, compare-x"]
+  Tok --> Report["Reports: phase-error/horizon sync, linear rank, QFT period, compare-x"]
 ```
 
 ### 4.2 Blind provider circuit (validator)
@@ -882,6 +882,7 @@ A simulator was implemented cycle-by-cycle to validate correctness. The demo ver
 - Optional prime/compound generation modes for non-arbitrary parameter testing.
 
 Repository: [cekkr/phaselane-algorithm@github.com](https://github.com/cekkr/phaselane-algorithm).
+Reference implementation and traces are provided as supplementary software material.
 For scientific interpretation, three distinctions are important. First, this section validates **protocol behavior** (schedule correctness, one-of-$x$, deterministic recomputation). Second, offline evolutionary experiments are used only as an **automatic search method** to discover candidate algorithmic/circuit policies under fixed objectives; they are not part of runtime protocol mechanics. Third, scoring is a **model-dependent lens** on quality: when score components or weights change, absolute scores should be compared only within the same scoring family, while invariant-level correctness claims remain comparable.
 
 ### 8.1 Sample token trace (x=4, seed=1337)
@@ -969,9 +970,22 @@ Additional multi-configuration outputs (other compound modes and seeds) are inte
 ### 8.5 Evolutionary interpretation (qualitative)
 In this work, evolutionary campaigns are interpreted as automated design-space exploration: they search for high-performing circuit/algorithm candidates, then support qualitative conclusions from score differences. They do not redefine protocol semantics and do not replace correctness arguments.
 
-Across long co-evolution campaigns, invariant metrics tend to saturate early (principle and permutation consistency), while most residual optimization pressure shifts toward synchronization robustness and long-horizon stability. In practical terms, this means many later generations explore structurally distinct genomes with small numerical score deltas, rather than producing frequent large jumps.
+Across long co-evolution campaigns, invariant metrics tend to saturate early (principle/permutation consistency and basic security constraints), while residual pressure concentrates on synchronization robustness and horizon-level drift control. In practical terms, later generations often show many genotype changes with small score movement unless the objective explicitly exposes synchronization gradients.
 
-The QFT/linear-rank/compare-$x$ terms are useful as protocol-alignment checks, but their contribution to search pressure depends on scenario variability. When these terms are nearly constant across candidate genomes, they operate primarily as compliance diagnostics rather than differentiating objectives. This is acceptable for validation, but future optimization studies should pair them with parameter sweeps that restore discriminatory power.
+This motivates a phase-control-oriented interpretation of search quality: weak progress is usually a gradient-design issue, not a raw compute issue. When projected sync-loss remains high, simple cost improvements can dominate selection even if long-horizon behavior is still suboptimal.
+
+The QFT/linear-rank/compare-$x$ terms remain important for protocol alignment and scientific reporting. However, under fixed scenario families they may become near-constant and therefore behave mainly as compliance checks. Their strongest optimization value appears when paired with scenario diversity that reintroduces discrimination.
+
+### 8.6 Practical circuit/algorithm changes derived from the search
+The evolutionary evidence supports five concrete changes in how candidate circuits are scored and selected:
+
+1. Add an explicit **phase-error control term** (bounded error level, recovery quality, oscillation penalty) instead of relying only on coarse sync aggregates.
+2. Apply a **long-horizon sync gate** at full evaluation stage: candidates with high projected sync-loss are penalized by a dynamic percentile threshold, tightened during flat-score windows.
+3. Use **attacker-panel-coupled defender ranking**: defender selection should optimize robust performance against multiple strong attackers, not only against a single current opponent.
+4. Introduce **anti-neutrality pressure** through repeated-phenotype fingerprints: repeated metric states receive a penalty, while measurable sync/horizon progress is rewarded.
+5. Add a **control-flow richness term** that rewards effective compare/branch structure near drift-management targets, so evolution can discover explicit recovery logic rather than only arithmetic mixing.
+
+These changes do not alter PCPL protocol semantics. They only improve the search lens used to discover stronger algorithmic/circuit instantiations.
 
 ## 9. Discussion and limitations
 - Parameter choice matters; $P, Q, R, M$ must be prime and pairwise coprime.
@@ -980,13 +994,15 @@ The QFT/linear-rank/compare-$x$ terms are useful as protocol-alignment checks, b
 - The public period $\mathrm{lcm}(P,Q,R,x)$ is visible (and QFT-recoverable), so period size should be chosen large enough for the deployment horizon.
 - For testing, primes and compound bases can be generated from a seeded stream to avoid arbitrary constants. [6][7]
 - Long-horizon synchronization remains the dominant practical weakness in current evolutionary studies: resynchronization can recover state, but projected drift-loss can still dominate the residual error budget.
+- Practical optimization should prioritize phase-error regulation, horizon-sync gating, and attacker-coupled defender robustness before further cost compression.
 - Empirical score values are not absolute physical constants; they depend on the chosen objective set and weights. For this reason, cross-run comparisons should include explicit objective-version metadata.
 - Some auxiliary terms (for example QFT/linear-rank/compare-$x$) can become near-constant under fixed scenario families; when this happens, they validate constraints but provide limited evolutionary gradient.
+- Plateau control matters: prolonged repeated phenotypes should be treated as a search-pathology signal and countered with anti-neutrality mechanisms.
 - Evolutionary search is heuristic optimization, not a formal proof technique; correctness remains grounded in the protocol construction and invariants.
 - This paper was developed and formatted with the help of OpenAI models.
 
 ## 10. Conclusion
-PCPL provides a deterministic, no-handshake token protocol with exact 1-of-$x$ matching and a device-only chaining mechanism. Combined with symmetric continuous tokenizer devices, it supports both provider validation and peer-to-peer isolation with dynamic, evolving secrets. The simulation results support the core invariants and provide a clear optimization direction: future work should prioritize long-horizon synchronization robustness, while preserving the already stable correctness and security envelope.
+PCPL provides a deterministic, no-handshake token protocol with exact 1-of-$x$ matching and a device-only chaining mechanism. Combined with symmetric continuous tokenizer devices, it supports both provider validation and peer-to-peer isolation with dynamic, evolving secrets. The simulation results support the core invariants and indicate a concrete optimization program: improve long-horizon synchronization via phase-error-aware control, attacker-coupled selection, and anti-neutrality search pressure, while preserving the already stable correctness and security envelope.
 
 ## References
 1. [NIST FIPS 180-4 (Update 1), *Secure Hash Standard (SHS)*](https://csrc.nist.gov/pubs/fips/180-4/upd1/final)
