@@ -26,6 +26,7 @@ BASE_DEFAULTS: Dict[str, Any] = {
     "continuous_max_iterations": 0,
     "workers": 0,
     "parallel_backend": "process",
+    "executor_backend": "cpu",
     "preferred_device": "auto",
     "parent_pool_ratio": 0.50,
     "stagnation_patience": 2,

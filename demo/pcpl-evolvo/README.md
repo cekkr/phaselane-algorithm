@@ -102,6 +102,19 @@ and the `report.md` line:
 
 If probe is `failed`, the run will print the probe error and fallback behavior.
 
+### Verify Kompute planning/simulation path
+
+```bash
+python3 demo/pcpl-evolvo/run_experiments.py \
+  --profile fast \
+  --mode dynamic \
+  --rounds 1 \
+  --executor-backend kompute-sim
+```
+
+This forces Kompute compatibility/planner checks and then runs simulated execution
+for compatible genomes (CPU-backed semantics). Native Vulkan Kompute dispatch is still pending.
+
 ### Continuous/resumable rounds
 
 ```bash
@@ -170,6 +183,7 @@ PowerShell:
 - `--elite-pool`, `--archive-limit`
 - `--no-resume` (start fresh even if archive exists)
 - `--parallel-backend {auto,process,thread,off}`, `--workers` (`0` = all CPUs)
+- `--executor-backend {auto,cpu,kompute,kompute-sim}` (GFSL executor path for scenario evaluation)
 - `--no-supervised-guide`
 - `--supervised-end-round-only`, `--no-supervised-end-round-only`
 - `--device {auto,cpu,cuda,rocm,mps}` (for optional supervised guide acceleration)

@@ -1051,6 +1051,7 @@ def evaluate_scenario(
     *,
     fixed_decision: Optional[PolicyDecision] = None,
     attacker: Optional[GFSLGenome] = None,
+    executor_kwargs: Optional[Dict[str, object]] = None,
 ) -> ScenarioMetrics:
     """Evaluate one scenario for a defender and optional attacker genome."""
     if genome is None and fixed_decision is None:
@@ -1094,8 +1095,16 @@ def evaluate_scenario(
     twin_state = copy.deepcopy(state)
     shared_secrets, _shared_state = build_fixture(params, scenario.seed ^ 0x9E3779B9, compound_cfg)
 
-    defender_executor = GFSLExecutor(track_instruction_activity=False)
-    attacker_executor = GFSLExecutor(track_instruction_activity=False)
+    runtime_kwargs = dict(executor_kwargs or {})
+    runtime_kwargs.pop("track_instruction_activity", None)
+    defender_executor = GFSLExecutor(
+        track_instruction_activity=False,
+        **runtime_kwargs,
+    )
+    attacker_executor = GFSLExecutor(
+        track_instruction_activity=False,
+        **runtime_kwargs,
+    )
 
     defender_units = 0.0
     if genome is not None:
@@ -1680,6 +1689,7 @@ def evaluate_across_scenarios(
     *,
     fixed_decision: Optional[PolicyDecision] = None,
     attacker: Optional[GFSLGenome] = None,
+    executor_kwargs: Optional[Dict[str, object]] = None,
 ) -> Tuple[float, List[ScenarioMetrics]]:
     metrics = [
         evaluate_scenario(
@@ -1687,6 +1697,7 @@ def evaluate_across_scenarios(
             genome,
             fixed_decision=fixed_decision,
             attacker=attacker,
+            executor_kwargs=executor_kwargs,
         )
         for scenario in scenarios
     ]

@@ -310,6 +310,7 @@ def _build_experiment_config(
         resume=resume,
         parallel_workers=workers,
         parallel_backend=args.parallel_backend,
+        executor_backend=args.executor_backend,
         use_supervised_guide=bool(args.use_supervised_guide),
         supervised_end_round_only=bool(args.supervised_end_round_only),
         preferred_device=args.device,
@@ -462,6 +463,7 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "continuous_max_iterations": "continuous_max_iterations",
         "workers": "workers",
         "parallel_backend": "parallel_backend",
+        "executor_backend": "executor_backend",
         "device": "preferred_device",
         "supervised_hidden_layers": "supervised_hidden_layers",
         "supervised_epochs": "supervised_epochs",
@@ -518,6 +520,10 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
     resolved["supervised_hidden_layers"] = _parse_hidden_layers_spec(
         resolved.get("supervised_hidden_layers")
     )
+    backend = str(resolved.get("executor_backend", "cpu")).strip().lower()
+    if backend not in {"auto", "cpu", "kompute", "kompute-sim"}:
+        backend = "cpu"
+    resolved["executor_backend"] = backend
     resolved["supervised_epochs"] = max(0, int(resolved.get("supervised_epochs", 0)))
     resolved["supervised_candidate_pool"] = max(0, int(resolved.get("supervised_candidate_pool", 0)))
     resolved["sync_loss_gate_percentile"] = _clamp_float(
@@ -580,6 +586,7 @@ def _apply_runtime_config(args: argparse.Namespace, resolved: Dict[str, Any]) ->
         "continuous_max_iterations",
         "workers",
         "parallel_backend",
+        "executor_backend",
         "device",
         "supervised_hidden_layers",
         "supervised_epochs",
@@ -653,6 +660,11 @@ def _print_effective_config(resolved: Dict[str, Any]) -> None:
             mf=float(resolved["mutation_floor"]),
             mc=float(resolved["mutation_ceiling"]),
             ms=float(resolved["mutation_step"]),
+        )
+    )
+    print(
+        "[pcpl-evolvo] executor backend={backend}".format(
+            backend=str(resolved["executor_backend"]),
         )
     )
     print(
@@ -858,10 +870,11 @@ def _print_summary(summary: Dict[str, Any]) -> None:
     if "resource_plan" in summary:
         plan = summary["resource_plan"]
         print(
-            "[pcpl-evolvo] resources backend={backend} workers={workers} gpu={gpu}".format(
+            "[pcpl-evolvo] resources backend={backend} workers={workers} gpu={gpu} exec={exec_backend}".format(
                 backend=plan.get("parallel_backend"),
                 workers=plan.get("parallel_workers"),
                 gpu=plan.get("gpu_backend"),
+                exec_backend=plan.get("executor_backend", "cpu"),
             )
         )
     if "index_path" in summary:
@@ -997,6 +1010,15 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "process", "thread", "off"),
         default=None,
         help="Parallel backend for fitness evaluation.",
+    )
+    parser.add_argument(
+        "--executor-backend",
+        choices=("auto", "cpu", "kompute", "kompute-sim"),
+        default=None,
+        help=(
+            "Execution backend for GFSL program evaluation. "
+            "`kompute-sim` runs Kompute compatibility/planning checks plus simulated execution."
+        ),
     )
     parser.add_argument(
         "--no-supervised-guide",

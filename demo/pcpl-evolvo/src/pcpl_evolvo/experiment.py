@@ -55,6 +55,7 @@ class ExperimentConfig:
     resume: bool = True
     parallel_workers: int = 0
     parallel_backend: str = "auto"  # auto|process|thread|off
+    executor_backend: str = "cpu"  # auto|cpu|kompute|kompute-sim
     use_supervised_guide: bool = True
     supervised_end_round_only: bool = True
     preferred_device: str = "auto"  # auto|cpu|cuda|rocm|mps
@@ -107,6 +108,52 @@ class ResourcePlan:
 
 def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, float(value)))
+
+
+_EVAL_EXECUTOR_KWARGS: Dict[str, Any] = {"compute_backend": "cpu"}
+
+
+def _normalize_executor_backend(backend: str) -> str:
+    backend_norm = str(backend).strip().lower()
+    if backend_norm not in {"auto", "cpu", "kompute", "kompute-sim"}:
+        return "cpu"
+    return backend_norm
+
+
+def _sanitize_eval_executor_kwargs(kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    raw = dict(kwargs or {})
+    backend = _normalize_executor_backend(str(raw.get("compute_backend", "cpu")))
+    sanitized: Dict[str, Any] = {"compute_backend": backend}
+    mode = raw.get("kompute_runtime_mode")
+    if mode is not None:
+        mode_norm = str(mode).strip().lower()
+        if mode_norm in {"native", "simulated", "auto"}:
+            sanitized["kompute_runtime_mode"] = mode_norm
+    for key in (
+        "kompute_warn_on_fallback",
+        "kompute_fail_hard",
+        "kompute_keep_vram_state",
+    ):
+        if key in raw:
+            sanitized[key] = bool(raw[key])
+    return sanitized
+
+
+def _set_eval_executor_kwargs(kwargs: Optional[Dict[str, Any]]) -> None:
+    global _EVAL_EXECUTOR_KWARGS
+    _EVAL_EXECUTOR_KWARGS = _sanitize_eval_executor_kwargs(kwargs)
+
+
+def _get_eval_executor_kwargs() -> Dict[str, Any]:
+    return dict(_EVAL_EXECUTOR_KWARGS)
+
+
+def _build_eval_executor_kwargs(config: ExperimentConfig) -> Dict[str, Any]:
+    backend = _normalize_executor_backend(config.executor_backend)
+    kwargs: Dict[str, Any] = {"compute_backend": backend}
+    if backend == "kompute-sim":
+        kwargs["kompute_runtime_mode"] = "simulated"
+    return kwargs
 
 
 MAX_DEFENDER_TOTAL_INSTRUCTIONS = 128
@@ -269,9 +316,15 @@ def _evaluate_with_timeout(
     attacker: Optional[GFSLGenome],
     timeout_seconds: float,
 ) -> Tuple[float, Sequence[Any]]:
+    runtime_executor_kwargs = _get_eval_executor_kwargs()
     timeout = max(0.0, float(timeout_seconds))
     if timeout <= 0.0 or not _can_use_eval_timeout():
-        return evaluate_across_scenarios(scenarios, genome, attacker=attacker)
+        return evaluate_across_scenarios(
+            scenarios,
+            genome,
+            attacker=attacker,
+            executor_kwargs=runtime_executor_kwargs,
+        )
 
     def _raise_timeout(signum, frame):  # type: ignore[no-untyped-def]
         _ = (signum, frame)
@@ -281,10 +334,31 @@ def _evaluate_with_timeout(
     try:
         signal.signal(signal.SIGALRM, _raise_timeout)
         signal.setitimer(signal.ITIMER_REAL, timeout)
-        return evaluate_across_scenarios(scenarios, genome, attacker=attacker)
+        return evaluate_across_scenarios(
+            scenarios,
+            genome,
+            attacker=attacker,
+            executor_kwargs=runtime_executor_kwargs,
+        )
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0.0)
         signal.signal(signal.SIGALRM, previous_handler)
+
+
+def _evaluate_across_scenarios_runtime(
+    scenarios: Sequence[ScenarioConfig],
+    genome: Optional[GFSLGenome],
+    *,
+    fixed_decision: Optional[PolicyDecision] = None,
+    attacker: Optional[GFSLGenome] = None,
+) -> Tuple[float, List[ScenarioMetrics]]:
+    return evaluate_across_scenarios(
+        scenarios,
+        genome,
+        fixed_decision=fixed_decision,
+        attacker=attacker,
+        executor_kwargs=_get_eval_executor_kwargs(),
+    )
 
 
 def _invalidate_genome_caches(genome: GFSLGenome) -> None:
@@ -857,8 +931,23 @@ def _process_pool_kwargs() -> Dict[str, Any]:
     return kwargs
 
 
-def _create_process_pool_executor(max_workers: int) -> concurrent.futures.ProcessPoolExecutor:
+def _process_pool_initializer(eval_executor_kwargs: Dict[str, Any]) -> None:
+    _set_eval_executor_kwargs(eval_executor_kwargs)
+
+
+def _create_process_pool_executor(
+    max_workers: int,
+    *,
+    eval_executor_kwargs: Optional[Dict[str, Any]] = None,
+) -> concurrent.futures.ProcessPoolExecutor:
     kwargs = _process_pool_kwargs()
+    init_kwargs = _sanitize_eval_executor_kwargs(
+        eval_executor_kwargs
+        if eval_executor_kwargs is not None
+        else _get_eval_executor_kwargs()
+    )
+    kwargs["initializer"] = _process_pool_initializer
+    kwargs["initargs"] = (init_kwargs,)
     return concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, **kwargs)
 
 
@@ -2287,6 +2376,7 @@ def _supervised_guide_state(
         "resource_gpu_backend": str(plan.gpu_backend),
         "resource_gpu_available": bool(plan.gpu_available),
         "resource_torch_available": bool(plan.torch_available),
+        "resource_executor_backend": _normalize_executor_backend(config.executor_backend),
     }
     if guide is None:
         return state
@@ -2300,11 +2390,18 @@ def _supervised_guide_state(
     return state
 
 
-def _create_shared_executor(plan: ResourcePlan) -> Optional[concurrent.futures.Executor]:
+def _create_shared_executor(
+    plan: ResourcePlan,
+    *,
+    eval_executor_kwargs: Optional[Dict[str, Any]] = None,
+) -> Optional[concurrent.futures.Executor]:
     if plan.parallel_backend == "off" or plan.parallel_workers <= 1:
         return None
     if plan.parallel_backend == "process":
-        return _create_process_pool_executor(max_workers=plan.parallel_workers)
+        return _create_process_pool_executor(
+            max_workers=plan.parallel_workers,
+            eval_executor_kwargs=eval_executor_kwargs,
+        )
     return concurrent.futures.ThreadPoolExecutor(max_workers=plan.parallel_workers)
 
 
@@ -3506,7 +3603,11 @@ def _baseline_rows(scenarios: Sequence[ScenarioConfig]) -> List[Dict[str, Any]]:
     ]
     rows: List[Dict[str, Any]] = []
     for name, policy in baselines:
-        score, metrics = evaluate_across_scenarios(scenarios, None, fixed_decision=policy)
+        score, metrics = _evaluate_across_scenarios_runtime(
+            scenarios,
+            None,
+            fixed_decision=policy,
+        )
         rows.append({
             "name": name,
             "mean_score": score,
@@ -3777,6 +3878,9 @@ def _write_view_outputs(
     conclusion_lines.append(f"- backend: `{resource_plan.parallel_backend}`")
     conclusion_lines.append(f"- workers: `{resource_plan.parallel_workers}`")
     conclusion_lines.append(f"- gpu backend: `{resource_plan.gpu_backend}`")
+    conclusion_lines.append(
+        f"- executor backend: `{_normalize_executor_backend(config.executor_backend)}`"
+    )
     conclusion_lines.append("")
     reference_baseline = _baseline_row_by_name(baseline_rows, name="reference-full")
     reference_metrics_rows: Sequence[Dict[str, Any]] = []
@@ -4016,7 +4120,11 @@ def _run_defender_round(
     def fitness(genome: GFSLGenome) -> float:
         ensure_genome_io(genome)
         full_scenarios = make_scenarios("full")
-        score, metrics = evaluate_across_scenarios(full_scenarios, genome, attacker=attacker)
+        score, metrics = _evaluate_across_scenarios_runtime(
+            full_scenarios,
+            genome,
+            attacker=attacker,
+        )
         genome._pcpl_metrics = metrics  # type: ignore[attr-defined]
         return score
 
@@ -4024,7 +4132,11 @@ def _run_defender_round(
         metrics = getattr(best, "_pcpl_metrics", None)
         if metrics is None:
             full_scenarios = make_scenarios("full")
-            _, metrics = evaluate_across_scenarios(full_scenarios, best, attacker=attacker)
+            _, metrics = _evaluate_across_scenarios_runtime(
+                full_scenarios,
+                best,
+                attacker=attacker,
+            )
             best._pcpl_metrics = metrics
         observed_batch_seconds = float(stage_stats.get("batch_seconds", 0.0))
         if observed_batch_seconds > 0.0:
@@ -4873,7 +4985,11 @@ def _run_attacker_round(
     def fitness(attacker: GFSLGenome) -> float:
         ensure_attacker_genome_io(attacker)
         full_scenarios = make_scenarios("full")
-        _, metrics = evaluate_across_scenarios(full_scenarios, defender, attacker=attacker)
+        _, metrics = _evaluate_across_scenarios_runtime(
+            full_scenarios,
+            defender,
+            attacker=attacker,
+        )
         attacker._attack_metrics = metrics  # type: ignore[attr-defined]
         attack_adv = _mean_metric(metrics, "attacker_advantage_score")
         lane_success = _mean_metric(metrics, "attacker_lane_success_rate")
@@ -4888,7 +5004,11 @@ def _run_attacker_round(
         metrics = getattr(best, "_attack_metrics", None)
         if metrics is None:
             full_scenarios = make_scenarios("full")
-            _, metrics = evaluate_across_scenarios(full_scenarios, defender, attacker=best)
+            _, metrics = _evaluate_across_scenarios_runtime(
+                full_scenarios,
+                defender,
+                attacker=best,
+            )
             best._attack_metrics = metrics
         observed_batch_seconds = float(stage_stats.get("batch_seconds", 0.0))
         if observed_batch_seconds > 0.0:
@@ -5599,6 +5719,8 @@ def run_continuous_experiment(
         config,
         max(config.population_size, config.attacker_population_size),
     )
+    eval_executor_kwargs = _build_eval_executor_kwargs(config)
+    _set_eval_executor_kwargs(eval_executor_kwargs)
 
     out_dir = Path(config.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -5611,12 +5733,13 @@ def run_continuous_experiment(
     baseline_rows = _baseline_rows(scenario_list)
 
     print(
-        "[pcpl-evolvo] resources cpu={cpu} backend={backend} workers={workers} gpu={gpu} torch={torch}".format(
+        "[pcpl-evolvo] resources cpu={cpu} backend={backend} workers={workers} gpu={gpu} torch={torch} exec={exec_backend}".format(
             cpu=resource_plan.cpu_count,
             backend=resource_plan.parallel_backend,
             workers=resource_plan.parallel_workers,
             gpu=resource_plan.gpu_backend,
             torch=resource_plan.torch_available,
+            exec_backend=str(eval_executor_kwargs.get("compute_backend", "cpu")),
         )
     )
     shared_executor: Optional[concurrent.futures.Executor] = None
@@ -5641,7 +5764,10 @@ def run_continuous_experiment(
                 current_attacker = None
 
         if resource_plan.parallel_backend != "off" and resource_plan.parallel_workers > 1:
-            shared_executor = _create_shared_executor(resource_plan)
+            shared_executor = _create_shared_executor(
+                resource_plan,
+                eval_executor_kwargs=eval_executor_kwargs,
+            )
 
         start_round = len(archive.get("rounds", []))
         for offset in range(max(1, config.rounds)):
@@ -5821,7 +5947,7 @@ def run_continuous_experiment(
 
             ranked_candidates.sort(key=lambda item: item[0], reverse=True)
             selected_robust_score, selected_defender, selected_score, selected_panel_worst_score, selected_panel_worst_adv = ranked_candidates[0]
-            _, selected_metrics = evaluate_across_scenarios(
+            _, selected_metrics = _evaluate_across_scenarios_runtime(
                 selection_scenarios,
                 selected_defender,
                 attacker=best_attacker,
@@ -5829,7 +5955,7 @@ def run_continuous_experiment(
 
             reference_defender = build_reference_defender_genome()
             ensure_genome_io(reference_defender)
-            reference_score, reference_metrics = evaluate_across_scenarios(
+            reference_score, reference_metrics = _evaluate_across_scenarios_runtime(
                 selection_scenarios,
                 reference_defender,
                 attacker=best_attacker,
@@ -6032,7 +6158,10 @@ def run_continuous_experiment(
                 **asdict(config),
                 "out_dir": str(out_dir),
             },
-            "resources": resource_plan.to_dict(),
+            "resources": {
+                **resource_plan.to_dict(),
+                "executor_backend": _normalize_executor_backend(config.executor_backend),
+            },
             "baselines": baseline_rows,
             "rounds_completed": len(archive.get("rounds", [])),
             "best_defender": archive.get("defender_elites", [])[:1],
@@ -6078,10 +6207,11 @@ def run_continuous_experiment(
             )
         )
         report_lines.append(
-            "- resources: backend={backend} workers={workers} gpu={gpu}".format(
+            "- resources: backend={backend} workers={workers} gpu={gpu} exec={exec_backend}".format(
                 backend=resource_plan.parallel_backend,
                 workers=resource_plan.parallel_workers,
                 gpu=resource_plan.gpu_backend,
+                exec_backend=_normalize_executor_backend(config.executor_backend),
             )
         )
         report_lines.append(
@@ -6313,7 +6443,10 @@ def run_continuous_experiment(
                 str(last_reference_signature) if str(last_reference_signature) else None
             ),
             "rounds_completed": len(archive.get("rounds", [])),
-            "resource_plan": resource_plan.to_dict(),
+            "resource_plan": {
+                **resource_plan.to_dict(),
+                "executor_backend": _normalize_executor_backend(config.executor_backend),
+            },
             "predictive_profile": predictive_profile,
             **view_paths,
         }
