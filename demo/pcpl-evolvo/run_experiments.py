@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import sys
 
 from config import (
@@ -69,6 +69,85 @@ def _detect_kompute_glsl_compiler() -> Optional[str]:
         if resolved:
             return resolved
     return None
+
+
+def _env_int(name: str) -> Optional[int]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid integer env {name}={raw!r}") from exc
+
+
+def _selftest_candidate_device_indices(kp_module: Any) -> List[int]:
+    configured = _env_int("EVOLVO_KOMPUTE_DEVICE_INDEX")
+    if configured is not None:
+        return [max(0, int(configured))]
+    try:
+        probe_manager = kp_module.Manager(0)
+        listed = probe_manager.list_devices()
+        if isinstance(listed, list) and listed:
+            return list(range(len(listed)))
+    except Exception:
+        pass
+    return [0, 1, 2, 3]
+
+
+def _selftest_candidate_queue_families() -> List[Optional[int]]:
+    configured = _env_int("EVOLVO_KOMPUTE_QUEUE_FAMILY")
+    if configured is not None:
+        return [max(0, int(configured))]
+    # Try the binding default first, then explicit queue family 0.
+    return [None, 0]
+
+
+def _probe_manager_sync(kp_module: Any, manager: Any) -> None:
+    import numpy as np
+
+    tensor = manager.tensor(np.array([1.0], dtype=np.float32))
+    sequence = manager.sequence()
+    sequence.record(kp_module.OpSyncDevice([tensor]))
+    sequence.record(kp_module.OpSyncLocal([tensor]))
+    sequence.eval()
+    _ = float(tensor.data()[0])
+
+
+def _create_selftest_manager(kp_module: Any) -> Tuple[Any, int, Optional[int], str]:
+    errors: List[str] = []
+    for device_index in _selftest_candidate_device_indices(kp_module):
+        for queue_family in _selftest_candidate_queue_families():
+            try:
+                if queue_family is None:
+                    manager = kp_module.Manager(int(device_index))
+                else:
+                    manager = kp_module.Manager(
+                        device=int(device_index),
+                        family_queue_indices=[int(queue_family)],
+                        desired_extensions=[],
+                    )
+                _probe_manager_sync(kp_module, manager)
+                props = manager.get_device_properties()
+                device_name = str(props.get("device_name", "unknown"))
+                return manager, int(device_index), queue_family, device_name
+            except Exception as exc:
+                errors.append(
+                    "device={device} queue_family={queue} -> {err}".format(
+                        device=int(device_index),
+                        queue=("default" if queue_family is None else int(queue_family)),
+                        err=str(exc),
+                    )
+                )
+    tail = "; ".join(errors[-4:]) if errors else "no attempts"
+    raise RuntimeError(
+        "unable to initialize Vulkan manager. "
+        "Set EVOLVO_KOMPUTE_DEVICE_INDEX and/or EVOLVO_KOMPUTE_QUEUE_FAMILY. "
+        f"recent attempts: {tail}"
+    )
 
 
 def _compile_kompute_selftest_spirv(compiler_path: str) -> bytes:
@@ -135,7 +214,15 @@ def _run_kompute_self_test() -> bool:
         return False
 
     try:
-        manager = kp.Manager()
+        manager, device_index, queue_family, device_name = _create_selftest_manager(kp)
+        queue_label = "default" if queue_family is None else str(int(queue_family))
+        print(
+            "[pcpl-evolvo][kompute-self-test] manager device_index={device} queue_family={queue} device_name={name}".format(
+                device=int(device_index),
+                queue=queue_label,
+                name=device_name,
+            )
+        )
         a = manager.tensor(np.array([1.5], dtype=np.float32))
         b = manager.tensor(np.array([2.0], dtype=np.float32))
         out = manager.tensor(np.array([0.0], dtype=np.float32))

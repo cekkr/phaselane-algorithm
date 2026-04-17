@@ -128,6 +128,13 @@ This performs:
 
 then exits immediately with status `0` on success (non-zero on failure).
 
+If default Vulkan device/queue selection fails on your host, override selection:
+
+```bash
+EVOLVO_KOMPUTE_DEVICE_INDEX=1 EVOLVO_KOMPUTE_QUEUE_FAMILY=0 \
+python3 demo/pcpl-evolvo/run_experiments.py --kompute-self-test
+```
+
 ### Continuous/resumable rounds
 
 ```bash
