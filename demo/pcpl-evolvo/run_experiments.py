@@ -520,9 +520,9 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
     resolved["supervised_hidden_layers"] = _parse_hidden_layers_spec(
         resolved.get("supervised_hidden_layers")
     )
-    backend = str(resolved.get("executor_backend", "cpu")).strip().lower()
+    backend = str(resolved.get("executor_backend", "auto")).strip().lower()
     if backend not in {"auto", "cpu", "kompute", "kompute-sim"}:
-        backend = "cpu"
+        backend = "auto"
     resolved["executor_backend"] = backend
     resolved["supervised_epochs"] = max(0, int(resolved.get("supervised_epochs", 0)))
     resolved["supervised_candidate_pool"] = max(0, int(resolved.get("supervised_candidate_pool", 0)))

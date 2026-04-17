@@ -113,7 +113,8 @@ python3 demo/pcpl-evolvo/run_experiments.py \
 ```
 
 This forces Kompute compatibility/planner checks and then runs simulated execution
-for compatible genomes (CPU-backed semantics). Native Vulkan Kompute dispatch is still pending.
+for compatible genomes (CPU-backed semantics). Native backend (`--executor-backend kompute`)
+dispatches supported scalar stages through Vulkan and transparently falls back to CPU for unsupported stages.
 
 ### Continuous/resumable rounds
 

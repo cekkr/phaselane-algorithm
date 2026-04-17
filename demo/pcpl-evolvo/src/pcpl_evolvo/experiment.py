@@ -55,7 +55,7 @@ class ExperimentConfig:
     resume: bool = True
     parallel_workers: int = 0
     parallel_backend: str = "auto"  # auto|process|thread|off
-    executor_backend: str = "cpu"  # auto|cpu|kompute|kompute-sim
+    executor_backend: str = "auto"  # auto|cpu|kompute|kompute-sim
     use_supervised_guide: bool = True
     supervised_end_round_only: bool = True
     preferred_device: str = "auto"  # auto|cpu|cuda|rocm|mps
@@ -110,19 +110,19 @@ def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, float(value)))
 
 
-_EVAL_EXECUTOR_KWARGS: Dict[str, Any] = {"compute_backend": "cpu"}
+_EVAL_EXECUTOR_KWARGS: Dict[str, Any] = {"compute_backend": "auto"}
 
 
 def _normalize_executor_backend(backend: str) -> str:
     backend_norm = str(backend).strip().lower()
     if backend_norm not in {"auto", "cpu", "kompute", "kompute-sim"}:
-        return "cpu"
+        return "auto"
     return backend_norm
 
 
 def _sanitize_eval_executor_kwargs(kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     raw = dict(kwargs or {})
-    backend = _normalize_executor_backend(str(raw.get("compute_backend", "cpu")))
+    backend = _normalize_executor_backend(str(raw.get("compute_backend", "auto")))
     sanitized: Dict[str, Any] = {"compute_backend": backend}
     mode = raw.get("kompute_runtime_mode")
     if mode is not None:
