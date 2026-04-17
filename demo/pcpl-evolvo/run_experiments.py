@@ -11,7 +11,9 @@ import json
 import multiprocessing
 import os
 import random
+import shutil
 import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -40,9 +42,173 @@ from pcpl_evolvo.experiment import ExperimentConfig, run_experiment
 
 DEFAULT_FITNESS_SCHEMA_VERSION = "auto"
 
+_KOMPUTE_SELFTEST_SHADER_SOURCE = """#version 450
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) buffer BufA { float a[]; };
+layout(binding = 1) buffer BufB { float b[]; };
+layout(binding = 2) buffer BufOut { float outv[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    outv[i] = a[i] + b[i];
+}
+"""
+
 
 def _safe_int(value: int, minimum: int = 1) -> int:
     return max(minimum, int(value))
+
+
+def _detect_kompute_glsl_compiler() -> Optional[str]:
+    env_path = os.environ.get("EVOLVO_GLSL_COMPILER", "").strip()
+    if env_path:
+        expanded = os.path.expanduser(env_path)
+        if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+            return expanded
+    for candidate in ("glslangValidator", "glslc"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def _compile_kompute_selftest_spirv(compiler_path: str) -> bytes:
+    compiler_name = os.path.basename(compiler_path)
+    with tempfile.TemporaryDirectory(prefix="pcpl-kompute-selftest-") as tmp_dir:
+        src_path = os.path.join(tmp_dir, "selftest.comp")
+        spv_path = os.path.join(tmp_dir, "selftest.spv")
+        with open(src_path, "w", encoding="utf-8") as handle:
+            handle.write(_KOMPUTE_SELFTEST_SHADER_SOURCE)
+        if compiler_name == "glslc":
+            cmd = [
+                compiler_path,
+                src_path,
+                "-o",
+                spv_path,
+                "-fshader-stage=compute",
+            ]
+        else:
+            cmd = [
+                compiler_path,
+                "-V",
+                "-S",
+                "comp",
+                src_path,
+                "-o",
+                spv_path,
+            ]
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or "").strip() or (proc.stdout or "").strip() or "unknown compiler error"
+            raise RuntimeError(f"GLSL->SPIR-V compilation failed: {detail}")
+        with open(spv_path, "rb") as handle:
+            return handle.read()
+
+
+def _run_kompute_self_test() -> bool:
+    print("[pcpl-evolvo][kompute-self-test] starting")
+    try:
+        import numpy as np
+        import kp  # type: ignore
+    except Exception as exc:
+        print(f"[pcpl-evolvo][kompute-self-test] FAILED: cannot import kp/numpy ({exc})")
+        return False
+
+    compiler_path = _detect_kompute_glsl_compiler()
+    if not compiler_path:
+        print(
+            "[pcpl-evolvo][kompute-self-test] FAILED: no GLSL compiler found "
+            "(`glslangValidator` or `glslc`)."
+        )
+        return False
+
+    kp_version = getattr(kp, "__version__", "unknown")
+    print(f"[pcpl-evolvo][kompute-self-test] kp={kp_version} compiler={compiler_path}")
+    try:
+        spirv = _compile_kompute_selftest_spirv(compiler_path)
+    except Exception as exc:
+        print(f"[pcpl-evolvo][kompute-self-test] FAILED: shader compile error ({exc})")
+        return False
+
+    try:
+        manager = kp.Manager()
+        a = manager.tensor(np.array([1.5], dtype=np.float32))
+        b = manager.tensor(np.array([2.0], dtype=np.float32))
+        out = manager.tensor(np.array([0.0], dtype=np.float32))
+        algorithm = manager.algorithm([a, b, out], spirv, [1, 1, 1], [], [])
+        sequence = manager.sequence()
+        sequence.record(kp.OpSyncDevice([a, b, out]))
+        sequence.record(kp.OpAlgoDispatch(algorithm))
+        sequence.record(kp.OpSyncLocal([out]))
+        sequence.eval()
+        native_out = float(out.data()[0])
+        if abs(native_out - 3.5) > 1e-5:
+            raise RuntimeError(f"unexpected raw kp result {native_out:.8f} (expected 3.5)")
+        print(
+            "[pcpl-evolvo][kompute-self-test] raw-kp-dispatch=ok result={:.6f}".format(
+                native_out
+            )
+        )
+    except Exception as exc:
+        print(f"[pcpl-evolvo][kompute-self-test] FAILED: raw kp dispatch failed ({exc})")
+        return False
+
+    try:
+        from pcpl_evolvo.bootstrap import ensure_evolvo_importable
+
+        ensure_evolvo_importable()
+        from evolvo import (
+            Category,
+            DataType,
+            GFSLExecutor,
+            GFSLGenome,
+            GFSLInstruction,
+            Operation,
+            pack_type_index,
+        )
+
+        instruction = GFSLInstruction(
+            [
+                int(Category.VARIABLE),
+                pack_type_index(DataType.DECIMAL, 0),
+                int(Operation.ADD),
+                int(Category.VARIABLE),
+                pack_type_index(DataType.DECIMAL, 1),
+                int(Category.VARIABLE),
+                pack_type_index(DataType.DECIMAL, 2),
+            ]
+        )
+        genome = GFSLGenome()
+        genome.instructions = [instruction]
+        genome.outputs = [(Category.VARIABLE, DataType.DECIMAL, 0)]
+        executor = GFSLExecutor(
+            compute_backend="kompute",
+            kompute_runtime_mode="native",
+            kompute_fail_hard=True,
+            kompute_warn_on_fallback=True,
+        )
+        outputs = executor.execute(
+            genome,
+            inputs={"d$1": 4.0, "d$2": 5.0},
+        )
+        result = float(outputs.get("d$0", 0.0))
+        if abs(result - 9.0) > 1e-5:
+            raise RuntimeError(f"unexpected GFSL native result {result:.8f} (expected 9.0)")
+        print(
+            "[pcpl-evolvo][kompute-self-test] evolvo-native=ok result={:.6f}".format(
+                result
+            )
+        )
+    except Exception as exc:
+        print(f"[pcpl-evolvo][kompute-self-test] FAILED: evolvo native check failed ({exc})")
+        return False
+
+    print("[pcpl-evolvo][kompute-self-test] PASSED")
+    return True
 
 
 def _param_choices(base: int, *, minimum: int = 1, high_factor: float = 1.5) -> List[int]:
@@ -909,6 +1075,13 @@ def parse_args() -> argparse.Namespace:
         help="Print resolved config (mode + profile + CLI overrides) before run.",
     )
     parser.add_argument(
+        "--kompute-self-test",
+        action="store_true",
+        help=(
+            "Run a fast native Kompute smoke test (raw kp dispatch + evolvo native executor) and exit."
+        ),
+    )
+    parser.add_argument(
         "--profile",
         choices=("fast", "full"),
         default=DEFAULT_PROFILE,
@@ -1288,6 +1461,11 @@ def main() -> None:
         print("[pcpl-evolvo] available modes:")
         for name in available_modes():
             print(f"- {name}: {mode_summary(name)}")
+        return
+    if args.kompute_self_test:
+        success = _run_kompute_self_test()
+        if not success:
+            raise SystemExit(2)
         return
 
     resolved = _resolve_runtime_config(args)

@@ -116,6 +116,18 @@ This forces Kompute compatibility/planner checks and then runs simulated executi
 for compatible genomes (CPU-backed semantics). Native backend (`--executor-backend kompute`)
 dispatches supported scalar stages through Vulkan and transparently falls back to CPU for unsupported stages.
 
+### Quick native Kompute self-test (recommended before long runs)
+
+```bash
+python3 demo/pcpl-evolvo/run_experiments.py --kompute-self-test
+```
+
+This performs:
+- a raw `kp` Vulkan dispatch test (simple add shader), and
+- an `evolvo` native executor test (`compute_backend=kompute`, `execution_mode=native`),
+
+then exits immediately with status `0` on success (non-zero on failure).
+
 ### Continuous/resumable rounds
 
 ```bash
