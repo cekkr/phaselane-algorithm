@@ -56,6 +56,20 @@ class ExperimentConfig:
     parallel_workers: int = 0
     parallel_backend: str = "auto"  # auto|process|thread|off
     executor_backend: str = "auto"  # auto|cpu|kompute|kompute-sim
+    kompute_runtime_mode: str = "native"  # native|simulated|auto
+    kompute_warn_on_fallback: bool = True
+    kompute_fail_hard: bool = False
+    kompute_keep_vram_state: bool = True
+    kompute_min_native_stage_count: int = 1
+    kompute_min_native_stage_share: float = 0.0
+    kompute_max_unsupported_share: float = 1.0
+    kompute_max_unsupported_count: int = -1
+    kompute_force_cpu_on_partial_coverage: bool = False
+    kompute_native_enable_decimal: bool = True
+    kompute_native_enable_boolean_compare: bool = True
+    kompute_native_enable_boolean_logic: bool = True
+    kompute_native_enable_list_query: bool = True
+    kompute_allow_process_pool: bool = False
     use_supervised_guide: bool = True
     supervised_end_round_only: bool = True
     preferred_device: str = "auto"  # auto|cpu|cuda|rocm|mps
@@ -138,9 +152,42 @@ def _sanitize_eval_executor_kwargs(kwargs: Optional[Dict[str, Any]]) -> Dict[str
         "kompute_warn_on_fallback",
         "kompute_fail_hard",
         "kompute_keep_vram_state",
+        "kompute_force_cpu_on_partial_coverage",
+        "kompute_native_enable_decimal",
+        "kompute_native_enable_boolean_compare",
+        "kompute_native_enable_boolean_logic",
+        "kompute_native_enable_list_query",
     ):
         if key in raw:
             sanitized[key] = bool(raw[key])
+    if "kompute_min_native_stage_count" in raw:
+        try:
+            sanitized["kompute_min_native_stage_count"] = max(
+                0,
+                int(raw["kompute_min_native_stage_count"]),
+            )
+        except Exception:
+            pass
+    if "kompute_max_unsupported_count" in raw:
+        try:
+            sanitized["kompute_max_unsupported_count"] = max(
+                -1,
+                int(raw["kompute_max_unsupported_count"]),
+            )
+        except Exception:
+            pass
+    if "kompute_min_native_stage_share" in raw:
+        try:
+            value = float(raw["kompute_min_native_stage_share"])
+            sanitized["kompute_min_native_stage_share"] = max(0.0, min(1.0, value))
+        except Exception:
+            pass
+    if "kompute_max_unsupported_share" in raw:
+        try:
+            value = float(raw["kompute_max_unsupported_share"])
+            sanitized["kompute_max_unsupported_share"] = max(0.0, min(1.0, value))
+        except Exception:
+            pass
     return sanitized
 
 
@@ -161,7 +208,45 @@ def _set_debug_eval_runtime_settings(*, timeout_seconds: float, log_interval_sec
 
 def _build_eval_executor_kwargs(config: ExperimentConfig) -> Dict[str, Any]:
     backend = _normalize_executor_backend(config.executor_backend)
-    kwargs: Dict[str, Any] = {"compute_backend": backend}
+    runtime_mode = str(config.kompute_runtime_mode).strip().lower()
+    if runtime_mode not in {"native", "simulated", "auto"}:
+        runtime_mode = "native"
+    kwargs: Dict[str, Any] = {
+        "compute_backend": backend,
+        "kompute_runtime_mode": runtime_mode,
+        "kompute_warn_on_fallback": bool(config.kompute_warn_on_fallback),
+        "kompute_fail_hard": bool(config.kompute_fail_hard),
+        "kompute_keep_vram_state": bool(config.kompute_keep_vram_state),
+        "kompute_min_native_stage_count": max(
+            0,
+            int(config.kompute_min_native_stage_count),
+        ),
+        "kompute_min_native_stage_share": max(
+            0.0,
+            min(1.0, float(config.kompute_min_native_stage_share)),
+        ),
+        "kompute_max_unsupported_share": max(
+            0.0,
+            min(1.0, float(config.kompute_max_unsupported_share)),
+        ),
+        "kompute_max_unsupported_count": max(
+            -1,
+            int(config.kompute_max_unsupported_count),
+        ),
+        "kompute_force_cpu_on_partial_coverage": bool(
+            config.kompute_force_cpu_on_partial_coverage
+        ),
+        "kompute_native_enable_decimal": bool(config.kompute_native_enable_decimal),
+        "kompute_native_enable_boolean_compare": bool(
+            config.kompute_native_enable_boolean_compare
+        ),
+        "kompute_native_enable_boolean_logic": bool(
+            config.kompute_native_enable_boolean_logic
+        ),
+        "kompute_native_enable_list_query": bool(
+            config.kompute_native_enable_list_query
+        ),
+    }
     if backend == "kompute-sim":
         kwargs["kompute_runtime_mode"] = "simulated"
     return kwargs
@@ -911,9 +996,10 @@ def _resolve_resource_plan(config: ExperimentConfig, max_population: int) -> Res
         resolved_backend = "thread"
 
     executor_backend = _normalize_executor_backend(config.executor_backend)
-    allow_kompute_process_pool = str(
-        os.environ.get("EVOLVO_KOMPUTE_ALLOW_PROCESS_POOL", "")
-    ).strip().lower() in {"1", "true", "yes", "on"}
+    allow_kompute_process_pool = bool(config.kompute_allow_process_pool) or (
+        str(os.environ.get("EVOLVO_KOMPUTE_ALLOW_PROCESS_POOL", "")).strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
     if (
         executor_backend in {"kompute", "kompute-sim"}
         and resolved_backend == "process"

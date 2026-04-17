@@ -938,6 +938,24 @@ def _build_experiment_config(
         parallel_workers=workers,
         parallel_backend=args.parallel_backend,
         executor_backend=args.executor_backend,
+        kompute_runtime_mode=args.kompute_runtime_mode,
+        kompute_warn_on_fallback=bool(args.kompute_warn_on_fallback),
+        kompute_fail_hard=bool(args.kompute_fail_hard),
+        kompute_keep_vram_state=bool(args.kompute_keep_vram_state),
+        kompute_min_native_stage_count=int(args.kompute_min_native_stage_count),
+        kompute_min_native_stage_share=float(args.kompute_min_native_stage_share),
+        kompute_max_unsupported_count=int(args.kompute_max_unsupported_count),
+        kompute_max_unsupported_share=float(args.kompute_max_unsupported_share),
+        kompute_force_cpu_on_partial_coverage=bool(
+            args.kompute_force_cpu_on_partial_coverage
+        ),
+        kompute_native_enable_decimal=bool(args.kompute_native_enable_decimal),
+        kompute_native_enable_boolean_compare=bool(
+            args.kompute_native_enable_boolean_compare
+        ),
+        kompute_native_enable_boolean_logic=bool(args.kompute_native_enable_boolean_logic),
+        kompute_native_enable_list_query=bool(args.kompute_native_enable_list_query),
+        kompute_allow_process_pool=bool(args.kompute_allow_process_pool),
         use_supervised_guide=bool(args.use_supervised_guide),
         supervised_end_round_only=bool(args.supervised_end_round_only),
         preferred_device=args.device,
@@ -1093,6 +1111,20 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "workers": "workers",
         "parallel_backend": "parallel_backend",
         "executor_backend": "executor_backend",
+        "kompute_runtime_mode": "kompute_runtime_mode",
+        "kompute_warn_on_fallback": "kompute_warn_on_fallback",
+        "kompute_fail_hard": "kompute_fail_hard",
+        "kompute_keep_vram_state": "kompute_keep_vram_state",
+        "kompute_min_native_stage_count": "kompute_min_native_stage_count",
+        "kompute_min_native_stage_share": "kompute_min_native_stage_share",
+        "kompute_max_unsupported_count": "kompute_max_unsupported_count",
+        "kompute_max_unsupported_share": "kompute_max_unsupported_share",
+        "kompute_force_cpu_on_partial_coverage": "kompute_force_cpu_on_partial_coverage",
+        "kompute_native_enable_decimal": "kompute_native_enable_decimal",
+        "kompute_native_enable_boolean_compare": "kompute_native_enable_boolean_compare",
+        "kompute_native_enable_boolean_logic": "kompute_native_enable_boolean_logic",
+        "kompute_native_enable_list_query": "kompute_native_enable_list_query",
+        "kompute_allow_process_pool": "kompute_allow_process_pool",
         "device": "preferred_device",
         "supervised_hidden_layers": "supervised_hidden_layers",
         "supervised_epochs": "supervised_epochs",
@@ -1153,6 +1185,57 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
     if backend not in {"auto", "cpu", "kompute", "kompute-sim"}:
         backend = "auto"
     resolved["executor_backend"] = backend
+    kompute_runtime_mode = str(
+        resolved.get("kompute_runtime_mode", "native")
+    ).strip().lower()
+    if kompute_runtime_mode not in {"native", "simulated", "auto"}:
+        kompute_runtime_mode = "native"
+    resolved["kompute_runtime_mode"] = kompute_runtime_mode
+    resolved["kompute_warn_on_fallback"] = bool(
+        resolved.get("kompute_warn_on_fallback", True)
+    )
+    resolved["kompute_fail_hard"] = bool(
+        resolved.get("kompute_fail_hard", False)
+    )
+    resolved["kompute_keep_vram_state"] = bool(
+        resolved.get("kompute_keep_vram_state", True)
+    )
+    resolved["kompute_min_native_stage_count"] = max(
+        0,
+        int(resolved.get("kompute_min_native_stage_count", 1)),
+    )
+    resolved["kompute_min_native_stage_share"] = _clamp_float(
+        float(resolved.get("kompute_min_native_stage_share", 0.0)),
+        0.0,
+        1.0,
+    )
+    resolved["kompute_max_unsupported_count"] = max(
+        -1,
+        int(resolved.get("kompute_max_unsupported_count", -1)),
+    )
+    resolved["kompute_max_unsupported_share"] = _clamp_float(
+        float(resolved.get("kompute_max_unsupported_share", 1.0)),
+        0.0,
+        1.0,
+    )
+    resolved["kompute_force_cpu_on_partial_coverage"] = bool(
+        resolved.get("kompute_force_cpu_on_partial_coverage", False)
+    )
+    resolved["kompute_native_enable_decimal"] = bool(
+        resolved.get("kompute_native_enable_decimal", True)
+    )
+    resolved["kompute_native_enable_boolean_compare"] = bool(
+        resolved.get("kompute_native_enable_boolean_compare", True)
+    )
+    resolved["kompute_native_enable_boolean_logic"] = bool(
+        resolved.get("kompute_native_enable_boolean_logic", True)
+    )
+    resolved["kompute_native_enable_list_query"] = bool(
+        resolved.get("kompute_native_enable_list_query", True)
+    )
+    resolved["kompute_allow_process_pool"] = bool(
+        resolved.get("kompute_allow_process_pool", False)
+    )
     resolved["supervised_epochs"] = max(0, int(resolved.get("supervised_epochs", 0)))
     resolved["supervised_candidate_pool"] = max(0, int(resolved.get("supervised_candidate_pool", 0)))
     resolved["sync_loss_gate_percentile"] = _clamp_float(
@@ -1224,6 +1307,20 @@ def _apply_runtime_config(args: argparse.Namespace, resolved: Dict[str, Any]) ->
         "workers",
         "parallel_backend",
         "executor_backend",
+        "kompute_runtime_mode",
+        "kompute_warn_on_fallback",
+        "kompute_fail_hard",
+        "kompute_keep_vram_state",
+        "kompute_min_native_stage_count",
+        "kompute_min_native_stage_share",
+        "kompute_max_unsupported_count",
+        "kompute_max_unsupported_share",
+        "kompute_force_cpu_on_partial_coverage",
+        "kompute_native_enable_decimal",
+        "kompute_native_enable_boolean_compare",
+        "kompute_native_enable_boolean_logic",
+        "kompute_native_enable_list_query",
+        "kompute_allow_process_pool",
         "device",
         "supervised_hidden_layers",
         "supervised_epochs",
@@ -1304,6 +1401,27 @@ def _print_effective_config(resolved: Dict[str, Any]) -> None:
     print(
         "[pcpl-evolvo] executor backend={backend}".format(
             backend=str(resolved["executor_backend"]),
+        )
+    )
+    print(
+        "[pcpl-evolvo] kompute mode={mode} keep_vram={keep_vram} warn={warn} fail_hard={fail_hard} "
+        "policy(min_stage={min_stage}, min_share={min_share:.2f}, max_unsup={max_unsup}, max_unsup_share={max_unsup_share:.2f}, force_cpu_partial={force_cpu_partial}) "
+        "native_families(decimal={decimal}, bool_cmp={bool_cmp}, bool_logic={bool_logic}, list_query={list_query}) "
+        "process_pool_allowed={pool_allowed}".format(
+            mode=str(resolved["kompute_runtime_mode"]),
+            keep_vram=bool(resolved["kompute_keep_vram_state"]),
+            warn=bool(resolved["kompute_warn_on_fallback"]),
+            fail_hard=bool(resolved["kompute_fail_hard"]),
+            min_stage=int(resolved["kompute_min_native_stage_count"]),
+            min_share=float(resolved["kompute_min_native_stage_share"]),
+            max_unsup=int(resolved["kompute_max_unsupported_count"]),
+            max_unsup_share=float(resolved["kompute_max_unsupported_share"]),
+            force_cpu_partial=bool(resolved["kompute_force_cpu_on_partial_coverage"]),
+            decimal=bool(resolved["kompute_native_enable_decimal"]),
+            bool_cmp=bool(resolved["kompute_native_enable_boolean_compare"]),
+            bool_logic=bool(resolved["kompute_native_enable_boolean_logic"]),
+            list_query=bool(resolved["kompute_native_enable_list_query"]),
+            pool_allowed=bool(resolved["kompute_allow_process_pool"]),
         )
     )
     print(
@@ -1681,6 +1799,162 @@ def parse_args() -> argparse.Namespace:
             "Execution backend for GFSL program evaluation. "
             "`kompute-sim` runs Kompute compatibility/planning checks plus simulated execution."
         ),
+    )
+    parser.add_argument(
+        "--kompute-runtime-mode",
+        choices=("native", "simulated", "auto"),
+        default=None,
+        help="Kompute runtime mode for `kompute` backend.",
+    )
+    parser.add_argument(
+        "--kompute-min-native-stage-count",
+        type=int,
+        default=None,
+        help="Minimum native GPU stage count required before allowing Kompute hybrid execution.",
+    )
+    parser.add_argument(
+        "--kompute-min-native-stage-share",
+        type=float,
+        default=None,
+        help="Minimum native stage share (0..1) required before allowing Kompute hybrid execution.",
+    )
+    parser.add_argument(
+        "--kompute-max-unsupported-count",
+        type=int,
+        default=None,
+        help="Maximum unsupported stage count allowed in Kompute hybrid mode (-1 disables check).",
+    )
+    parser.add_argument(
+        "--kompute-max-unsupported-share",
+        type=float,
+        default=None,
+        help="Maximum unsupported stage share (0..1) allowed in Kompute hybrid mode.",
+    )
+    kompute_warn_group = parser.add_mutually_exclusive_group()
+    kompute_warn_group.add_argument(
+        "--kompute-warn-on-fallback",
+        dest="kompute_warn_on_fallback",
+        action="store_true",
+        default=None,
+        help="Enable Kompute fallback warnings.",
+    )
+    kompute_warn_group.add_argument(
+        "--no-kompute-warn-on-fallback",
+        dest="kompute_warn_on_fallback",
+        action="store_false",
+        help="Disable Kompute fallback warnings.",
+    )
+    kompute_fail_group = parser.add_mutually_exclusive_group()
+    kompute_fail_group.add_argument(
+        "--kompute-fail-hard",
+        dest="kompute_fail_hard",
+        action="store_true",
+        default=None,
+        help="Fail immediately when Kompute initialization/execution cannot proceed.",
+    )
+    kompute_fail_group.add_argument(
+        "--no-kompute-fail-hard",
+        dest="kompute_fail_hard",
+        action="store_false",
+        help="Allow CPU fallback when Kompute cannot proceed.",
+    )
+    kompute_vram_group = parser.add_mutually_exclusive_group()
+    kompute_vram_group.add_argument(
+        "--kompute-keep-vram-state",
+        dest="kompute_keep_vram_state",
+        action="store_true",
+        default=None,
+        help="Keep VRAM-backed state between Kompute stages when possible.",
+    )
+    kompute_vram_group.add_argument(
+        "--no-kompute-keep-vram-state",
+        dest="kompute_keep_vram_state",
+        action="store_false",
+        help="Disable persistent VRAM state for Kompute stages.",
+    )
+    kompute_partial_group = parser.add_mutually_exclusive_group()
+    kompute_partial_group.add_argument(
+        "--kompute-force-cpu-on-partial-coverage",
+        dest="kompute_force_cpu_on_partial_coverage",
+        action="store_true",
+        default=None,
+        help="Force CPU execution whenever Kompute compatibility reports unsupported stages.",
+    )
+    kompute_partial_group.add_argument(
+        "--no-kompute-force-cpu-on-partial-coverage",
+        dest="kompute_force_cpu_on_partial_coverage",
+        action="store_false",
+        help="Allow hybrid Kompute+CPU execution on partial coverage.",
+    )
+    kompute_native_decimal_group = parser.add_mutually_exclusive_group()
+    kompute_native_decimal_group.add_argument(
+        "--kompute-native-enable-decimal",
+        dest="kompute_native_enable_decimal",
+        action="store_true",
+        default=None,
+        help="Enable native Kompute decimal shader family.",
+    )
+    kompute_native_decimal_group.add_argument(
+        "--no-kompute-native-enable-decimal",
+        dest="kompute_native_enable_decimal",
+        action="store_false",
+        help="Disable native Kompute decimal shader family (force CPU fallback).",
+    )
+    kompute_native_bool_cmp_group = parser.add_mutually_exclusive_group()
+    kompute_native_bool_cmp_group.add_argument(
+        "--kompute-native-enable-boolean-compare",
+        dest="kompute_native_enable_boolean_compare",
+        action="store_true",
+        default=None,
+        help="Enable native Kompute boolean-compare shader family.",
+    )
+    kompute_native_bool_cmp_group.add_argument(
+        "--no-kompute-native-enable-boolean-compare",
+        dest="kompute_native_enable_boolean_compare",
+        action="store_false",
+        help="Disable native Kompute boolean-compare shader family (force CPU fallback).",
+    )
+    kompute_native_bool_logic_group = parser.add_mutually_exclusive_group()
+    kompute_native_bool_logic_group.add_argument(
+        "--kompute-native-enable-boolean-logic",
+        dest="kompute_native_enable_boolean_logic",
+        action="store_true",
+        default=None,
+        help="Enable native Kompute boolean-logic shader family.",
+    )
+    kompute_native_bool_logic_group.add_argument(
+        "--no-kompute-native-enable-boolean-logic",
+        dest="kompute_native_enable_boolean_logic",
+        action="store_false",
+        help="Disable native Kompute boolean-logic shader family (force CPU fallback).",
+    )
+    kompute_native_list_query_group = parser.add_mutually_exclusive_group()
+    kompute_native_list_query_group.add_argument(
+        "--kompute-native-enable-list-query",
+        dest="kompute_native_enable_list_query",
+        action="store_true",
+        default=None,
+        help="Enable native Kompute list-query shader family.",
+    )
+    kompute_native_list_query_group.add_argument(
+        "--no-kompute-native-enable-list-query",
+        dest="kompute_native_enable_list_query",
+        action="store_false",
+        help="Disable native Kompute list-query shader family (force CPU fallback).",
+    )
+    kompute_pool_group = parser.add_mutually_exclusive_group()
+    kompute_pool_group.add_argument(
+        "--kompute-allow-process-pool",
+        dest="kompute_allow_process_pool",
+        action="store_true",
+        default=None,
+        help="Allow process-pool backend in Kompute mode (advanced; may be unstable).",
+    )
+    kompute_pool_group.add_argument(
+        "--no-kompute-allow-process-pool",
+        dest="kompute_allow_process_pool",
+        action="store_false",
+        help="Auto-downgrade process-pool to threads in Kompute mode.",
     )
     parser.add_argument(
         "--no-supervised-guide",

@@ -241,6 +241,10 @@ PowerShell:
 - `--executor-backend {auto,cpu,kompute,kompute-sim}` (GFSL executor path for scenario evaluation)
 - `--kompute-check-libs` (Vulkan/Kompute dependency doctor and manager init probe)
 - `--kompute-self-test` (fast raw `kp` + evolvo native dispatch smoke test)
+- `--kompute-native-enable-decimal/--no-kompute-native-enable-decimal`
+- `--kompute-native-enable-boolean-compare/--no-kompute-native-enable-boolean-compare`
+- `--kompute-native-enable-boolean-logic/--no-kompute-native-enable-boolean-logic`
+- `--kompute-native-enable-list-query/--no-kompute-native-enable-list-query`
 - `--debug-eval-timeout-seconds` (debug-only stall watchdog: emit timeout diagnostics if parallel eval makes no completion for N seconds)
 - `--debug-eval-log-interval-seconds` (debug-only heartbeat logs during long parallel eval phases)
 - `--no-supervised-guide`

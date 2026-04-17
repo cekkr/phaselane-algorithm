@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from settings import ACCELERATION_DEFAULTS
+
 
 DEFAULT_PROFILE = "full"
 DEFAULT_MODE = "paper"
@@ -26,7 +28,49 @@ BASE_DEFAULTS: Dict[str, Any] = {
     "continuous_max_iterations": 0,
     "workers": 0,
     "parallel_backend": "process",
-    "executor_backend": "auto",
+    "executor_backend": str(ACCELERATION_DEFAULTS.get("executor_backend", "auto")),
+    "kompute_runtime_mode": str(
+        ACCELERATION_DEFAULTS.get("kompute_runtime_mode", "native")
+    ),
+    "kompute_warn_on_fallback": bool(
+        ACCELERATION_DEFAULTS.get("kompute_warn_on_fallback", True)
+    ),
+    "kompute_fail_hard": bool(
+        ACCELERATION_DEFAULTS.get("kompute_fail_hard", False)
+    ),
+    "kompute_keep_vram_state": bool(
+        ACCELERATION_DEFAULTS.get("kompute_keep_vram_state", True)
+    ),
+    "kompute_min_native_stage_count": int(
+        ACCELERATION_DEFAULTS.get("kompute_min_native_stage_count", 1)
+    ),
+    "kompute_min_native_stage_share": float(
+        ACCELERATION_DEFAULTS.get("kompute_min_native_stage_share", 0.0)
+    ),
+    "kompute_max_unsupported_count": int(
+        ACCELERATION_DEFAULTS.get("kompute_max_unsupported_count", -1)
+    ),
+    "kompute_max_unsupported_share": float(
+        ACCELERATION_DEFAULTS.get("kompute_max_unsupported_share", 1.0)
+    ),
+    "kompute_force_cpu_on_partial_coverage": bool(
+        ACCELERATION_DEFAULTS.get("kompute_force_cpu_on_partial_coverage", False)
+    ),
+    "kompute_native_enable_decimal": bool(
+        ACCELERATION_DEFAULTS.get("kompute_native_enable_decimal", True)
+    ),
+    "kompute_native_enable_boolean_compare": bool(
+        ACCELERATION_DEFAULTS.get("kompute_native_enable_boolean_compare", True)
+    ),
+    "kompute_native_enable_boolean_logic": bool(
+        ACCELERATION_DEFAULTS.get("kompute_native_enable_boolean_logic", True)
+    ),
+    "kompute_native_enable_list_query": bool(
+        ACCELERATION_DEFAULTS.get("kompute_native_enable_list_query", True)
+    ),
+    "kompute_allow_process_pool": bool(
+        ACCELERATION_DEFAULTS.get("kompute_allow_process_pool", False)
+    ),
     "preferred_device": "auto",
     "parent_pool_ratio": 0.50,
     "stagnation_patience": 2,
