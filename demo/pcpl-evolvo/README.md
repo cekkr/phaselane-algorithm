@@ -116,6 +116,20 @@ This forces Kompute compatibility/planner checks and then runs simulated executi
 for compatible genomes (CPU-backed semantics). Native backend (`--executor-backend kompute`)
 dispatches supported scalar stages through Vulkan and transparently falls back to CPU for unsupported stages.
 
+### Vulkan / Kompute dependency doctor
+
+```bash
+python3 demo/pcpl-evolvo/run_experiments.py --kompute-check-libs
+```
+
+This checks:
+- Vulkan loader (`libvulkan.so.1`)
+- ICD JSON files and their driver `library_path` targets
+- `vulkaninfo --summary` execution
+- `kp` import + Vulkan manager initialization
+
+Exit code is `0` on pass and non-zero on failure.
+
 ### Quick native Kompute self-test (recommended before long runs)
 
 ```bash
@@ -204,6 +218,8 @@ PowerShell:
 - `--no-resume` (start fresh even if archive exists)
 - `--parallel-backend {auto,process,thread,off}`, `--workers` (`0` = all CPUs)
 - `--executor-backend {auto,cpu,kompute,kompute-sim}` (GFSL executor path for scenario evaluation)
+- `--kompute-check-libs` (Vulkan/Kompute dependency doctor and manager init probe)
+- `--kompute-self-test` (fast raw `kp` + evolvo native dispatch smoke test)
 - `--no-supervised-guide`
 - `--supervised-end-round-only`, `--no-supervised-end-round-only`
 - `--device {auto,cpu,cuda,rocm,mps}` (for optional supervised guide acceleration)

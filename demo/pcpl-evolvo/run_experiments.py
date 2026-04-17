@@ -145,7 +145,7 @@ def _create_selftest_manager(kp_module: Any) -> Tuple[Any, int, Optional[int], s
     tail = "; ".join(errors[-4:]) if errors else "no attempts"
     raise RuntimeError(
         "unable to initialize Vulkan manager. "
-        "Set EVOLVO_KOMPUTE_DEVICE_INDEX and/or EVOLVO_KOMPUTE_QUEUE_FAMILY. "
+        "Run `--kompute-check-libs` and set EVOLVO_KOMPUTE_DEVICE_INDEX and/or EVOLVO_KOMPUTE_QUEUE_FAMILY. "
         f"recent attempts: {tail}"
     )
 
@@ -296,6 +296,290 @@ def _run_kompute_self_test() -> bool:
 
     print("[pcpl-evolvo][kompute-self-test] PASSED")
     return True
+
+
+def _run_cmd_capture(
+    cmd: List[str],
+    *,
+    timeout_seconds: float = 20.0,
+) -> Tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=max(1.0, float(timeout_seconds)),
+        )
+        return int(proc.returncode), str(proc.stdout or ""), str(proc.stderr or "")
+    except subprocess.TimeoutExpired as exc:
+        stdout = str(getattr(exc, "stdout", "") or "")
+        stderr = str(getattr(exc, "stderr", "") or "")
+        return 124, stdout, stderr
+    except Exception as exc:
+        return 127, "", str(exc)
+
+
+def _truncate_lines(text: str, *, max_lines: int = 12) -> str:
+    lines = [line.rstrip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    if len(lines) <= int(max_lines):
+        return "\n".join(lines)
+    head = lines[: int(max_lines)]
+    return "\n".join(head + [f"... ({len(lines) - int(max_lines)} more lines)"])
+
+
+def _read_os_release() -> Dict[str, str]:
+    path = Path("/etc/os-release")
+    if not path.exists():
+        return {}
+    parsed: Dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        parsed[str(key).strip()] = str(value).strip().strip('"')
+    return parsed
+
+
+def _ldconfig_library_map() -> Dict[str, List[str]]:
+    ldconfig_path = shutil.which("ldconfig")
+    if not ldconfig_path:
+        return {}
+    rc, stdout, _stderr = _run_cmd_capture([ldconfig_path, "-p"], timeout_seconds=8.0)
+    if rc != 0:
+        return {}
+    libs: Dict[str, List[str]] = {}
+    for line in stdout.splitlines():
+        if "=>" not in line:
+            continue
+        left, right = line.split("=>", 1)
+        name = left.strip().split(" ", 1)[0]
+        target = right.strip()
+        if not name or not target:
+            continue
+        libs.setdefault(name, []).append(target)
+    return libs
+
+
+def _collect_vulkan_icd_files() -> List[Path]:
+    directories = [
+        Path("/etc/vulkan/icd.d"),
+        Path("/usr/share/vulkan/icd.d"),
+        Path("/usr/local/share/vulkan/icd.d"),
+    ]
+    found: List[Path] = []
+    seen = set()
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        for entry in sorted(directory.glob("*.json")):
+            resolved = entry.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            found.append(resolved)
+    return found
+
+
+def _icd_library_path_from_json(path: Path) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"invalid json ({exc})"
+    if not isinstance(payload, dict):
+        return None, "json root is not an object"
+    candidate: Optional[str] = None
+    icd_section = payload.get("ICD")
+    if isinstance(icd_section, dict):
+        maybe = icd_section.get("library_path")
+        if isinstance(maybe, str) and maybe.strip():
+            candidate = maybe.strip()
+    if not candidate:
+        maybe = payload.get("library_path")
+        if isinstance(maybe, str) and maybe.strip():
+            candidate = maybe.strip()
+    if not candidate:
+        return None, "missing `library_path`"
+    return candidate, None
+
+
+def _icd_library_exists(
+    lib_path: str,
+    *,
+    icd_file: Path,
+    ld_map: Dict[str, List[str]],
+) -> bool:
+    candidate = str(lib_path).strip()
+    if not candidate:
+        return False
+    if os.path.isabs(candidate):
+        return Path(candidate).exists()
+    if "/" in candidate:
+        joined = (icd_file.parent / candidate).resolve()
+        if joined.exists():
+            return True
+    basename = os.path.basename(candidate)
+    mapped = ld_map.get(basename, [])
+    for item in mapped:
+        if Path(item).exists():
+            return True
+    return False
+
+
+def _run_kompute_library_check() -> bool:
+    print("[pcpl-evolvo][kompute-check-libs] starting")
+    ok = True
+    linux_mode = sys.platform.startswith("linux")
+
+    os_release = _read_os_release()
+    distro = os_release.get("PRETTY_NAME") or os_release.get("NAME") or "unknown"
+    kernel = ""
+    try:
+        kernel = os.uname().release  # type: ignore[attr-defined]
+    except Exception:
+        kernel = "unknown"
+    print(
+        "[pcpl-evolvo][kompute-check-libs] host platform={platform} distro={distro} kernel={kernel}".format(
+            platform=sys.platform,
+            distro=distro,
+            kernel=kernel,
+        )
+    )
+
+    loader_map: Dict[str, List[str]] = {}
+    if linux_mode:
+        loader_map = _ldconfig_library_map()
+        loader_paths = loader_map.get("libvulkan.so.1", [])
+        if loader_paths:
+            print(
+                "[pcpl-evolvo][kompute-check-libs] vulkan-loader=ok count={count} sample={sample}".format(
+                    count=len(loader_paths),
+                    sample=loader_paths[0],
+                )
+            )
+        else:
+            ok = False
+            print(
+                "[pcpl-evolvo][kompute-check-libs] vulkan-loader=MISSING "
+                "(libvulkan.so.1 not found in ldconfig cache)."
+            )
+
+        icd_files = _collect_vulkan_icd_files()
+        if not icd_files:
+            ok = False
+            print(
+                "[pcpl-evolvo][kompute-check-libs] icd-json=MISSING "
+                "(no files in /etc|/usr/share|/usr/local/share vulkan icd.d)"
+            )
+        else:
+            print(f"[pcpl-evolvo][kompute-check-libs] icd-json count={len(icd_files)}")
+            for icd_file in icd_files:
+                lib_path, err = _icd_library_path_from_json(icd_file)
+                if err:
+                    ok = False
+                    print(f"[pcpl-evolvo][kompute-check-libs] icd INVALID {icd_file}: {err}")
+                    continue
+                assert lib_path is not None
+                exists = _icd_library_exists(lib_path, icd_file=icd_file, ld_map=loader_map)
+                if exists:
+                    print(f"[pcpl-evolvo][kompute-check-libs] icd OK {icd_file.name} -> {lib_path}")
+                else:
+                    ok = False
+                    print(
+                        f"[pcpl-evolvo][kompute-check-libs] icd BROKEN {icd_file.name} -> {lib_path} "
+                        "(library not found)"
+                    )
+    else:
+        print(
+            "[pcpl-evolvo][kompute-check-libs] non-linux host: skipping ldconfig/icd filesystem checks."
+        )
+
+    vk_icd_filenames = os.environ.get("VK_ICD_FILENAMES", "").strip()
+    if vk_icd_filenames:
+        missing: List[str] = []
+        entries = [item.strip() for item in vk_icd_filenames.split(":") if item.strip()]
+        for item in entries:
+            if not Path(item).exists():
+                missing.append(item)
+        if missing:
+            ok = False
+            print(
+                "[pcpl-evolvo][kompute-check-libs] env VK_ICD_FILENAMES invalid entries={missing}".format(
+                    missing=",".join(missing)
+                )
+            )
+        else:
+            print(
+                "[pcpl-evolvo][kompute-check-libs] env VK_ICD_FILENAMES=ok entries={count}".format(
+                    count=len(entries)
+                )
+            )
+    else:
+        print("[pcpl-evolvo][kompute-check-libs] env VK_ICD_FILENAMES not set (using loader defaults)")
+
+    vulkaninfo_path = shutil.which("vulkaninfo")
+    if vulkaninfo_path:
+        rc, stdout, stderr = _run_cmd_capture(
+            [vulkaninfo_path, "--summary"],
+            timeout_seconds=25.0,
+        )
+        if rc == 0:
+            print("[pcpl-evolvo][kompute-check-libs] vulkaninfo=ok")
+        else:
+            ok = False
+            merged = "\n".join([stdout, stderr]).strip()
+            print(
+                "[pcpl-evolvo][kompute-check-libs] vulkaninfo=FAILED rc={rc}\n{snippet}".format(
+                    rc=rc,
+                    snippet=_truncate_lines(merged, max_lines=14),
+                )
+            )
+            if "Invalid instance" in merged:
+                print(
+                    "[pcpl-evolvo][kompute-check-libs] hint: Vulkan loader created an invalid instance. "
+                    "Check ICD jsons and try forcing a known-good driver with VK_ICD_FILENAMES."
+                )
+    else:
+        print("[pcpl-evolvo][kompute-check-libs] vulkaninfo not found (optional but recommended)")
+
+    try:
+        import kp  # type: ignore
+    except Exception as exc:
+        ok = False
+        print(f"[pcpl-evolvo][kompute-check-libs] kp-import=FAILED ({exc})")
+    else:
+        try:
+            _manager, device_index, queue_family, device_name = _create_selftest_manager(kp)
+            queue_label = "default" if queue_family is None else str(int(queue_family))
+            print(
+                "[pcpl-evolvo][kompute-check-libs] kp-manager=ok device_index={device} queue_family={queue} device_name={name}".format(
+                    device=int(device_index),
+                    queue=queue_label,
+                    name=device_name,
+                )
+            )
+        except Exception as exc:
+            ok = False
+            text = str(exc)
+            print(f"[pcpl-evolvo][kompute-check-libs] kp-manager=FAILED ({text})")
+            if "Invalid instance" in text:
+                print(
+                    "[pcpl-evolvo][kompute-check-libs] hint: this usually means broken Vulkan loader/ICD setup."
+                )
+
+    if ok:
+        print("[pcpl-evolvo][kompute-check-libs] PASSED")
+        return True
+
+    print("[pcpl-evolvo][kompute-check-libs] FAILED")
+    print(
+        "[pcpl-evolvo][kompute-check-libs] next: verify Vulkan packages/ICD jsons, then run "
+        "`python run_experiments.py --kompute-self-test`."
+    )
+    return False
 
 
 def _param_choices(base: int, *, minimum: int = 1, high_factor: float = 1.5) -> List[int]:
@@ -1162,6 +1446,13 @@ def parse_args() -> argparse.Namespace:
         help="Print resolved config (mode + profile + CLI overrides) before run.",
     )
     parser.add_argument(
+        "--kompute-check-libs",
+        action="store_true",
+        help=(
+            "Run Vulkan/Kompute dependency diagnostics (loader, ICDs, vulkaninfo, kp manager init) and exit."
+        ),
+    )
+    parser.add_argument(
         "--kompute-self-test",
         action="store_true",
         help=(
@@ -1549,6 +1840,12 @@ def main() -> None:
         for name in available_modes():
             print(f"- {name}: {mode_summary(name)}")
         return
+    if args.kompute_check_libs:
+        check_ok = _run_kompute_library_check()
+        if not check_ok:
+            raise SystemExit(2)
+        if not args.kompute_self_test:
+            return
     if args.kompute_self_test:
         success = _run_kompute_self_test()
         if not success:
