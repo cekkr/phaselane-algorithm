@@ -126,7 +126,7 @@ This checks:
 - Vulkan loader (`libvulkan.so.1`)
 - ICD JSON files and their driver `library_path` targets
 - `vulkaninfo --summary` execution
-- `kp` import + Vulkan manager initialization
+- `kp` import + API mode detection (`explicit-sync` vs `shared-memory`) + Vulkan manager initialization
 
 Exit code is `0` on pass and non-zero on failure.
 
@@ -141,6 +141,9 @@ This performs:
 - an `evolvo` native executor test (`compute_backend=kompute`, `execution_mode=native`),
 
 then exits immediately with status `0` on success (non-zero on failure).
+It supports both `kp` API variants:
+- `explicit-sync` (`OpSyncDevice`/`OpSyncLocal` available)
+- `shared-memory` (older/minimal bindings without those ops)
 
 If default Vulkan device/queue selection fails on your host, override selection:
 

@@ -106,14 +106,43 @@ def _selftest_candidate_queue_families() -> List[Optional[int]]:
     return [None, 0]
 
 
+def _kp_sync_ops(kp_module: Any) -> Tuple[Optional[Any], Optional[Any]]:
+    return getattr(kp_module, "OpSyncDevice", None), getattr(kp_module, "OpSyncLocal", None)
+
+
+def _kp_shared_memory_type(kp_module: Any) -> Optional[Any]:
+    memory_types = getattr(kp_module, "MemoryTypes", None)
+    if memory_types is not None and hasattr(memory_types, "deviceAndHost"):
+        return memory_types.deviceAndHost
+    if memory_types is not None and hasattr(memory_types, "host"):
+        return memory_types.host
+    if hasattr(kp_module, "deviceAndHost"):
+        return getattr(kp_module, "deviceAndHost")
+    if hasattr(kp_module, "host"):
+        return getattr(kp_module, "host")
+    return None
+
+
 def _probe_manager_sync(kp_module: Any, manager: Any) -> None:
     import numpy as np
 
-    tensor = manager.tensor(np.array([1.0], dtype=np.float32))
-    sequence = manager.sequence()
-    sequence.record(kp_module.OpSyncDevice([tensor]))
-    sequence.record(kp_module.OpSyncLocal([tensor]))
-    sequence.eval()
+    sync_device_op, sync_local_op = _kp_sync_ops(kp_module)
+    if sync_device_op is not None and sync_local_op is not None:
+        tensor = manager.tensor(np.array([1.0], dtype=np.float32))
+        sequence = manager.sequence()
+        sequence.record(sync_device_op([tensor]))
+        sequence.record(sync_local_op([tensor]))
+        sequence.eval()
+        _ = float(tensor.data()[0])
+        return
+
+    shared_memory_type = _kp_shared_memory_type(kp_module)
+    if shared_memory_type is None:
+        # Minimal queue probe if sync operations are not exposed in this kp build.
+        manager.sequence().eval()
+        return
+    tensor = manager.tensor(np.array([1.0], dtype=np.float32), shared_memory_type)
+    manager.sequence().eval()
     _ = float(tensor.data()[0])
 
 
@@ -216,21 +245,38 @@ def _run_kompute_self_test() -> bool:
     try:
         manager, device_index, queue_family, device_name = _create_selftest_manager(kp)
         queue_label = "default" if queue_family is None else str(int(queue_family))
+        sync_device_op, sync_local_op = _kp_sync_ops(kp)
+        use_explicit_sync = bool(sync_device_op is not None and sync_local_op is not None)
+        tensor_memory_type = _kp_shared_memory_type(kp) if not use_explicit_sync else None
+        api_mode = "explicit-sync" if use_explicit_sync else "shared-memory"
+        if not use_explicit_sync and tensor_memory_type is None:
+            raise RuntimeError(
+                "kp build has no OpSyncDevice/OpSyncLocal and no shared memory type; "
+                "cannot run raw dispatch self-test."
+            )
         print(
-            "[pcpl-evolvo][kompute-self-test] manager device_index={device} queue_family={queue} device_name={name}".format(
+            "[pcpl-evolvo][kompute-self-test] manager device_index={device} queue_family={queue} device_name={name} api_mode={mode}".format(
                 device=int(device_index),
                 queue=queue_label,
                 name=device_name,
+                mode=api_mode,
             )
         )
-        a = manager.tensor(np.array([1.5], dtype=np.float32))
-        b = manager.tensor(np.array([2.0], dtype=np.float32))
-        out = manager.tensor(np.array([0.0], dtype=np.float32))
+        if use_explicit_sync:
+            a = manager.tensor(np.array([1.5], dtype=np.float32))
+            b = manager.tensor(np.array([2.0], dtype=np.float32))
+            out = manager.tensor(np.array([0.0], dtype=np.float32))
+        else:
+            a = manager.tensor(np.array([1.5], dtype=np.float32), tensor_memory_type)
+            b = manager.tensor(np.array([2.0], dtype=np.float32), tensor_memory_type)
+            out = manager.tensor(np.array([0.0], dtype=np.float32), tensor_memory_type)
         algorithm = manager.algorithm([a, b, out], spirv, [1, 1, 1], [], [])
         sequence = manager.sequence()
-        sequence.record(kp.OpSyncDevice([a, b, out]))
+        if use_explicit_sync:
+            sequence.record(sync_device_op([a, b, out]))  # type: ignore[misc]
         sequence.record(kp.OpAlgoDispatch(algorithm))
-        sequence.record(kp.OpSyncLocal([out]))
+        if use_explicit_sync:
+            sequence.record(sync_local_op([out]))  # type: ignore[misc]
         sequence.eval()
         native_out = float(out.data()[0])
         if abs(native_out - 3.5) > 1e-5:
@@ -551,6 +597,25 @@ def _run_kompute_library_check() -> bool:
         ok = False
         print(f"[pcpl-evolvo][kompute-check-libs] kp-import=FAILED ({exc})")
     else:
+        sync_device_op, sync_local_op = _kp_sync_ops(kp)
+        shared_memory_type = _kp_shared_memory_type(kp)
+        api_mode = (
+            "explicit-sync"
+            if (sync_device_op is not None and sync_local_op is not None)
+            else (
+                "shared-memory"
+                if shared_memory_type is not None
+                else "unsupported"
+            )
+        )
+        print(
+            "[pcpl-evolvo][kompute-check-libs] kp-api mode={mode} has_sync_device={has_sd} has_sync_local={has_sl} has_shared_memory={has_sm}".format(
+                mode=api_mode,
+                has_sd=bool(sync_device_op is not None),
+                has_sl=bool(sync_local_op is not None),
+                has_sm=bool(shared_memory_type is not None),
+            )
+        )
         try:
             _manager, device_index, queue_family, device_name = _create_selftest_manager(kp)
             queue_label = "default" if queue_family is None else str(int(queue_family))
