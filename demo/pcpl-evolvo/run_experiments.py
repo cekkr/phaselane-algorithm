@@ -84,6 +84,21 @@ def _env_int(name: str) -> Optional[int]:
         raise RuntimeError(f"Invalid integer env {name}={raw!r}") from exc
 
 
+def _vulkan_device_sort_key(index: int, descriptor: Any) -> Tuple[int, int, int]:
+    name = ""
+    if isinstance(descriptor, dict):
+        name = str(descriptor.get("device_name", ""))
+    elif descriptor is not None:
+        name = str(descriptor)
+    name_lc = name.strip().lower()
+    is_software = any(
+        token in name_lc for token in ("llvmpipe", "lavapipe", "swiftshader", "software")
+    )
+    looks_amd = any(token in name_lc for token in ("amd", "radeon", "navi", "gfx"))
+    # Prefer hardware accelerators over software ICDs; among hardware devices, favor AMD names.
+    return (1 if is_software else 0, 0 if looks_amd else 1, int(index))
+
+
 def _selftest_candidate_device_indices(kp_module: Any) -> List[int]:
     configured = _env_int("EVOLVO_KOMPUTE_DEVICE_INDEX")
     if configured is not None:
@@ -92,7 +107,11 @@ def _selftest_candidate_device_indices(kp_module: Any) -> List[int]:
         probe_manager = kp_module.Manager(0)
         listed = probe_manager.list_devices()
         if isinstance(listed, list) and listed:
-            return list(range(len(listed)))
+            ranked = sorted(
+                list(enumerate(listed)),
+                key=lambda item: _vulkan_device_sort_key(int(item[0]), item[1]),
+            )
+            return [int(idx) for idx, _item in ranked]
     except Exception:
         pass
     return [0, 1, 2, 3]
@@ -107,7 +126,13 @@ def _selftest_candidate_queue_families() -> List[Optional[int]]:
 
 
 def _kp_sync_ops(kp_module: Any) -> Tuple[Optional[Any], Optional[Any]]:
-    return getattr(kp_module, "OpSyncDevice", None), getattr(kp_module, "OpSyncLocal", None)
+    sync_device = getattr(kp_module, "OpSyncDevice", None)
+    sync_local = getattr(kp_module, "OpSyncLocal", None)
+    if sync_device is None:
+        sync_device = getattr(kp_module, "OpTensorSyncDevice", None)
+    if sync_local is None:
+        sync_local = getattr(kp_module, "OpTensorSyncLocal", None)
+    return sync_device, sync_local
 
 
 def _kp_shared_memory_type(kp_module: Any) -> Optional[Any]:
@@ -138,11 +163,10 @@ def _probe_manager_sync(kp_module: Any, manager: Any) -> None:
 
     shared_memory_type = _kp_shared_memory_type(kp_module)
     if shared_memory_type is None:
-        # Minimal queue probe if sync operations are not exposed in this kp build.
-        manager.sequence().eval()
+        # No sync API and no shared tensors: manager creation itself is the best lightweight probe.
         return
     tensor = manager.tensor(np.array([1.0], dtype=np.float32), shared_memory_type)
-    manager.sequence().eval()
+    # Avoid empty sequence eval() here: on some AMD Vulkan stacks this can stall indefinitely.
     _ = float(tensor.data()[0])
 
 
@@ -251,7 +275,8 @@ def _run_kompute_self_test() -> bool:
         api_mode = "explicit-sync" if use_explicit_sync else "shared-memory"
         if not use_explicit_sync and tensor_memory_type is None:
             raise RuntimeError(
-                "kp build has no OpSyncDevice/OpSyncLocal and no shared memory type; "
+                "kp build has no sync ops (OpSyncDevice/OpSyncLocal or "
+                "OpTensorSyncDevice/OpTensorSyncLocal) and no shared memory type; "
                 "cannot run raw dispatch self-test."
             )
         print(
@@ -987,6 +1012,8 @@ def _build_experiment_config(
         device_mhz=args.device_mhz,
         provider_mhz=args.provider_mhz,
         max_test_time_seconds=args.max_test_seconds,
+        debug_eval_timeout_seconds=float(args.debug_eval_timeout_seconds),
+        debug_eval_log_interval_seconds=float(args.debug_eval_log_interval_seconds),
     )
 
 
@@ -1161,6 +1188,14 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         0.0,
         float(resolved.get("attacker_panel_penalty", 0.16)),
     )
+    resolved["debug_eval_timeout_seconds"] = max(
+        0.0,
+        float(getattr(args, "debug_eval_timeout_seconds", 0.0)),
+    )
+    resolved["debug_eval_log_interval_seconds"] = max(
+        0.0,
+        float(getattr(args, "debug_eval_log_interval_seconds", 0.0)),
+    )
     resolved["statistical_predictive"] = bool(defaults["statistical_predictive"]) and not bool(
         args.no_statistical_predictive
     )
@@ -1213,6 +1248,8 @@ def _apply_runtime_config(args: argparse.Namespace, resolved: Dict[str, Any]) ->
         "anti_neutrality_bonus",
         "attacker_panel_size",
         "attacker_panel_penalty",
+        "debug_eval_timeout_seconds",
+        "debug_eval_log_interval_seconds",
         "target_generation_seconds",
         "max_eval_cache_entries",
         "device_mhz",
@@ -1329,6 +1366,15 @@ def _print_effective_config(resolved: Dict[str, Any]) -> None:
             cache=int(resolved["max_eval_cache_entries"]),
         )
     )
+    debug_timeout = float(resolved.get("debug_eval_timeout_seconds", 0.0))
+    debug_interval = float(resolved.get("debug_eval_log_interval_seconds", 0.0))
+    if debug_timeout > 0.0 or debug_interval > 0.0:
+        print(
+            "[pcpl-evolvo] debug eval monitor timeout_s={timeout:.1f} log_interval_s={interval:.1f}".format(
+                timeout=debug_timeout,
+                interval=debug_interval,
+            )
+        )
     if "fitness_schema_version" in resolved:
         print(
             "[pcpl-evolvo] conclusions fitness_schema={schema} analysis_tag={tag} replicates={reps} replicate_ref={rep_ref}".format(
@@ -1839,6 +1885,24 @@ def parse_args() -> argparse.Namespace:
         help="Per-round dedup cache capacity for reuse of evaluated genome signatures.",
     )
     parser.add_argument(
+        "--debug-eval-timeout-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Debug-only stall timeout watchdog for parallel evaluators. "
+            "When > 0, prints timeout diagnostics if no task completes for this duration."
+        ),
+    )
+    parser.add_argument(
+        "--debug-eval-log-interval-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Debug-only heartbeat interval for parallel evaluator progress logs. "
+            "0 disables heartbeat logs."
+        ),
+    )
+    parser.add_argument(
         "--device-mhz",
         type=float,
         default=None,
@@ -1946,6 +2010,10 @@ def main() -> None:
         raise ValueError("--attacker-panel-size must be >= 1")
     if float(args.attacker_panel_penalty) < 0.0:
         raise ValueError("--attacker-panel-penalty must be >= 0")
+    if float(args.debug_eval_timeout_seconds) < 0.0:
+        raise ValueError("--debug-eval-timeout-seconds must be >= 0")
+    if float(args.debug_eval_log_interval_seconds) < 0.0:
+        raise ValueError("--debug-eval-log-interval-seconds must be >= 0")
     resolved["fitness_schema_version"] = str(args.fitness_schema_version)
     resolved["analysis_tag"] = str(args.analysis_tag or "")
     resolved["replicates"] = int(args.replicates)

@@ -115,6 +115,9 @@ python3 demo/pcpl-evolvo/run_experiments.py \
 This forces Kompute compatibility/planner checks and then runs simulated execution
 for compatible genomes (CPU-backed semantics). Native backend (`--executor-backend kompute`)
 dispatches supported scalar stages through Vulkan and transparently falls back to CPU for unsupported stages.
+When Kompute is enabled, process-pool evaluation is auto-switched to thread mode by default
+to avoid Vulkan instability with forked workers; set `EVOLVO_KOMPUTE_ALLOW_PROCESS_POOL=1`
+only if you explicitly want to keep process workers.
 
 ### Vulkan / Kompute dependency doctor
 
@@ -142,7 +145,7 @@ This performs:
 
 then exits immediately with status `0` on success (non-zero on failure).
 It supports both `kp` API variants:
-- `explicit-sync` (`OpSyncDevice`/`OpSyncLocal` available)
+- `explicit-sync` (`OpSyncDevice`/`OpSyncLocal` or `OpTensorSyncDevice`/`OpTensorSyncLocal` available)
 - `shared-memory` (older/minimal bindings without those ops)
 
 If default Vulkan device/queue selection fails on your host, override selection:
@@ -151,6 +154,21 @@ If default Vulkan device/queue selection fails on your host, override selection:
 EVOLVO_KOMPUTE_DEVICE_INDEX=1 EVOLVO_KOMPUTE_QUEUE_FAMILY=0 \
 python3 demo/pcpl-evolvo/run_experiments.py --kompute-self-test
 ```
+
+### Debug watchdog/heartbeat for long evaluator phases
+
+```bash
+python3 demo/pcpl-evolvo/run_experiments.py \
+  --profile fast \
+  --mode dynamic \
+  --rounds 1 \
+  --executor-backend kompute \
+  --debug-eval-timeout-seconds 30 \
+  --debug-eval-log-interval-seconds 10
+```
+
+These debug-only flags add periodic evaluator progress logs and emit timeout diagnostics
+when no parallel task completion is observed for the timeout window.
 
 ### Continuous/resumable rounds
 
@@ -223,6 +241,8 @@ PowerShell:
 - `--executor-backend {auto,cpu,kompute,kompute-sim}` (GFSL executor path for scenario evaluation)
 - `--kompute-check-libs` (Vulkan/Kompute dependency doctor and manager init probe)
 - `--kompute-self-test` (fast raw `kp` + evolvo native dispatch smoke test)
+- `--debug-eval-timeout-seconds` (debug-only stall watchdog: emit timeout diagnostics if parallel eval makes no completion for N seconds)
+- `--debug-eval-log-interval-seconds` (debug-only heartbeat logs during long parallel eval phases)
 - `--no-supervised-guide`
 - `--supervised-end-round-only`, `--no-supervised-end-round-only`
 - `--device {auto,cpu,cuda,rocm,mps}` (for optional supervised guide acceleration)

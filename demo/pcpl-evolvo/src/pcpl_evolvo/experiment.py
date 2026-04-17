@@ -90,6 +90,9 @@ class ExperimentConfig:
     anti_neutrality_bonus: float = 0.015
     attacker_panel_size: int = 3
     attacker_panel_penalty: float = 0.16
+    # Debug-only evaluator observability controls (disabled by default).
+    debug_eval_timeout_seconds: float = 0.0
+    debug_eval_log_interval_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -111,6 +114,8 @@ def clamp(value: float, lower: float, upper: float) -> float:
 
 
 _EVAL_EXECUTOR_KWARGS: Dict[str, Any] = {"compute_backend": "auto"}
+_DEBUG_EVAL_TIMEOUT_SECONDS: float = 0.0
+_DEBUG_EVAL_LOG_INTERVAL_SECONDS: float = 0.0
 
 
 def _normalize_executor_backend(backend: str) -> str:
@@ -146,6 +151,12 @@ def _set_eval_executor_kwargs(kwargs: Optional[Dict[str, Any]]) -> None:
 
 def _get_eval_executor_kwargs() -> Dict[str, Any]:
     return dict(_EVAL_EXECUTOR_KWARGS)
+
+
+def _set_debug_eval_runtime_settings(*, timeout_seconds: float, log_interval_seconds: float) -> None:
+    global _DEBUG_EVAL_TIMEOUT_SECONDS, _DEBUG_EVAL_LOG_INTERVAL_SECONDS
+    _DEBUG_EVAL_TIMEOUT_SECONDS = max(0.0, float(timeout_seconds))
+    _DEBUG_EVAL_LOG_INTERVAL_SECONDS = max(0.0, float(log_interval_seconds))
 
 
 def _build_eval_executor_kwargs(config: ExperimentConfig) -> Dict[str, Any]:
@@ -898,6 +909,19 @@ def _resolve_resource_plan(config: ExperimentConfig, max_population: int) -> Res
     if platform.system().lower().startswith("win") and resolved_backend == "process":
         # Keep behavior predictable on macOS/Linux request, but avoid fragile forks elsewhere.
         resolved_backend = "thread"
+
+    executor_backend = _normalize_executor_backend(config.executor_backend)
+    allow_kompute_process_pool = str(
+        os.environ.get("EVOLVO_KOMPUTE_ALLOW_PROCESS_POOL", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if (
+        executor_backend in {"kompute", "kompute-sim"}
+        and resolved_backend == "process"
+        and not allow_kompute_process_pool
+    ):
+        # Vulkan drivers can become unstable under heavy process forking; prefer threads here.
+        resolved_backend = "thread"
+        workers = max(1, min(workers, 8))
 
     gpu_backend, gpu_available, torch_available = _detect_gpu_backend(config.preferred_device)
     return ResourcePlan(
@@ -2862,6 +2886,132 @@ def _evaluate_pending_parallel(
     else:
         map_chunk_size = max(1, len(tasks) // max(1, workers * 2))
 
+    debug_timeout_seconds = max(0.0, float(_DEBUG_EVAL_TIMEOUT_SECONDS))
+    debug_log_interval_seconds = max(0.0, float(_DEBUG_EVAL_LOG_INTERVAL_SECONDS))
+    debug_monitor_enabled = bool(
+        debug_timeout_seconds > 0.0 or debug_log_interval_seconds > 0.0
+    )
+    stage_counts: Dict[str, int] = {}
+    if worker_fn in {_defender_eval_worker, _attacker_eval_worker}:
+        for task in tasks:
+            stage_name = _task_eval_stage(task)
+            stage_counts[stage_name] = stage_counts.get(stage_name, 0) + 1
+    stage_summary = (
+        ",".join(f"{name}:{count}" for name, count in sorted(stage_counts.items()))
+        if stage_counts
+        else "n/a"
+    )
+
+    def run_with_debug_monitor(
+        exec_obj: concurrent.futures.Executor,
+        fn,
+        task_list,
+    ):
+        total = len(task_list)
+        if total <= 0:
+            return []
+        pending_futures: Dict[concurrent.futures.Future, Tuple[int, float]] = {}
+        ordered_results: List[Optional[Tuple[float, List[Dict[str, Any]]]]] = [None] * total
+        start_ts = time.perf_counter()
+        last_completion_ts = start_ts
+        next_log_ts = (
+            start_ts + debug_log_interval_seconds
+            if debug_log_interval_seconds > 0.0
+            else float("inf")
+        )
+        next_timeout_ts = (
+            start_ts + debug_timeout_seconds
+            if debug_timeout_seconds > 0.0
+            else float("inf")
+        )
+        worker_label = str(getattr(fn, "__name__", "worker"))
+        backend_label = (
+            "process"
+            if isinstance(exec_obj, concurrent.futures.ProcessPoolExecutor)
+            else "thread"
+        )
+        for task_idx, task in enumerate(task_list):
+            future = exec_obj.submit(fn, task)
+            pending_futures[future] = (int(task_idx), time.perf_counter())
+
+        completed = 0
+        while pending_futures:
+            done, _ = concurrent.futures.wait(
+                tuple(pending_futures.keys()),
+                timeout=max(0.05, float(PROCESS_EVAL_WATCHDOG_POLL_SECONDS)),
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            now = time.perf_counter()
+
+            for future in done:
+                idx, _submitted_ts = pending_futures.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    raise RuntimeError(
+                        "parallel evaluator worker failed "
+                        f"(worker={worker_label}, backend={backend_label}, task_index={idx})"
+                    ) from exc
+                ordered_results[idx] = result
+                completed += 1
+                last_completion_ts = now
+
+            if debug_log_interval_seconds > 0.0 and now >= next_log_ts:
+                oldest_age = (
+                    max(
+                        (now - submitted_ts)
+                        for _future, (_idx, submitted_ts) in pending_futures.items()
+                    )
+                    if pending_futures
+                    else 0.0
+                )
+                print(
+                    "[pcpl-evolvo][debug][eval] worker={worker} backend={backend} stage={stage} done={done}/{total} in_flight={in_flight} elapsed={elapsed:.1f}s oldest={oldest:.1f}s".format(
+                        worker=worker_label,
+                        backend=backend_label,
+                        stage=stage_summary,
+                        done=int(completed),
+                        total=int(total),
+                        in_flight=int(len(pending_futures)),
+                        elapsed=float(now - start_ts),
+                        oldest=float(oldest_age),
+                    )
+                )
+                next_log_ts = now + debug_log_interval_seconds
+
+            if debug_timeout_seconds > 0.0 and now >= next_timeout_ts and pending_futures:
+                no_completion = now - last_completion_ts
+                if no_completion >= debug_timeout_seconds:
+                    oldest_age = max(
+                        (now - submitted_ts)
+                        for _future, (_idx, submitted_ts) in pending_futures.items()
+                    )
+                    print(
+                        "[pcpl-evolvo][debug][timeout] worker={worker} backend={backend} stage={stage} no_completion={no_completion:.1f}s threshold={threshold:.1f}s in_flight={in_flight} oldest={oldest:.1f}s done={done}/{total}".format(
+                            worker=worker_label,
+                            backend=backend_label,
+                            stage=stage_summary,
+                            no_completion=float(no_completion),
+                            threshold=float(debug_timeout_seconds),
+                            in_flight=int(len(pending_futures)),
+                            oldest=float(oldest_age),
+                            done=int(completed),
+                            total=int(total),
+                        )
+                    )
+                    next_timeout_ts = now + debug_timeout_seconds
+                else:
+                    next_timeout_ts = last_completion_ts + debug_timeout_seconds
+
+        resolved: List[Tuple[float, List[Dict[str, Any]]]] = []
+        for idx, result in enumerate(ordered_results):
+            if result is None:
+                raise RuntimeError(
+                    f"parallel evaluator missing task result at index {idx} ({worker_label})"
+                )
+            resolved.append(result)
+        return resolved
+
     def run_with_executor(
         exec_obj: concurrent.futures.Executor,
         fn,
@@ -2869,6 +3019,8 @@ def _evaluate_pending_parallel(
         *,
         process_chunksize: Optional[int] = None,
     ):
+        if debug_monitor_enabled:
+            return run_with_debug_monitor(exec_obj, fn, task_list)
         if isinstance(exec_obj, concurrent.futures.ProcessPoolExecutor):
             chunk_size = map_chunk_size if process_chunksize is None else int(process_chunksize)
             return list(exec_obj.map(fn, task_list, chunksize=max(1, chunk_size)))
@@ -5721,6 +5873,10 @@ def run_continuous_experiment(
     )
     eval_executor_kwargs = _build_eval_executor_kwargs(config)
     _set_eval_executor_kwargs(eval_executor_kwargs)
+    _set_debug_eval_runtime_settings(
+        timeout_seconds=float(config.debug_eval_timeout_seconds),
+        log_interval_seconds=float(config.debug_eval_log_interval_seconds),
+    )
 
     out_dir = Path(config.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -5742,6 +5898,16 @@ def run_continuous_experiment(
             exec_backend=str(eval_executor_kwargs.get("compute_backend", "cpu")),
         )
     )
+    if (
+        float(config.debug_eval_timeout_seconds) > 0.0
+        or float(config.debug_eval_log_interval_seconds) > 0.0
+    ):
+        print(
+            "[pcpl-evolvo] debug eval monitor enabled timeout_s={timeout:.1f} log_interval_s={interval:.1f}".format(
+                timeout=float(config.debug_eval_timeout_seconds),
+                interval=float(config.debug_eval_log_interval_seconds),
+            )
+        )
     shared_executor: Optional[concurrent.futures.Executor] = None
 
     try:
@@ -6452,6 +6618,10 @@ def run_continuous_experiment(
         }
         return summary
     finally:
+        _set_debug_eval_runtime_settings(
+            timeout_seconds=0.0,
+            log_interval_seconds=0.0,
+        )
         _shutdown_shared_executor(shared_executor)
 
 
