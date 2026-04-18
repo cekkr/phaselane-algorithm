@@ -438,6 +438,15 @@ def _normalize_executor_backend(backend: str) -> str:
     return backend_norm
 
 
+def _has_kp_bindings() -> bool:
+    try:
+        import kp  # type: ignore
+        _ = kp
+        return True
+    except Exception:
+        return False
+
+
 def _sanitize_eval_executor_kwargs(kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     raw = dict(kwargs or {})
     backend = _normalize_executor_backend(str(raw.get("compute_backend", "auto")))
@@ -1325,12 +1334,20 @@ def _resolve_resource_plan(config: ExperimentConfig, max_population: int) -> Res
         resolved_backend = "thread"
 
     executor_backend = _normalize_executor_backend(config.executor_backend)
+    runtime_mode = str(config.kompute_runtime_mode).strip().lower()
+    if runtime_mode not in {"native", "simulated", "auto"}:
+        runtime_mode = "native"
     allow_kompute_process_pool = bool(config.kompute_allow_process_pool) or (
         str(os.environ.get("EVOLVO_KOMPUTE_ALLOW_PROCESS_POOL", "")).strip().lower()
         in {"1", "true", "yes", "on"}
     )
+    auto_backend_prefers_kompute = bool(
+        executor_backend == "auto"
+        and runtime_mode in {"native", "auto"}
+        and _has_kp_bindings()
+    )
     if (
-        executor_backend in {"kompute", "kompute-sim"}
+        (executor_backend in {"kompute", "kompute-sim"} or auto_backend_prefers_kompute)
         and resolved_backend == "process"
         and not allow_kompute_process_pool
     ):
