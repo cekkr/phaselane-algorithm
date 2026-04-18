@@ -388,6 +388,22 @@ def _task_timeout_seconds(task: Any, *, worker_fn) -> float:
     return max(float(DEFENDER_EVAL_TIMEOUT_SECONDS), float(ATTACKER_EVAL_TIMEOUT_SECONDS))
 
 
+def _thread_soft_timeout_multiplier() -> float:
+    eval_backend = _normalize_executor_backend(
+        str(_get_eval_executor_kwargs().get("compute_backend", "auto"))
+    )
+    multiplier = 4.0 if eval_backend in {"kompute", "kompute-sim"} else 1.0
+    raw_multiplier = str(
+        os.environ.get("EVOLVO_THREAD_SOFT_TIMEOUT_MULTIPLIER", "")
+    ).strip()
+    if raw_multiplier:
+        try:
+            multiplier = max(1.0, float(raw_multiplier))
+        except ValueError:
+            pass
+    return float(multiplier)
+
+
 def _timeout_fallback_result(task: Any, *, worker_fn) -> Tuple[float, List[Dict[str, Any]]]:
     _ = task
     if worker_fn is _defender_eval_worker:
@@ -414,12 +430,21 @@ def _evaluate_with_timeout(
 ) -> Tuple[float, Sequence[Any]]:
     runtime_executor_kwargs = _get_eval_executor_kwargs()
     timeout = max(0.0, float(timeout_seconds))
-    if timeout <= 0.0 or not _can_use_eval_timeout():
+    if timeout <= 0.0:
         return evaluate_across_scenarios(
             scenarios,
             genome,
             attacker=attacker,
             executor_kwargs=runtime_executor_kwargs,
+        )
+    if not _can_use_eval_timeout():
+        effective_timeout = timeout * _thread_soft_timeout_multiplier()
+        return evaluate_across_scenarios(
+            scenarios,
+            genome,
+            attacker=attacker,
+            executor_kwargs=runtime_executor_kwargs,
+            timeout_deadline=time.perf_counter() + effective_timeout,
         )
 
     def _raise_timeout(signum, frame):  # type: ignore[no-untyped-def]
@@ -2994,16 +3019,25 @@ def _evaluate_pending_parallel(
         if stage_counts
         else "n/a"
     )
+    thread_soft_timeout_hit = False
 
     def run_with_debug_monitor(
         exec_obj: concurrent.futures.Executor,
         fn,
         task_list,
     ):
+        nonlocal thread_soft_timeout_hit
         total = len(task_list)
         if total <= 0:
             return []
-        pending_futures: Dict[concurrent.futures.Future, Tuple[int, float]] = {}
+        supports_soft_timeout = bool(
+            isinstance(exec_obj, concurrent.futures.ThreadPoolExecutor)
+            and fn in {_defender_eval_worker, _attacker_eval_worker}
+        )
+        soft_timeout_multiplier = (
+            _thread_soft_timeout_multiplier() if supports_soft_timeout else 1.0
+        )
+        pending_futures: Dict[concurrent.futures.Future, Tuple[int, float, float]] = {}
         ordered_results: List[Optional[Tuple[float, List[Dict[str, Any]]]]] = [None] * total
         start_ts = time.perf_counter()
         last_completion_ts = start_ts
@@ -3025,7 +3059,13 @@ def _evaluate_pending_parallel(
         )
         for task_idx, task in enumerate(task_list):
             future = exec_obj.submit(fn, task)
-            pending_futures[future] = (int(task_idx), time.perf_counter())
+            timeout_s = (
+                max(0.0, float(_task_timeout_seconds(task, worker_fn=fn)))
+                * float(soft_timeout_multiplier)
+                if supports_soft_timeout
+                else 0.0
+            )
+            pending_futures[future] = (int(task_idx), time.perf_counter(), timeout_s)
 
         completed = 0
         while pending_futures:
@@ -3037,7 +3077,7 @@ def _evaluate_pending_parallel(
             now = time.perf_counter()
 
             for future in done:
-                idx, _submitted_ts = pending_futures.pop(future)
+                idx, _submitted_ts, _timeout_s = pending_futures.pop(future)
                 try:
                     result = future.result()
                 except Exception as exc:
@@ -3049,11 +3089,45 @@ def _evaluate_pending_parallel(
                 completed += 1
                 last_completion_ts = now
 
+            if supports_soft_timeout and pending_futures:
+                timed_out: List[Tuple[concurrent.futures.Future, int, float, float]] = []
+                for future, (idx, submitted_ts, timeout_s) in pending_futures.items():
+                    if timeout_s <= 0.0:
+                        continue
+                    age = now - submitted_ts
+                    if age >= timeout_s:
+                        timed_out.append((future, idx, age, timeout_s))
+                if timed_out:
+                    thread_soft_timeout_hit = True
+                for future, idx, age, timeout_s in timed_out:
+                    pending_futures.pop(future, None)
+                    try:
+                        future.cancel()
+                    except Exception:
+                        pass
+                    ordered_results[idx] = _timeout_fallback_result(
+                        task_list[idx],
+                        worker_fn=fn,
+                    )
+                    completed += 1
+                    last_completion_ts = now
+                    if debug_monitor_enabled:
+                        print(
+                            "[pcpl-evolvo][debug][timeout-cut] worker={worker} backend={backend} stage={stage} task_index={idx} age={age:.1f}s timeout={timeout:.1f}s -> fallback".format(
+                                worker=worker_label,
+                                backend=backend_label,
+                                stage=stage_summary,
+                                idx=int(idx),
+                                age=float(age),
+                                timeout=float(timeout_s),
+                            )
+                        )
+
             if debug_log_interval_seconds > 0.0 and now >= next_log_ts:
                 oldest_age = (
                     max(
                         (now - submitted_ts)
-                        for _future, (_idx, submitted_ts) in pending_futures.items()
+                        for _future, (_idx, submitted_ts, _timeout_s) in pending_futures.items()
                     )
                     if pending_futures
                     else 0.0
@@ -3077,7 +3151,7 @@ def _evaluate_pending_parallel(
                 if no_completion >= debug_timeout_seconds:
                     oldest_age = max(
                         (now - submitted_ts)
-                        for _future, (_idx, submitted_ts) in pending_futures.items()
+                        for _future, (_idx, submitted_ts, _timeout_s) in pending_futures.items()
                     )
                     print(
                         "[pcpl-evolvo][debug][timeout] worker={worker} backend={backend} stage={stage} no_completion={no_completion:.1f}s threshold={threshold:.1f}s in_flight={in_flight} oldest={oldest:.1f}s done={done}/{total}".format(
@@ -3112,7 +3186,11 @@ def _evaluate_pending_parallel(
         *,
         process_chunksize: Optional[int] = None,
     ):
-        if debug_monitor_enabled:
+        soft_timeout_monitor_enabled = bool(
+            isinstance(exec_obj, concurrent.futures.ThreadPoolExecutor)
+            and fn in {_defender_eval_worker, _attacker_eval_worker}
+        )
+        if debug_monitor_enabled or soft_timeout_monitor_enabled:
             return run_with_debug_monitor(exec_obj, fn, task_list)
         if isinstance(exec_obj, concurrent.futures.ProcessPoolExecutor):
             chunk_size = map_chunk_size if process_chunksize is None else int(process_chunksize)
@@ -3201,7 +3279,7 @@ def _evaluate_pending_parallel(
             process_chunksize=map_chunk_size,
         )
 
-    if executor is not None:
+    if executor is not None and backend != "thread":
         results = run_standard(executor)
         assign(results)
         return
@@ -3210,8 +3288,17 @@ def _evaluate_pending_parallel(
         with _create_process_pool_executor(max_workers=workers) as local_exec:
             results = run_standard(local_exec)
     else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as local_exec:
+        local_exec = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+        try:
             results = run_standard(local_exec)
+        finally:
+            try:
+                local_exec.shutdown(
+                    wait=not bool(thread_soft_timeout_hit),
+                    cancel_futures=True,
+                )
+            except Exception:
+                pass
 
     assign(results)
 

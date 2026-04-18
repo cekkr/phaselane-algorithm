@@ -1095,6 +1095,7 @@ def evaluate_scenario(
     fixed_decision: Optional[PolicyDecision] = None,
     attacker: Optional[GFSLGenome] = None,
     executor_kwargs: Optional[Dict[str, object]] = None,
+    timeout_deadline: Optional[float] = None,
 ) -> ScenarioMetrics:
     """Evaluate one scenario for a defender and optional attacker genome."""
     if genome is None and fixed_decision is None:
@@ -1201,8 +1202,19 @@ def evaluate_scenario(
     prev_emitted = 0
     prev_idx = 0
 
+    deadline = None
+    if timeout_deadline is not None:
+        try:
+            candidate = float(timeout_deadline)
+        except (TypeError, ValueError):
+            candidate = None
+        if candidate is not None and math.isfinite(candidate):
+            deadline = candidate
+
     start = time.perf_counter()
     for t in range(scenario.cycles):
+        if deadline is not None and (t & 7) == 0 and time.perf_counter() >= deadline:
+            raise TimeoutError("evaluation-timeout")
         phase = phase_clock(t, params)
         block = t // params.x
         slot = t % params.x
@@ -1219,6 +1231,8 @@ def evaluate_scenario(
         lane_decisions: List[PolicyDecision] = []
 
         for lane in range(params.x):
+            if deadline is not None and (lane & 3) == 0 and time.perf_counter() >= deadline:
+                raise TimeoutError("evaluation-timeout")
             if fixed_decision is not None:
                 decision = fixed_decision
             else:
@@ -1378,6 +1392,8 @@ def evaluate_scenario(
 
         # Optional evolved attacker benchmark.
         if attacker is not None:
+            if deadline is not None and time.perf_counter() >= deadline:
+                raise TimeoutError("evaluation-timeout")
             absolute_phase = 0.0
             if scenario.absolute_time_ms > 0:
                 absolute_phase = (reference_ms % scenario.absolute_time_ms) / scenario.absolute_time_ms
@@ -1733,16 +1749,31 @@ def evaluate_across_scenarios(
     fixed_decision: Optional[PolicyDecision] = None,
     attacker: Optional[GFSLGenome] = None,
     executor_kwargs: Optional[Dict[str, object]] = None,
+    timeout_deadline: Optional[float] = None,
 ) -> Tuple[float, List[ScenarioMetrics]]:
-    metrics = [
-        evaluate_scenario(
-            scenario,
-            genome,
-            fixed_decision=fixed_decision,
-            attacker=attacker,
-            executor_kwargs=executor_kwargs,
+    deadline = None
+    if timeout_deadline is not None:
+        try:
+            candidate = float(timeout_deadline)
+        except (TypeError, ValueError):
+            candidate = None
+        if candidate is not None and math.isfinite(candidate):
+            deadline = candidate
+
+    metrics: List[ScenarioMetrics] = []
+    for scenario in scenarios:
+        if deadline is not None and time.perf_counter() >= deadline:
+            raise TimeoutError("evaluation-timeout")
+        metrics.append(
+            evaluate_scenario(
+                scenario,
+                genome,
+                fixed_decision=fixed_decision,
+                attacker=attacker,
+                executor_kwargs=executor_kwargs,
+                timeout_deadline=deadline,
+            )
         )
-        for scenario in scenarios
-    ]
+
     total = sum(item.total_score for item in metrics) / float(max(1, len(metrics)))
     return total, metrics
