@@ -11,8 +11,10 @@ import multiprocessing
 import os
 import platform
 import random
+import re
 import signal
 import statistics
+import subprocess
 import threading
 import time
 from collections import OrderedDict
@@ -36,7 +38,16 @@ from .simulation import (
 
 ensure_evolvo_importable()
 
-from evolvo import GFSLGenome, GFSLInstruction, GFSLEvolver, resolve_torch_accelerator
+from evolvo import (
+    DataType,
+    GFSLGenome,
+    GFSLInstruction,
+    GFSLEvolver,
+    Operation,
+    SLOT_OPERATION,
+    custom_operations,
+    resolve_torch_accelerator,
+)
 
 
 @dataclass(frozen=True)
@@ -130,6 +141,294 @@ def clamp(value: float, lower: float, upper: float) -> float:
 _EVAL_EXECUTOR_KWARGS: Dict[str, Any] = {"compute_backend": "auto"}
 _DEBUG_EVAL_TIMEOUT_SECONDS: float = 0.0
 _DEBUG_EVAL_LOG_INTERVAL_SECONDS: float = 0.0
+_OPERATION_PROFILE_MODE: str = "default"
+_GPU_WORKER_AUTOTUNER: Optional["_GpuWorkerAutotuner"] = None
+_GPU_PROFILE_NATIVE_OPS: Tuple[int, ...] = (
+    int(Operation.GT),
+    int(Operation.LT),
+    int(Operation.EQ),
+    int(Operation.GTE),
+    int(Operation.LTE),
+    int(Operation.NEQ),
+    int(Operation.AND),
+    int(Operation.OR),
+    int(Operation.NOT),
+    int(Operation.ADD),
+    int(Operation.SUB),
+    int(Operation.MUL),
+    int(Operation.DIV),
+    int(Operation.POW),
+    int(Operation.SQRT),
+    int(Operation.ABS),
+    int(Operation.SIN),
+    int(Operation.COS),
+    int(Operation.EXP),
+    int(Operation.LOG),
+    int(Operation.MOD),
+    int(Operation.LISTCOUNT),
+    int(Operation.LISTHASITEMS),
+)
+_GPU_PROFILE_CPU_FALLBACK_HEAVY_OPS: Tuple[int, ...] = (
+    int(Operation.PREPEND),
+    int(Operation.APPEND),
+    int(Operation.CLONE),
+    int(Operation.FIFO),
+    int(Operation.FILO),
+    int(Operation.FUNC),
+    int(Operation.CALL),
+)
+_GPU_PROFILE_CUSTOM_NATIVE_NAMES = {"PCPL_HASHMIX", "PCPL_PHASEMIX", "PCPL_MODHASH"}
+
+
+def _set_operation_profile_mode(mode: str) -> None:
+    global _OPERATION_PROFILE_MODE
+    mode_norm = str(mode).strip().lower()
+    _OPERATION_PROFILE_MODE = "kompute" if mode_norm == "kompute" else "default"
+
+
+def _apply_runtime_operation_profile(genome: Optional[GFSLGenome]) -> None:
+    if genome is None:
+        return
+    if _OPERATION_PROFILE_MODE != "kompute":
+        return
+    weights = getattr(genome, "operation_weights", None)
+    if weights is None:
+        return
+    # Favor GPU-native arithmetic/compare/query ops and strongly discourage known CPU-heavy fallbacks.
+    weights.default_weight = 1.0
+    for op_code in _GPU_PROFILE_NATIVE_OPS:
+        weights.set_operation_weight(op_code, 2.10)
+    for op_code in _GPU_PROFILE_CPU_FALLBACK_HEAVY_OPS:
+        weights.set_operation_weight(op_code, 0.12)
+    try:
+        custom_decimal_codes = custom_operations.codes_for_target(DataType.DECIMAL)
+    except Exception:
+        custom_decimal_codes = []
+    for code in custom_decimal_codes:
+        custom_op = custom_operations.get(int(code))
+        name = str(getattr(custom_op, "name", "")).strip().upper()
+        if name in _GPU_PROFILE_CUSTOM_NATIVE_NAMES:
+            weights.set_operation_weight(int(code), 1.85)
+        else:
+            weights.set_operation_weight(int(code), 0.22)
+
+
+def _weighted_slot_choice(
+    genome: GFSLGenome,
+    *,
+    slot_idx: int,
+    options: Sequence[int],
+) -> int:
+    if not options:
+        raise ValueError("No options available for weighted slot choice.")
+    if int(slot_idx) != int(SLOT_OPERATION):
+        return int(random.choice(list(options)))
+    weighted: List[float] = []
+    total = 0.0
+    operation_weights = getattr(genome, "operation_weights", None)
+    for opt in options:
+        if operation_weights is None:
+            resolved = 1.0
+        else:
+            resolved = operation_weights.resolve_weight(int(opt), default=1.0)
+        weight = 1.0 if resolved is None else float(resolved)
+        if not math.isfinite(weight):
+            weight = 0.0
+        weight = max(0.0, weight)
+        weighted.append(weight)
+        total += weight
+    if total <= 0.0:
+        return int(random.choice(list(options)))
+    return int(random.choices(list(options), weights=weighted, k=1)[0])
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return float(default)
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(default)
+    if not math.isfinite(value):
+        return float(default)
+    return float(value)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+def _sample_gpu_utilization_percent(backend: str) -> Optional[float]:
+    backend_norm = str(backend).strip().lower()
+    if backend_norm == "rocm":
+        try:
+            proc = subprocess.run(
+                ["rocm-smi", "--showuse", "--csv"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2.0,
+            )
+        except Exception:
+            return None
+        if proc.returncode != 0:
+            return None
+        lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+        if len(lines) < 2:
+            return None
+        values: List[float] = []
+        for line in lines[1:]:
+            parts = [part.strip().strip('"') for part in line.split(",")]
+            if len(parts) < 2:
+                continue
+            try:
+                values.append(float(parts[1]))
+            except Exception:
+                continue
+        if not values:
+            return None
+        return float(sum(values) / float(len(values)))
+    if backend_norm == "cuda":
+        try:
+            proc = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2.0,
+            )
+        except Exception:
+            return None
+        if proc.returncode != 0:
+            return None
+        values: List[float] = []
+        for line in (proc.stdout or "").splitlines():
+            text = str(line).strip()
+            if not text:
+                continue
+            try:
+                values.append(float(text))
+            except Exception:
+                continue
+        if not values:
+            return None
+        return float(sum(values) / float(len(values)))
+    if backend_norm == "mps":
+        # macOS does not provide a stable non-privileged per-process GPU util API;
+        # try lightweight system samplers and return None on unsupported hosts.
+        candidates = [
+            ["powermetrics", "--samplers", "gpu_power", "-n", "1"],
+            ["ioreg", "-r", "-d", "1", "-c", "IOReportLegend"],
+        ]
+        for cmd in candidates:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=2.0,
+                )
+            except Exception:
+                continue
+            if proc.returncode != 0:
+                continue
+            blob = f"{proc.stdout}\n{proc.stderr}"
+            match = re.search(r"([0-9]+(?:\\.[0-9]+)?)\\s*%", blob)
+            if match:
+                try:
+                    return float(match.group(1))
+                except Exception:
+                    continue
+        return None
+    return None
+
+
+@dataclass
+class _GpuWorkerAutotuner:
+    enabled: bool
+    backend: str
+    min_workers: int
+    max_workers: int
+    current_workers: int
+    target_low_util: float
+    target_high_util: float
+    probe_interval_seconds: float
+    action_cooldown_seconds: float
+    step: int = 1
+    last_probe_ts: float = 0.0
+    last_action_ts: float = 0.0
+    last_utilization: float = -1.0
+
+    def tuned_workers(self, requested_workers: int, *, backend: str) -> int:
+        requested = max(1, int(requested_workers))
+        if (not self.enabled) or requested <= 1:
+            return requested
+        if str(backend).strip().lower() != "thread":
+            return requested
+
+        now = time.perf_counter()
+        if now - float(self.last_probe_ts) < max(0.5, float(self.probe_interval_seconds)):
+            return max(1, int(self.current_workers))
+
+        self.last_probe_ts = now
+        util = _sample_gpu_utilization_percent(self.backend)
+        if util is None or (not math.isfinite(float(util))):
+            return max(1, int(self.current_workers))
+
+        util = max(0.0, min(100.0, float(util)))
+        self.last_utilization = util
+        candidate = int(self.current_workers)
+        cooldown_ok = (now - float(self.last_action_ts)) >= max(
+            0.5,
+            float(self.action_cooldown_seconds),
+        )
+        if cooldown_ok:
+            if util < float(self.target_low_util):
+                candidate += max(1, int(self.step))
+            elif util > float(self.target_high_util):
+                candidate -= max(1, int(self.step))
+
+        upper = max(1, int(self.max_workers))
+        lower = max(1, min(int(self.min_workers), upper))
+        candidate = max(lower, min(upper, candidate))
+        if candidate != int(self.current_workers):
+            print(
+                "[pcpl-evolvo][gpu-autotune] backend={backend} util={util:.1f}% workers {prev}->{curr} target={low:.1f}-{high:.1f}%".format(
+                    backend=self.backend,
+                    util=float(util),
+                    prev=int(self.current_workers),
+                    curr=int(candidate),
+                    low=float(self.target_low_util),
+                    high=float(self.target_high_util),
+                )
+            )
+            self.current_workers = int(candidate)
+            self.last_action_ts = now
+        return max(1, int(self.current_workers))
+
+
+def _set_gpu_worker_autotuner(tuner: Optional[_GpuWorkerAutotuner]) -> None:
+    global _GPU_WORKER_AUTOTUNER
+    _GPU_WORKER_AUTOTUNER = tuner
+
+
+def _autotuned_worker_count(*, requested: int, backend: str) -> int:
+    tuner = _GPU_WORKER_AUTOTUNER
+    if tuner is None:
+        return max(1, int(requested))
+    return max(1, int(tuner.tuned_workers(int(requested), backend=backend)))
 
 
 def _normalize_executor_backend(backend: str) -> str:
@@ -497,6 +796,7 @@ def _append_random_instruction_fast(
     max_attempts: int = 8,
 ) -> bool:
     """Add one valid random instruction without expensive probability trees."""
+    _apply_runtime_operation_profile(genome)
     slot_count = max(1, int(genome.validator.slot_count))
     for _ in range(max(1, int(max_attempts))):
         instruction = GFSLInstruction(slot_count=slot_count)
@@ -506,7 +806,11 @@ def _append_random_instruction_fast(
             if not options:
                 valid = False
                 break
-            instruction.slots[slot_idx] = random.choice(options)
+            instruction.slots[slot_idx] = _weighted_slot_choice(
+                genome,
+                slot_idx=int(slot_idx),
+                options=options,
+            )
         if not valid:
             continue
         genome.instructions.append(instruction)
@@ -1499,6 +1803,9 @@ def _evaluate_pending_dedup_cache_parallel(
     if not pending:
         return stats
 
+    for _, genome in pending:
+        _apply_runtime_operation_profile(genome)
+
     groups: Dict[str, List[GFSLGenome]] = {}
     for _, genome in pending:
         key = str(cache_key_fn(genome))
@@ -1572,9 +1879,11 @@ def _replace_genome_contents(target: GFSLGenome, source: GFSLGenome) -> None:
         (int(cat), int(dtype), int(idx))
         for cat, dtype, idx in source.outputs
     ]
+    target.operation_weights = copy.deepcopy(source.operation_weights)
     target.validator = copy.deepcopy(source.validator)
     target.instruction_activity = copy.deepcopy(source.instruction_activity)
     target.fitness = None
+    _apply_runtime_operation_profile(target)
     _invalidate_genome_caches(target)
     for attr in ("_pcpl_metrics", "_attack_metrics"):
         if hasattr(target, attr):
@@ -2966,6 +3275,10 @@ def _evaluate_pending_parallel(
     if not pending:
         return
 
+    for _, genome in pending:
+        _apply_runtime_operation_profile(genome)
+
+    workers = _autotuned_worker_count(requested=workers, backend=backend)
     if backend == "off" or workers <= 1:
         for _, genome in pending:
             score, rows = worker_fn(build_task(genome))
@@ -3317,6 +3630,7 @@ def _mean_metric(metrics: Sequence[Any], attr: str) -> float:
 
 def _make_random_genome(initial_instructions: int, *, slot_count: Optional[int] = None) -> GFSLGenome:
     genome = GFSLGenome("algorithm", slot_count=slot_count)
+    _apply_runtime_operation_profile(genome)
     for _ in range(random.randint(1, max(1, int(initial_instructions)))):
         if _append_random_instruction_fast(genome, max_attempts=6):
             continue
@@ -3645,6 +3959,7 @@ def _seed_population_from_archive(
 
     def push(genome: GFSLGenome) -> bool:
         io_initializer(genome)
+        _apply_runtime_operation_profile(genome)
         signature = _evaluation_signature(genome)
         if signature in seen:
             return False
@@ -3701,10 +4016,12 @@ def _seed_population_from_archive(
             random_genome = _make_random_genome(max(4, initial_instructions))
             if not push(random_genome):
                 io_initializer(random_genome)
+                _apply_runtime_operation_profile(random_genome)
                 seeded.append(random_genome)
         except Exception:
             fallback_any = copy.deepcopy(random.choice(evolver.population))
             io_initializer(fallback_any)
+            _apply_runtime_operation_profile(fallback_any)
             seeded.append(fallback_any)
 
     evolver.population = seeded[:population_size]
@@ -6051,12 +6368,76 @@ def run_continuous_experiment(
         config,
         max(config.population_size, config.attacker_population_size),
     )
+    executor_backend = _normalize_executor_backend(config.executor_backend)
+    _set_operation_profile_mode(
+        "kompute" if executor_backend in {"kompute", "kompute-sim"} else "default"
+    )
     eval_executor_kwargs = _build_eval_executor_kwargs(config)
     _set_eval_executor_kwargs(eval_executor_kwargs)
     _set_debug_eval_runtime_settings(
         timeout_seconds=float(config.debug_eval_timeout_seconds),
         log_interval_seconds=float(config.debug_eval_log_interval_seconds),
     )
+    autotune_enabled = (
+        str(os.environ.get("EVOLVO_GPU_AUTOTUNE", "1")).strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+    gpu_autotuner: Optional[_GpuWorkerAutotuner] = None
+    if (
+        autotune_enabled
+        and executor_backend in {"kompute", "kompute-sim"}
+        and resource_plan.parallel_backend == "thread"
+        and int(resource_plan.parallel_workers) > 1
+        and str(resource_plan.gpu_backend).strip().lower() in {"rocm", "cuda", "mps"}
+    ):
+        default_max_workers = max(
+            int(resource_plan.parallel_workers),
+            min(
+                int(resource_plan.cpu_count),
+                int(math.ceil(float(resource_plan.parallel_workers) * 1.50)),
+            ),
+        )
+        min_workers = max(
+            1,
+            _env_int(
+                "EVOLVO_GPU_AUTOTUNE_MIN_WORKERS",
+                max(2, int(math.ceil(float(resource_plan.parallel_workers) * 0.5))),
+            ),
+        )
+        max_workers = max(
+            min_workers,
+            _env_int(
+                "EVOLVO_GPU_AUTOTUNE_MAX_WORKERS",
+                int(default_max_workers),
+            ),
+        )
+        gpu_autotuner = _GpuWorkerAutotuner(
+            enabled=True,
+            backend=str(resource_plan.gpu_backend),
+            min_workers=min_workers,
+            max_workers=max_workers,
+            current_workers=int(resource_plan.parallel_workers),
+            target_low_util=clamp(
+                _env_float("EVOLVO_GPU_AUTOTUNE_LOW", 48.0),
+                5.0,
+                95.0,
+            ),
+            target_high_util=clamp(
+                _env_float("EVOLVO_GPU_AUTOTUNE_HIGH", 86.0),
+                10.0,
+                99.0,
+            ),
+            probe_interval_seconds=max(
+                1.0,
+                _env_float("EVOLVO_GPU_AUTOTUNE_PROBE_SECONDS", 6.0),
+            ),
+            action_cooldown_seconds=max(
+                1.0,
+                _env_float("EVOLVO_GPU_AUTOTUNE_COOLDOWN_SECONDS", 12.0),
+            ),
+            step=max(1, _env_int("EVOLVO_GPU_AUTOTUNE_STEP", 1)),
+        )
+    _set_gpu_worker_autotuner(gpu_autotuner)
 
     out_dir = Path(config.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -6078,6 +6459,20 @@ def run_continuous_experiment(
             exec_backend=str(eval_executor_kwargs.get("compute_backend", "cpu")),
         )
     )
+    if gpu_autotuner is not None and bool(gpu_autotuner.enabled):
+        print(
+            "[pcpl-evolvo] gpu autotune backend={backend} workers={curr}[{wmin}-{wmax}] target={low:.1f}-{high:.1f}% probe={probe:.1f}s cooldown={cooldown:.1f}s step={step}".format(
+                backend=str(gpu_autotuner.backend),
+                curr=int(gpu_autotuner.current_workers),
+                wmin=int(gpu_autotuner.min_workers),
+                wmax=int(gpu_autotuner.max_workers),
+                low=float(gpu_autotuner.target_low_util),
+                high=float(gpu_autotuner.target_high_util),
+                probe=float(gpu_autotuner.probe_interval_seconds),
+                cooldown=float(gpu_autotuner.action_cooldown_seconds),
+                step=int(gpu_autotuner.step),
+            )
+        )
     if (
         float(config.debug_eval_timeout_seconds) > 0.0
         or float(config.debug_eval_log_interval_seconds) > 0.0
@@ -6106,6 +6501,7 @@ def run_continuous_experiment(
             try:
                 current_attacker = _deserialize_genome(archive["attacker_elites"][0]["genome"])
                 ensure_attacker_genome_io(current_attacker)
+                _apply_runtime_operation_profile(current_attacker)
             except Exception:
                 current_attacker = None
 
@@ -6798,6 +7194,8 @@ def run_continuous_experiment(
         }
         return summary
     finally:
+        _set_gpu_worker_autotuner(None)
+        _set_operation_profile_mode("default")
         _set_debug_eval_runtime_settings(
             timeout_seconds=0.0,
             log_interval_seconds=0.0,

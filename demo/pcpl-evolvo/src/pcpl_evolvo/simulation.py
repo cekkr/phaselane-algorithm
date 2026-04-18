@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import math
 import random
 import threading
@@ -181,28 +180,46 @@ class ScenarioConfig:
 
 def _quantize_decimal(value: float) -> int:
     clipped = clamp(float(value), -1_000_000.0, 1_000_000.0)
-    return int(round(clipped * 1_000_000.0))
+    scaled = abs(clipped) * 1_000_000.0
+    rounded = int(math.floor(scaled + 0.5))
+    return -rounded if clipped < 0.0 else rounded
 
 
-def _hash_to_unit(*parts: object) -> float:
-    payload = "|".join(str(part) for part in parts).encode("utf-8")
-    digest = hashlib.blake2b(payload, digest_size=8).digest()
-    raw = int.from_bytes(digest, "big")
-    return float(raw) / float((1 << 64) - 1)
+_U32_MASK = 0xFFFFFFFF
+
+
+def _u32(value: int) -> int:
+    return int(value) & int(_U32_MASK)
+
+
+def _mix_u32(value: int) -> int:
+    mixed = _u32(value)
+    mixed ^= mixed >> 16
+    mixed = _u32(mixed * 0x7FEB352D)
+    mixed ^= mixed >> 15
+    mixed = _u32(mixed * 0x846CA68B)
+    mixed ^= mixed >> 16
+    return _u32(mixed)
+
+
+def _unit_from_u32(value: int) -> float:
+    return float(_u32(value)) / float(0xFFFFFFFF)
 
 
 def _pcpl_hashmix_op(a: float, b: float) -> float:
     qa = _quantize_decimal(a)
     qb = _quantize_decimal(b)
-    unit = _hash_to_unit("PCPL_HASHMIX", qa, qb)
+    seed = _u32(qa) ^ _u32(qb * 0x9E3779B1)
+    unit = _unit_from_u32(_mix_u32(seed ^ 0xA5A5A5A5))
     return (2.0 * unit) - 1.0
 
 
 def _pcpl_phasemix_op(a: float, b: float) -> float:
     qa = _quantize_decimal(a)
     qb = _quantize_decimal(b)
-    folded = ((qa * 31) ^ (qb * 17)) & 0xFFFFFFFF
-    unit = _hash_to_unit("PCPL_PHASEMIX", folded, qa - qb)
+    folded = _u32((qa * 31) ^ (qb * 17))
+    seed = folded ^ _u32(qa - qb) ^ 0xC3A5C85C
+    unit = _unit_from_u32(_mix_u32(seed))
     return (2.0 * unit) - 1.0
 
 
@@ -212,7 +229,8 @@ def _pcpl_modhash_op(a: float, b: float) -> float:
     base = abs(qa) + 1
     mod = (abs(qb) % 1_000_003) + 97
     mixed = pow(base, 3, mod)
-    unit = _hash_to_unit("PCPL_MODHASH", mixed, mod)
+    seed = _u32(mixed) ^ _u32(mod * 0x27D4EB2D) ^ 0x85EBCA6B
+    unit = _unit_from_u32(_mix_u32(seed))
     return (2.0 * unit) - 1.0
 
 
