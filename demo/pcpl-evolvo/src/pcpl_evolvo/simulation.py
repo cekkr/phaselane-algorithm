@@ -338,6 +338,16 @@ class ScenarioMetrics:
     compare_x_chain_ratio: float = 0.0
     phase_error_control_score: float = 0.0
     control_flow_score: float = 0.0
+    native_execution_calls: float = 0.0
+    native_kompute_calls: float = 0.0
+    native_gpu_dispatch_count: float = 0.0
+    native_cpu_fallback_count: float = 0.0
+    native_cpu_full_sync_count: float = 0.0
+    native_cpu_partial_sync_count: float = 0.0
+    native_cpu_no_sync_count: float = 0.0
+    native_cpu_synced_tensors: float = 0.0
+    native_final_sync_count: float = 0.0
+    native_gpu_share: float = 0.0
 
     def to_dict(self) -> Dict[str, float]:
         return asdict(self)
@@ -355,6 +365,42 @@ def safe_float(value: object, default: float = 0.0) -> float:
     if math.isnan(parsed) or math.isinf(parsed):
         return default
     return parsed
+
+
+def _empty_native_counter() -> Dict[str, int]:
+    return {
+        "execution_calls": 0,
+        "kompute_calls": 0,
+        "gpu_dispatch_count": 0,
+        "cpu_fallback_count": 0,
+        "cpu_full_sync_count": 0,
+        "cpu_partial_sync_count": 0,
+        "cpu_no_sync_count": 0,
+        "cpu_synced_tensors": 0,
+        "final_sync_count": 0,
+    }
+
+
+def _accumulate_executor_native_stats(counter: Dict[str, int], executor: GFSLExecutor) -> None:
+    getter = getattr(executor, "last_execution_stats", None)
+    if not callable(getter):
+        return
+    try:
+        stats = getter()
+    except Exception:
+        return
+    if not isinstance(stats, dict):
+        return
+    counter["execution_calls"] += 1
+    if bool(stats.get("used_kompute", False)):
+        counter["kompute_calls"] += 1
+    counter["gpu_dispatch_count"] += max(0, int(stats.get("gpu_dispatch_count", 0)))
+    counter["cpu_fallback_count"] += max(0, int(stats.get("cpu_fallback_count", 0)))
+    counter["cpu_full_sync_count"] += max(0, int(stats.get("cpu_full_sync_count", 0)))
+    counter["cpu_partial_sync_count"] += max(0, int(stats.get("cpu_partial_sync_count", 0)))
+    counter["cpu_no_sync_count"] += max(0, int(stats.get("cpu_no_sync_count", 0)))
+    counter["cpu_synced_tensors"] += max(0, int(stats.get("cpu_synced_tensors", 0)))
+    counter["final_sync_count"] += max(0, int(stats.get("final_sync_count", 0)))
 
 
 def sigmoid(value: float) -> float:
@@ -1191,6 +1237,7 @@ def evaluate_scenario(
 
     device_compound_total = 0
     provider_compound_total = 0
+    native_counters = _empty_native_counter()
 
     lane_attack_hits = 0
     token_attack_hits = 0
@@ -1264,8 +1311,10 @@ def evaluate_scenario(
                 )
                 try:
                     outputs = defender_executor.execute(genome, inputs, track_activity=False)
+                    _accumulate_executor_native_stats(native_counters, defender_executor)
                     decision = _policy_from_outputs(outputs)
                 except Exception:
+                    _accumulate_executor_native_stats(native_counters, defender_executor)
                     controller_fails += 1
                     decision = PolicyDecision(
                         active_ratio=1.0,
@@ -1426,6 +1475,7 @@ def evaluate_scenario(
             )
             try:
                 attack_outputs = attacker_executor.execute(attacker, attack_inputs, track_activity=False)
+                _accumulate_executor_native_stats(native_counters, attacker_executor)
                 lane_raw = safe_float(attack_outputs.get(f"d${ATTACK_OUTPUT_INDICES[0]}", 0.0))
                 token_raw = safe_float(attack_outputs.get(f"d${ATTACK_OUTPUT_INDICES[1]}", 0.0))
                 lane_guess = abs(int(lane_raw * 1_000_000.0)) % params.x
@@ -1437,6 +1487,7 @@ def evaluate_scenario(
                 if token_guess == token_low:
                     token_attack_hits += 1
             except Exception:
+                _accumulate_executor_native_stats(native_counters, attacker_executor)
                 # Broken attacker counts as no hit.
                 pass
 
@@ -1674,6 +1725,14 @@ def evaluate_scenario(
         0.0,
         1.0,
     )
+    native_dispatch_total = int(native_counters["gpu_dispatch_count"]) + int(
+        native_counters["cpu_fallback_count"]
+    )
+    native_gpu_share = (
+        float(native_counters["gpu_dispatch_count"]) / float(native_dispatch_total)
+        if native_dispatch_total > 0
+        else 0.0
+    )
 
     total_score = (
         0.17 * principle_score
@@ -1757,6 +1816,16 @@ def evaluate_scenario(
         compare_x_score=compare_x_score,
         compare_x_period_ratio=compare_x_period_ratio,
         compare_x_chain_ratio=compare_x_chain_ratio,
+        native_execution_calls=float(native_counters["execution_calls"]),
+        native_kompute_calls=float(native_counters["kompute_calls"]),
+        native_gpu_dispatch_count=float(native_counters["gpu_dispatch_count"]),
+        native_cpu_fallback_count=float(native_counters["cpu_fallback_count"]),
+        native_cpu_full_sync_count=float(native_counters["cpu_full_sync_count"]),
+        native_cpu_partial_sync_count=float(native_counters["cpu_partial_sync_count"]),
+        native_cpu_no_sync_count=float(native_counters["cpu_no_sync_count"]),
+        native_cpu_synced_tensors=float(native_counters["cpu_synced_tensors"]),
+        native_final_sync_count=float(native_counters["final_sync_count"]),
+        native_gpu_share=float(native_gpu_share),
     )
 
 

@@ -3628,6 +3628,123 @@ def _mean_metric(metrics: Sequence[Any], attr: str) -> float:
     return total / float(len(metrics))
 
 
+def _sum_metric(metrics: Sequence[Any], attr: str) -> float:
+    if not metrics:
+        return 0.0
+    total = 0.0
+    for item in metrics:
+        if isinstance(item, dict):
+            total += float(item.get(attr, 0.0))
+        else:
+            total += float(getattr(item, attr, 0.0))
+    return total
+
+
+def _generation_native_counter_rows(
+    generation_log: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for item in generation_log:
+        if not isinstance(item, dict):
+            continue
+        generation = int(item.get("generation", -1))
+        gpu_dispatch = max(0, int(item.get("native_gpu_dispatch_total", 0)))
+        cpu_fallback = max(0, int(item.get("native_cpu_fallback_total", 0)))
+        dispatch_total = max(
+            0,
+            int(item.get("native_dispatch_total", gpu_dispatch + cpu_fallback)),
+        )
+        if dispatch_total <= 0:
+            dispatch_total = gpu_dispatch + cpu_fallback
+        gpu_share = (
+            float(gpu_dispatch) / float(dispatch_total)
+            if dispatch_total > 0
+            else 0.0
+        )
+        rows.append(
+            {
+                "generation": generation,
+                "native_execution_calls_total": max(
+                    0,
+                    int(item.get("native_execution_calls_total", 0)),
+                ),
+                "native_kompute_calls_total": max(
+                    0,
+                    int(item.get("native_kompute_calls_total", 0)),
+                ),
+                "native_gpu_dispatch_total": gpu_dispatch,
+                "native_cpu_fallback_total": cpu_fallback,
+                "native_dispatch_total": dispatch_total,
+                "native_gpu_share": gpu_share,
+                "native_cpu_full_sync_total": max(
+                    0,
+                    int(item.get("native_cpu_full_sync_total", 0)),
+                ),
+                "native_cpu_partial_sync_total": max(
+                    0,
+                    int(item.get("native_cpu_partial_sync_total", 0)),
+                ),
+                "native_cpu_no_sync_total": max(
+                    0,
+                    int(item.get("native_cpu_no_sync_total", 0)),
+                ),
+                "native_cpu_synced_tensors_total": max(
+                    0,
+                    int(item.get("native_cpu_synced_tensors_total", 0)),
+                ),
+                "native_final_sync_total": max(
+                    0,
+                    int(item.get("native_final_sync_total", 0)),
+                ),
+            }
+        )
+    return rows
+
+
+def _aggregate_native_counter_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    execution_calls_total = 0
+    kompute_calls_total = 0
+    gpu_dispatch_total = 0
+    cpu_fallback_total = 0
+    cpu_full_sync_total = 0
+    cpu_partial_sync_total = 0
+    cpu_no_sync_total = 0
+    cpu_synced_tensors_total = 0
+    final_sync_total = 0
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        execution_calls_total += max(0, int(item.get("native_execution_calls_total", 0)))
+        kompute_calls_total += max(0, int(item.get("native_kompute_calls_total", 0)))
+        gpu_dispatch_total += max(0, int(item.get("native_gpu_dispatch_total", 0)))
+        cpu_fallback_total += max(0, int(item.get("native_cpu_fallback_total", 0)))
+        cpu_full_sync_total += max(0, int(item.get("native_cpu_full_sync_total", 0)))
+        cpu_partial_sync_total += max(0, int(item.get("native_cpu_partial_sync_total", 0)))
+        cpu_no_sync_total += max(0, int(item.get("native_cpu_no_sync_total", 0)))
+        cpu_synced_tensors_total += max(0, int(item.get("native_cpu_synced_tensors_total", 0)))
+        final_sync_total += max(0, int(item.get("native_final_sync_total", 0)))
+    dispatch_total = gpu_dispatch_total + cpu_fallback_total
+    gpu_share = (
+        float(gpu_dispatch_total) / float(dispatch_total)
+        if dispatch_total > 0
+        else 0.0
+    )
+    return {
+        "generations": int(len(rows)),
+        "native_execution_calls_total": int(execution_calls_total),
+        "native_kompute_calls_total": int(kompute_calls_total),
+        "native_gpu_dispatch_total": int(gpu_dispatch_total),
+        "native_cpu_fallback_total": int(cpu_fallback_total),
+        "native_dispatch_total": int(dispatch_total),
+        "native_gpu_share": float(gpu_share),
+        "native_cpu_full_sync_total": int(cpu_full_sync_total),
+        "native_cpu_partial_sync_total": int(cpu_partial_sync_total),
+        "native_cpu_no_sync_total": int(cpu_no_sync_total),
+        "native_cpu_synced_tensors_total": int(cpu_synced_tensors_total),
+        "native_final_sync_total": int(final_sync_total),
+    }
+
+
 def _make_random_genome(initial_instructions: int, *, slot_count: Optional[int] = None) -> GFSLGenome:
     genome = GFSLGenome("algorithm", slot_count=slot_count)
     _apply_runtime_operation_profile(genome)
@@ -4792,6 +4909,39 @@ def _run_defender_round(
             stage_stats["target_batch_seconds"] = float(
                 target_calibrator.observe(observed_batch_seconds)
             )
+        native_execution_calls_total = int(
+            round(_sum_metric(metrics, "native_execution_calls"))
+        )
+        native_kompute_calls_total = int(
+            round(_sum_metric(metrics, "native_kompute_calls"))
+        )
+        native_gpu_dispatch_total = int(
+            round(_sum_metric(metrics, "native_gpu_dispatch_count"))
+        )
+        native_cpu_fallback_total = int(
+            round(_sum_metric(metrics, "native_cpu_fallback_count"))
+        )
+        native_cpu_full_sync_total = int(
+            round(_sum_metric(metrics, "native_cpu_full_sync_count"))
+        )
+        native_cpu_partial_sync_total = int(
+            round(_sum_metric(metrics, "native_cpu_partial_sync_count"))
+        )
+        native_cpu_no_sync_total = int(
+            round(_sum_metric(metrics, "native_cpu_no_sync_count"))
+        )
+        native_cpu_synced_tensors_total = int(
+            round(_sum_metric(metrics, "native_cpu_synced_tensors"))
+        )
+        native_final_sync_total = int(
+            round(_sum_metric(metrics, "native_final_sync_count"))
+        )
+        native_dispatch_total = native_gpu_dispatch_total + native_cpu_fallback_total
+        native_gpu_share = (
+            float(native_gpu_dispatch_total) / float(native_dispatch_total)
+            if native_dispatch_total > 0
+            else 0.0
+        )
 
         row = {
             "generation": int(gen),
@@ -4849,6 +4999,17 @@ def _run_defender_round(
                 stage_stats.get("target_batch_seconds", target_calibrator.target_seconds)
             ),
             "stall_immigrants": int(getattr(evolver, "_last_stall_immigrants", 0)),
+            "native_execution_calls_total": int(native_execution_calls_total),
+            "native_kompute_calls_total": int(native_kompute_calls_total),
+            "native_gpu_dispatch_total": int(native_gpu_dispatch_total),
+            "native_cpu_fallback_total": int(native_cpu_fallback_total),
+            "native_dispatch_total": int(native_dispatch_total),
+            "native_gpu_share": float(native_gpu_share),
+            "native_cpu_full_sync_total": int(native_cpu_full_sync_total),
+            "native_cpu_partial_sync_total": int(native_cpu_partial_sync_total),
+            "native_cpu_no_sync_total": int(native_cpu_no_sync_total),
+            "native_cpu_synced_tensors_total": int(native_cpu_synced_tensors_total),
+            "native_final_sync_total": int(native_final_sync_total),
         }
         generation_log.append(row)
         print(
@@ -5664,6 +5825,39 @@ def _run_attacker_round(
             stage_stats["target_batch_seconds"] = float(
                 target_calibrator.observe(observed_batch_seconds)
             )
+        native_execution_calls_total = int(
+            round(_sum_metric(metrics, "native_execution_calls"))
+        )
+        native_kompute_calls_total = int(
+            round(_sum_metric(metrics, "native_kompute_calls"))
+        )
+        native_gpu_dispatch_total = int(
+            round(_sum_metric(metrics, "native_gpu_dispatch_count"))
+        )
+        native_cpu_fallback_total = int(
+            round(_sum_metric(metrics, "native_cpu_fallback_count"))
+        )
+        native_cpu_full_sync_total = int(
+            round(_sum_metric(metrics, "native_cpu_full_sync_count"))
+        )
+        native_cpu_partial_sync_total = int(
+            round(_sum_metric(metrics, "native_cpu_partial_sync_count"))
+        )
+        native_cpu_no_sync_total = int(
+            round(_sum_metric(metrics, "native_cpu_no_sync_count"))
+        )
+        native_cpu_synced_tensors_total = int(
+            round(_sum_metric(metrics, "native_cpu_synced_tensors"))
+        )
+        native_final_sync_total = int(
+            round(_sum_metric(metrics, "native_final_sync_count"))
+        )
+        native_dispatch_total = native_gpu_dispatch_total + native_cpu_fallback_total
+        native_gpu_share = (
+            float(native_gpu_dispatch_total) / float(native_dispatch_total)
+            if native_dispatch_total > 0
+            else 0.0
+        )
         row = {
             "generation": int(gen),
             "attack_score": float(best_fitness),
@@ -5707,6 +5901,17 @@ def _run_attacker_round(
                 stage_stats.get("target_batch_seconds", target_calibrator.target_seconds)
             ),
             "stall_immigrants": int(getattr(evolver, "_last_stall_immigrants", 0)),
+            "native_execution_calls_total": int(native_execution_calls_total),
+            "native_kompute_calls_total": int(native_kompute_calls_total),
+            "native_gpu_dispatch_total": int(native_gpu_dispatch_total),
+            "native_cpu_fallback_total": int(native_cpu_fallback_total),
+            "native_dispatch_total": int(native_dispatch_total),
+            "native_gpu_share": float(native_gpu_share),
+            "native_cpu_full_sync_total": int(native_cpu_full_sync_total),
+            "native_cpu_partial_sync_total": int(native_cpu_partial_sync_total),
+            "native_cpu_no_sync_total": int(native_cpu_no_sync_total),
+            "native_cpu_synced_tensors_total": int(native_cpu_synced_tensors_total),
+            "native_final_sync_total": int(native_final_sync_total),
         }
         generation_log.append(row)
         print(
@@ -6495,6 +6700,8 @@ def run_continuous_experiment(
         last_reference_score = -float("inf")
         last_reference_signature = ""
         last_round_dir = None
+        last_defender_log: List[Dict[str, Any]] = []
+        last_attacker_log: List[Dict[str, Any]] = []
 
         current_attacker: Optional[GFSLGenome] = None
         if archive.get("attacker_elites"):
@@ -6773,6 +6980,8 @@ def run_continuous_experiment(
                 )
             archive["defender_anti_attacker_elites"] = anti_entries
 
+            defender_native_rows = _generation_native_counter_rows(defender_log)
+            attacker_native_rows = _generation_native_counter_rows(attacker_log)
             round_summary = {
                 "round": round_index,
                 "timestamp": _utc_now_iso(),
@@ -6791,6 +7000,14 @@ def run_continuous_experiment(
                 "round_dir": str(round_dir),
                 "defender_log": defender_log,
                 "attacker_log": attacker_log,
+                "generation_native_counters": {
+                    "defender": defender_native_rows,
+                    "attacker": attacker_native_rows,
+                },
+                "generation_native_totals": {
+                    "defender": _aggregate_native_counter_rows(defender_native_rows),
+                    "attacker": _aggregate_native_counter_rows(attacker_native_rows),
+                },
                 "defender_stop_reason": (
                     str(defender_log[-1].get("stop_reason", ""))
                     if defender_log
@@ -6862,6 +7079,61 @@ def run_continuous_experiment(
             last_reference_score = reference_score
             last_reference_signature = reference_signature
             last_round_dir = round_dir
+            last_defender_log = list(defender_log)
+            last_attacker_log = list(attacker_log)
+            partial_summary = {
+                "status": "running",
+                "config": {
+                    **asdict(config),
+                    "out_dir": str(out_dir),
+                },
+                "resources": {
+                    **resource_plan.to_dict(),
+                    "executor_backend": _normalize_executor_backend(config.executor_backend),
+                },
+                "rounds_completed": len(archive.get("rounds", [])),
+                "last_round": {
+                    "score": float(last_defender_score),
+                    "signature": str(last_defender_signature),
+                    "attacker_score": float(last_attacker_score),
+                    "attacker_signature": str(last_attacker_signature),
+                    "reference_score": (
+                        float(last_reference_score)
+                        if math.isfinite(float(last_reference_score))
+                        else None
+                    ),
+                    "reference_signature": (
+                        str(last_reference_signature)
+                        if str(last_reference_signature)
+                        else None
+                    ),
+                    "score_delta_vs_reference": (
+                        float(last_defender_score - last_reference_score)
+                        if math.isfinite(float(last_reference_score))
+                        else None
+                    ),
+                    "round_dir": str(last_round_dir) if last_round_dir else None,
+                    "generation_native_counters": {
+                        "defender": _generation_native_counter_rows(last_defender_log),
+                        "attacker": _generation_native_counter_rows(last_attacker_log),
+                    },
+                    "generation_native_totals": {
+                        "defender": _aggregate_native_counter_rows(
+                            _generation_native_counter_rows(last_defender_log)
+                        ),
+                        "attacker": _aggregate_native_counter_rows(
+                            _generation_native_counter_rows(last_attacker_log)
+                        ),
+                    },
+                },
+            }
+            try:
+                (out_dir / "results.json").write_text(
+                    json.dumps(partial_summary, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
 
             print(
                 "[pcpl-evolvo] round={round:04d} defender={def_score:.6f} attacker={atk_score:.6f}".format(
@@ -6929,6 +7201,18 @@ def run_continuous_experiment(
                     else None
                 ),
                 "round_dir": str(last_round_dir) if last_round_dir else None,
+                "generation_native_counters": {
+                    "defender": _generation_native_counter_rows(last_defender_log),
+                    "attacker": _generation_native_counter_rows(last_attacker_log),
+                },
+                "generation_native_totals": {
+                    "defender": _aggregate_native_counter_rows(
+                        _generation_native_counter_rows(last_defender_log)
+                    ),
+                    "attacker": _aggregate_native_counter_rows(
+                        _generation_native_counter_rows(last_attacker_log)
+                    ),
+                },
             },
             "views": view_paths,
         }
