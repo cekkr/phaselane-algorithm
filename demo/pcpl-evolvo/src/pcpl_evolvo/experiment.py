@@ -1007,7 +1007,14 @@ def _resolve_resource_plan(config: ExperimentConfig, max_population: int) -> Res
     ):
         # Vulkan drivers can become unstable under heavy process forking; prefer threads here.
         resolved_backend = "thread"
-        workers = max(1, min(workers, 8))
+        thread_cap = max(1, min(cpu_count, 16))
+        thread_cap_raw = str(os.environ.get("EVOLVO_KOMPUTE_THREAD_WORKERS", "")).strip()
+        if thread_cap_raw:
+            try:
+                thread_cap = max(1, min(cpu_count, int(thread_cap_raw)))
+            except ValueError:
+                pass
+        workers = max(1, min(workers, thread_cap))
 
     gpu_backend, gpu_available, torch_available = _detect_gpu_backend(config.preferred_device)
     return ResourcePlan(

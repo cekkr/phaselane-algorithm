@@ -6,6 +6,7 @@ import copy
 import hashlib
 import math
 import random
+import threading
 import time
 from dataclasses import asdict, dataclass
 from functools import lru_cache
@@ -105,6 +106,48 @@ OPERATION_COST_UNITS = {
 }
 DEFAULT_OPERATION_COST = 1.0
 PCPL_CUSTOM_OP_CODES: Dict[str, int] = {}
+_EXECUTOR_CACHE_LOCAL = threading.local()
+_MAX_THREAD_EXECUTOR_CACHE = 16
+
+
+def _executor_cache_store() -> Dict[Tuple[str, Tuple[Tuple[str, str], ...]], GFSLExecutor]:
+    store = getattr(_EXECUTOR_CACHE_LOCAL, "store", None)
+    if isinstance(store, dict):
+        return store
+    created: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], GFSLExecutor] = {}
+    _EXECUTOR_CACHE_LOCAL.store = created
+    return created
+
+
+def _executor_cache_key(
+    *,
+    role: str,
+    runtime_kwargs: Dict[str, object],
+) -> Tuple[str, Tuple[Tuple[str, str], ...]]:
+    normalized = tuple(
+        sorted((str(key), repr(value)) for key, value in runtime_kwargs.items())
+    )
+    return (str(role).strip().lower() or "default", normalized)
+
+
+def _cached_scenario_executor(
+    *,
+    role: str,
+    runtime_kwargs: Dict[str, object],
+) -> GFSLExecutor:
+    store = _executor_cache_store()
+    key = _executor_cache_key(role=role, runtime_kwargs=runtime_kwargs)
+    cached = store.get(key)
+    if cached is not None:
+        return cached
+    if len(store) >= int(_MAX_THREAD_EXECUTOR_CACHE):
+        store.clear()
+    executor = GFSLExecutor(
+        track_instruction_activity=False,
+        **runtime_kwargs,
+    )
+    store[key] = executor
+    return executor
 
 
 @dataclass(frozen=True)
@@ -1097,13 +1140,13 @@ def evaluate_scenario(
 
     runtime_kwargs = dict(executor_kwargs or {})
     runtime_kwargs.pop("track_instruction_activity", None)
-    defender_executor = GFSLExecutor(
-        track_instruction_activity=False,
-        **runtime_kwargs,
+    defender_executor = _cached_scenario_executor(
+        role="defender",
+        runtime_kwargs=runtime_kwargs,
     )
-    attacker_executor = GFSLExecutor(
-        track_instruction_activity=False,
-        **runtime_kwargs,
+    attacker_executor = _cached_scenario_executor(
+        role="attacker",
+        runtime_kwargs=runtime_kwargs,
     )
 
     defender_units = 0.0
