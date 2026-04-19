@@ -1436,10 +1436,28 @@ def _resolve_round_parallel_plan(
             lanes = max(1, min(requested_lanes, total_rounds, budget_workers))
         else:
             executor_backend = _normalize_executor_backend(config.executor_backend)
-            max_lanes = 4 if executor_backend in {"kompute", "kompute-sim"} else 6
-            if executor_backend in {"kompute", "kompute-sim"}:
-                target_workers_per_round = 2 if budget_workers >= 4 else 1
+            runtime_mode = str(config.kompute_runtime_mode).strip().lower()
+            if runtime_mode not in {"native", "simulated", "auto"}:
+                runtime_mode = "native"
+            kompute_like = bool(
+                executor_backend in {"kompute", "kompute-sim"}
+                or (
+                    executor_backend == "auto"
+                    and runtime_mode in {"native", "auto"}
+                    and _has_kp_bindings()
+                )
+            )
+            if kompute_like:
+                # Keep Kompute lanes wider by default to increase useful GPU pressure per round.
+                max_lanes = 3
+                if budget_workers >= 12:
+                    target_workers_per_round = 6
+                elif budget_workers >= 8:
+                    target_workers_per_round = 4
+                else:
+                    target_workers_per_round = 2 if budget_workers >= 4 else 1
             else:
+                max_lanes = 6
                 target_workers_per_round = 3 if budget_workers >= 8 else (2 if budget_workers >= 4 else 1)
             lanes = max(1, budget_workers // max(1, target_workers_per_round))
             lanes = min(lanes, total_rounds)
@@ -4105,6 +4123,7 @@ def _compact_round_summary_for_archive(entry: Dict[str, Any]) -> Dict[str, Any]:
         "selection_panel": {
             "attacker_panel_size": int(panel_payload.get("attacker_panel_size", 0)),
             "attacker_panel_penalty": float(panel_payload.get("attacker_panel_penalty", 0.0)),
+            "timeout_recheck": bool(panel_payload.get("timeout_recheck", False)),
             "defender_robust_score": float(panel_payload.get("defender_robust_score", 0.0)),
             "defender_panel_worst_score": float(panel_payload.get("defender_panel_worst_score", 0.0)),
             "defender_panel_worst_attacker_adv": float(panel_payload.get("defender_panel_worst_attacker_adv", 0.0)),
@@ -5014,6 +5033,14 @@ def _run_defender_round(
                 attacker=attacker,
             )
             best._pcpl_metrics = metrics
+        best_objective_score = float(best_fitness)
+        best_total_score = _mean_metric(metrics, "total_score")
+        if math.isfinite(float(best_total_score)):
+            best_fitness = float(best_total_score)
+            try:
+                best.fitness = float(best_total_score)
+            except Exception:
+                pass
         observed_batch_seconds = float(stage_stats.get("batch_seconds", 0.0))
         if observed_batch_seconds > 0.0:
             stage_stats["target_batch_seconds"] = float(
@@ -5056,6 +5083,8 @@ def _run_defender_round(
         row = {
             "generation": int(gen),
             "best_score": float(best_fitness),
+            "best_objective_score": float(best_objective_score),
+            "best_total_score": float(best_total_score),
             "best_signature": _evaluation_signature(best),
             "principle": _mean_metric(metrics, "principle_score"),
             "sync_score": _mean_metric(metrics, "sync_score"),
@@ -5123,9 +5152,11 @@ def _run_defender_round(
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} sync={sync:.4f} hs={hs:.4f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} gate={gate}@{gthr:.3f}/{gp:.2f} neu={np}/{nr} imm={imm} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
+            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} objective={objective:.5f} total={total:.5f} sync={sync:.4f} hs={hs:.4f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} gate={gate}@{gthr:.3f}/{gp:.2f} neu={np}/{nr} imm={imm} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
+                objective=row["best_objective_score"],
+                total=row["best_total_score"],
                 sync=row["sync_score"],
                 hs=row["horizon_sync"],
                 security=row["security"],
@@ -6852,29 +6883,65 @@ def _run_round_from_snapshot(
                     panel_primary_metrics[id(candidate)] = _metrics_rows(metrics)
 
         panel_penalty = max(0.0, float(config.attacker_panel_penalty))
-        ranked_candidates: List[Tuple[float, GFSLGenome, float, float, float]] = []
-        for candidate in top_candidates:
-            scores = panel_scores.get(id(candidate), [])
-            advantages = panel_advantages.get(id(candidate), [])
-            if not scores:
-                scores = [float(candidate.fitness or -float("inf"))]
-            if not advantages:
-                advantages = [0.0]
-            base_score = float(scores[0])
-            worst_score = float(min(scores))
-            mean_score = float(sum(scores) / float(max(1, len(scores))))
-            worst_adv = float(max(advantages))
-            robust_score = (
-                (0.42 * base_score)
-                + (0.38 * worst_score)
-                + (0.20 * mean_score)
-                - (panel_penalty * worst_adv)
-            )
-            ranked_candidates.append(
-                (robust_score, candidate, base_score, worst_score, worst_adv)
-            )
+        def _rank_from_panel_scores() -> List[Tuple[float, GFSLGenome, float, float, float]]:
+            ranked: List[Tuple[float, GFSLGenome, float, float, float]] = []
+            for candidate in top_candidates:
+                scores = panel_scores.get(id(candidate), [])
+                advantages = panel_advantages.get(id(candidate), [])
+                if not scores:
+                    scores = [float(candidate.fitness or -float("inf"))]
+                if not advantages:
+                    advantages = [0.0]
+                base_score = float(scores[0])
+                worst_score = float(min(scores))
+                mean_score = float(sum(scores) / float(max(1, len(scores))))
+                worst_adv = float(max(advantages))
+                robust_score = (
+                    (0.42 * base_score)
+                    + (0.38 * worst_score)
+                    + (0.20 * mean_score)
+                    - (panel_penalty * worst_adv)
+                )
+                ranked.append(
+                    (robust_score, candidate, base_score, worst_score, worst_adv)
+                )
+            ranked.sort(key=lambda item: item[0], reverse=True)
+            return ranked
 
-        ranked_candidates.sort(key=lambda item: item[0], reverse=True)
+        ranked_candidates = _rank_from_panel_scores()
+        timeout_cut = float(_timeout_cut_score(role="defender"))
+        panel_timeout_recheck = bool(
+            ranked_candidates
+            and max(float(item[2]) for item in ranked_candidates) <= (timeout_cut + 1e-9)
+        )
+        if panel_timeout_recheck:
+            print(
+                "[pcpl-evolvo] round={round:04d} defender panel timeout collapse detected; reranking candidates with direct evaluation.".format(
+                    round=int(round_index),
+                )
+            )
+            panel_scores = {id(candidate): [] for candidate in top_candidates}
+            panel_advantages = {id(candidate): [] for candidate in top_candidates}
+            panel_primary_metrics = {}
+            for panel_index, panel_attacker in enumerate(attacker_panel):
+                for candidate in top_candidates:
+                    try:
+                        score, candidate_metrics = _evaluate_across_scenarios_runtime(
+                            selection_scenarios,
+                            candidate,
+                            attacker=panel_attacker,
+                        )
+                    except Exception:
+                        score = timeout_cut
+                        candidate_metrics = []
+                    panel_scores[id(candidate)].append(float(score))
+                    panel_advantages[id(candidate)].append(
+                        _mean_metric(candidate_metrics, "attacker_advantage_score")
+                    )
+                    if panel_index == 0:
+                        panel_primary_metrics[id(candidate)] = _metrics_rows(candidate_metrics)
+            ranked_candidates = _rank_from_panel_scores()
+
         selected_robust_score, selected_defender, selected_panel_base_score, selected_panel_worst_score, selected_panel_worst_adv = ranked_candidates[0]
         selected_eval_score, selected_metrics = _evaluate_across_scenarios_runtime(
             selection_scenarios,
@@ -6972,6 +7039,7 @@ def _run_round_from_snapshot(
             "selection_panel": {
                 "attacker_panel_size": int(len(attacker_panel)),
                 "attacker_panel_penalty": float(panel_penalty),
+                "timeout_recheck": bool(panel_timeout_recheck),
                 "defender_robust_score": float(selected_robust_score),
                 "defender_panel_worst_score": float(selected_panel_worst_score),
                 "defender_panel_worst_attacker_adv": float(selected_panel_worst_adv),
