@@ -153,6 +153,7 @@ class RoundParallelPlan:
     cpu_utilization_target: float
     gpu_utilization_target: float
     learning_sync: str = "batch-start"
+    host_cpu_load_ratio: float = -1.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -287,6 +288,19 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return int(default)
+
+
+def _normalized_host_cpu_load_ratio() -> Optional[float]:
+    if not hasattr(os, "getloadavg"):
+        return None
+    try:
+        load_1m, _load_5m, _load_15m = os.getloadavg()
+    except Exception:
+        return None
+    if not math.isfinite(float(load_1m)):
+        return None
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    return clamp(float(load_1m) / float(cpu_count), 0.0, 2.5)
 
 
 def _sample_gpu_utilization_percent(backend: str) -> Optional[float]:
@@ -1431,6 +1445,7 @@ def _resolve_round_parallel_plan(
     )
     requested_lanes = int(config.round_parallelism)
     lanes = 1
+    host_cpu_load_ratio = _normalized_host_cpu_load_ratio()
     if total_rounds > 1 and budget_workers > 1 and resource_plan.parallel_backend != "off":
         if requested_lanes > 0:
             lanes = max(1, min(requested_lanes, total_rounds, budget_workers))
@@ -1456,6 +1471,30 @@ def _resolve_round_parallel_plan(
                     target_workers_per_round = 4
                 else:
                     target_workers_per_round = 2 if budget_workers >= 4 else 1
+                if host_cpu_load_ratio is not None:
+                    low_cut = clamp(
+                        float(resource_plan.cpu_utilization_target) * 0.45,
+                        0.05,
+                        0.70,
+                    )
+                    high_cut = clamp(
+                        float(resource_plan.cpu_utilization_target) * 1.05,
+                        0.20,
+                        1.50,
+                    )
+                    # loadavg is already normalized by host core count; this avoids
+                    # treating "one busy core == 100% host usage" on multi-core systems.
+                    if host_cpu_load_ratio <= low_cut:
+                        target_workers_per_round = max(
+                            2,
+                            int(target_workers_per_round) - 1,
+                        )
+                        max_lanes = min(5, max_lanes + 1)
+                    elif host_cpu_load_ratio >= high_cut:
+                        target_workers_per_round = min(
+                            int(budget_workers),
+                            int(target_workers_per_round) + 1,
+                        )
             else:
                 max_lanes = 6
                 target_workers_per_round = 3 if budget_workers >= 8 else (2 if budget_workers >= 4 else 1)
@@ -1482,6 +1521,11 @@ def _resolve_round_parallel_plan(
         cpu_utilization_target=float(resource_plan.cpu_utilization_target),
         gpu_utilization_target=float(resource_plan.gpu_utilization_target),
         learning_sync=learning_sync,
+        host_cpu_load_ratio=(
+            float(host_cpu_load_ratio)
+            if host_cpu_load_ratio is not None
+            else -1.0
+        ),
     )
 
 
@@ -7256,11 +7300,17 @@ def run_continuous_experiment(
             gpu_budget=f"{round_plan.gpu_utilization_target:.2f}",
         )
     )
+    host_cpu_load_text = (
+        f"{float(round_plan.host_cpu_load_ratio):.3f}"
+        if float(round_plan.host_cpu_load_ratio) >= 0.0
+        else "n/a"
+    )
     print(
-        "[pcpl-evolvo] rounds parallel lanes={lanes} workers-per-round={workers} learning-sync={sync}".format(
+        "[pcpl-evolvo] rounds parallel lanes={lanes} workers-per-round={workers} learning-sync={sync} host-cpu-load={cpu_load}".format(
             lanes=int(round_plan.lanes),
             workers=int(round_plan.workers_per_round),
             sync=str(round_plan.learning_sync),
+            cpu_load=host_cpu_load_text,
         )
     )
     if gpu_autotuner is not None and bool(gpu_autotuner.enabled):
@@ -7642,12 +7692,17 @@ def run_continuous_experiment(
             )
         )
         report_lines.append(
-            "- round parallelization: lanes={lanes} workers-per-round={workers} learning-sync={sync} budget(cpu={cpu:.2f},gpu={gpu:.2f})".format(
+            "- round parallelization: lanes={lanes} workers-per-round={workers} learning-sync={sync} budget(cpu={cpu:.2f},gpu={gpu:.2f}) host_cpu_load={cpu_load}".format(
                 lanes=int(round_plan.lanes),
                 workers=int(round_plan.workers_per_round),
                 sync=str(round_plan.learning_sync),
                 cpu=float(round_plan.cpu_utilization_target),
                 gpu=float(round_plan.gpu_utilization_target),
+                cpu_load=(
+                    f"{float(round_plan.host_cpu_load_ratio):.3f}"
+                    if float(round_plan.host_cpu_load_ratio) >= 0.0
+                    else "n/a"
+                ),
             )
         )
         report_lines.append(
