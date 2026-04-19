@@ -6875,11 +6875,16 @@ def _run_round_from_snapshot(
             )
 
         ranked_candidates.sort(key=lambda item: item[0], reverse=True)
-        selected_robust_score, selected_defender, selected_score, selected_panel_worst_score, selected_panel_worst_adv = ranked_candidates[0]
-        _, selected_metrics = _evaluate_across_scenarios_runtime(
+        selected_robust_score, selected_defender, selected_panel_base_score, selected_panel_worst_score, selected_panel_worst_adv = ranked_candidates[0]
+        selected_eval_score, selected_metrics = _evaluate_across_scenarios_runtime(
             selection_scenarios,
             selected_defender,
             attacker=best_attacker,
+        )
+        selected_score = (
+            float(selected_eval_score)
+            if math.isfinite(float(selected_eval_score))
+            else float(selected_panel_base_score)
         )
 
         reference_defender = build_reference_defender_genome()
@@ -7402,12 +7407,30 @@ def run_continuous_experiment(
         offset = 0
         while offset < total_rounds:
             batch_size = min(lane_count, total_rounds - offset)
+            batch_round_indices = [
+                int(start_round + offset + lane_offset)
+                for lane_offset in range(batch_size)
+            ]
             batch_archive_snapshot = copy.deepcopy(archive)
             attacker_payload = (
                 _serialize_genome(current_attacker, role="attacker")
                 if current_attacker is not None
                 else None
             )
+            if batch_size > 1:
+                print(
+                    "[pcpl-evolvo] round-batch launch mode=parallel lanes={lanes} rounds={rounds} sync={sync}".format(
+                        lanes=int(batch_size),
+                        rounds=",".join(f"{idx:04d}" for idx in batch_round_indices),
+                        sync=str(round_plan.learning_sync),
+                    )
+                )
+            else:
+                print(
+                    "[pcpl-evolvo] round-batch launch mode=sequential round={round_idx:04d}".format(
+                        round_idx=int(batch_round_indices[0]),
+                    )
+                )
             if batch_size <= 1 or round_executor is None:
                 round_index = start_round + offset
                 result = _run_round_from_snapshot(
@@ -7444,6 +7467,11 @@ def run_continuous_experiment(
             batch_results.sort(key=lambda item: int(item.round_index))
             for result in batch_results:
                 _merge_round_result(result)
+            print(
+                "[pcpl-evolvo] round-batch complete rounds={rounds}".format(
+                    rounds=",".join(f"{int(item.round_index):04d}" for item in batch_results),
+                )
+            )
             offset += batch_size
 
         # Build global summary and report.
