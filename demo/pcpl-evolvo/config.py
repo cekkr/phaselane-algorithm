@@ -28,6 +28,10 @@ BASE_DEFAULTS: Dict[str, Any] = {
     "continuous_max_iterations": 0,
     "workers": 0,
     "parallel_backend": "process",
+    "round_parallelism": 0,
+    "max_cpu_utilization": 0.75,
+    "max_gpu_utilization": 0.75,
+    "round_state_sync": "batch-start",
     "executor_backend": str(ACCELERATION_DEFAULTS.get("executor_backend", "auto")),
     "kompute_runtime_mode": str(
         ACCELERATION_DEFAULTS.get("kompute_runtime_mode", "native")

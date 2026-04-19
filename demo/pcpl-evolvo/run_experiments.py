@@ -937,6 +937,10 @@ def _build_experiment_config(
         resume=resume,
         parallel_workers=workers,
         parallel_backend=args.parallel_backend,
+        round_parallelism=int(args.round_parallelism),
+        max_cpu_utilization=float(args.max_cpu_utilization),
+        max_gpu_utilization=float(args.max_gpu_utilization),
+        round_state_sync=str(args.round_state_sync),
         executor_backend=args.executor_backend,
         kompute_runtime_mode=args.kompute_runtime_mode,
         kompute_warn_on_fallback=bool(args.kompute_warn_on_fallback),
@@ -1040,9 +1044,13 @@ def _resolve_continuous_lane_plan(
     grid_size: int,
     workers_arg: int,
     parallel_backend: str,
+    max_cpu_utilization: float = 0.75,
 ) -> Dict[str, int]:
     cpu_count = max(1, int(os.cpu_count() or 1))
-    total_workers = max(1, int(workers_arg)) if int(workers_arg) > 0 else cpu_count
+    cpu_budget_ratio = _clamp_float(float(max_cpu_utilization), 0.10, 1.0)
+    cpu_budget_workers = max(1, min(cpu_count, int(float(cpu_count) * cpu_budget_ratio)))
+    requested_workers = max(1, int(workers_arg)) if int(workers_arg) > 0 else cpu_budget_workers
+    total_workers = max(1, min(requested_workers, cpu_budget_workers))
     backend = str(parallel_backend).lower()
     if backend not in {"auto", "process", "thread", "off"}:
         backend = "auto"
@@ -1110,6 +1118,10 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "continuous_max_iterations": "continuous_max_iterations",
         "workers": "workers",
         "parallel_backend": "parallel_backend",
+        "round_parallelism": "round_parallelism",
+        "max_cpu_utilization": "max_cpu_utilization",
+        "max_gpu_utilization": "max_gpu_utilization",
+        "round_state_sync": "round_state_sync",
         "executor_backend": "executor_backend",
         "kompute_runtime_mode": "kompute_runtime_mode",
         "kompute_warn_on_fallback": "kompute_warn_on_fallback",
@@ -1236,6 +1248,24 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
     resolved["kompute_allow_process_pool"] = bool(
         resolved.get("kompute_allow_process_pool", False)
     )
+    resolved["round_parallelism"] = max(
+        0,
+        int(resolved.get("round_parallelism", 0)),
+    )
+    resolved["max_cpu_utilization"] = _clamp_float(
+        float(resolved.get("max_cpu_utilization", 0.75)),
+        0.10,
+        1.0,
+    )
+    resolved["max_gpu_utilization"] = _clamp_float(
+        float(resolved.get("max_gpu_utilization", 0.75)),
+        0.10,
+        1.0,
+    )
+    round_state_sync = str(resolved.get("round_state_sync", "batch-start")).strip().lower()
+    if round_state_sync not in {"batch-start", "batch", "start-only", "round-start"}:
+        round_state_sync = "batch-start"
+    resolved["round_state_sync"] = round_state_sync
     resolved["supervised_epochs"] = max(0, int(resolved.get("supervised_epochs", 0)))
     resolved["supervised_candidate_pool"] = max(0, int(resolved.get("supervised_candidate_pool", 0)))
     resolved["sync_loss_gate_percentile"] = _clamp_float(
@@ -1306,6 +1336,10 @@ def _apply_runtime_config(args: argparse.Namespace, resolved: Dict[str, Any]) ->
         "continuous_max_iterations",
         "workers",
         "parallel_backend",
+        "round_parallelism",
+        "max_cpu_utilization",
+        "max_gpu_utilization",
+        "round_state_sync",
         "executor_backend",
         "kompute_runtime_mode",
         "kompute_warn_on_fallback",
@@ -1387,6 +1421,14 @@ def _print_effective_config(resolved: Dict[str, Any]) -> None:
             apop=resolved["attacker_population_size"],
             agen=resolved["attacker_generations"],
             elite=resolved["elite_pool"],
+        )
+    )
+    print(
+        "[pcpl-evolvo] round-parallel lanes={lanes} caps(cpu={cpu:.2f},gpu={gpu:.2f}) learned-sync={sync}".format(
+            lanes=int(resolved["round_parallelism"]),
+            cpu=float(resolved["max_cpu_utilization"]),
+            gpu=float(resolved["max_gpu_utilization"]),
+            sync=str(resolved["round_state_sync"]),
         )
     )
     print(
@@ -1635,14 +1677,31 @@ def _print_summary(summary: Dict[str, Any]) -> None:
     print(f"[pcpl-evolvo] archive={summary['archive_path']}")
     if "resource_plan" in summary:
         plan = summary["resource_plan"]
+        per_round = plan.get("per_round_resource_plan", {}) if isinstance(plan, dict) else {}
+        if not isinstance(per_round, dict):
+            per_round = {}
+        round_parallel = plan.get("round_parallel_plan", {}) if isinstance(plan, dict) else {}
+        if not isinstance(round_parallel, dict):
+            round_parallel = {}
         print(
             "[pcpl-evolvo] resources backend={backend} workers={workers} gpu={gpu} exec={exec_backend}".format(
-                backend=plan.get("parallel_backend"),
-                workers=plan.get("parallel_workers"),
+                backend=per_round.get("parallel_backend", plan.get("parallel_backend")),
+                workers=per_round.get("parallel_workers", plan.get("parallel_workers")),
                 gpu=plan.get("gpu_backend"),
                 exec_backend=plan.get("executor_backend", "cpu"),
             )
         )
+        if round_parallel:
+            print(
+                "[pcpl-evolvo] round-parallel lanes={lanes} workers-per-round={workers} sync={sync}".format(
+                    lanes=round_parallel.get("lanes", 1),
+                    workers=round_parallel.get(
+                        "workers_per_round",
+                        per_round.get("parallel_workers", plan.get("parallel_workers", 1)),
+                    ),
+                    sync=round_parallel.get("learning_sync", "batch-start"),
+                )
+            )
     if "index_path" in summary:
         print(f"[pcpl-evolvo] index={summary['index_path']}")
     if "conclusion_path" in summary:
@@ -1790,6 +1849,34 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "process", "thread", "off"),
         default=None,
         help="Parallel backend for fitness evaluation.",
+    )
+    parser.add_argument(
+        "--round-parallelism",
+        type=int,
+        default=None,
+        help=(
+            "Concurrent round lanes. 0 means auto (safe batch-start snapshots, merged in round order)."
+        ),
+    )
+    parser.add_argument(
+        "--max-cpu-utilization",
+        type=float,
+        default=None,
+        help="Upper CPU utilization budget in [0,1] used to cap worker planning.",
+    )
+    parser.add_argument(
+        "--max-gpu-utilization",
+        type=float,
+        default=None,
+        help="Upper GPU utilization budget in [0,1] used to cap worker planning.",
+    )
+    parser.add_argument(
+        "--round-state-sync",
+        choices=("batch-start", "batch", "start-only", "round-start"),
+        default=None,
+        help=(
+            "When running concurrent round lanes, share learned/archive state only at batch start."
+        ),
     )
     parser.add_argument(
         "--executor-backend",
@@ -2288,6 +2375,12 @@ def main() -> None:
         raise ValueError("--debug-eval-timeout-seconds must be >= 0")
     if float(args.debug_eval_log_interval_seconds) < 0.0:
         raise ValueError("--debug-eval-log-interval-seconds must be >= 0")
+    if int(args.round_parallelism) < 0:
+        raise ValueError("--round-parallelism must be >= 0")
+    if not (0.0 < float(args.max_cpu_utilization) <= 1.0):
+        raise ValueError("--max-cpu-utilization must be in (0, 1]")
+    if not (0.0 < float(args.max_gpu_utilization) <= 1.0):
+        raise ValueError("--max-gpu-utilization must be in (0, 1]")
     resolved["fitness_schema_version"] = str(args.fitness_schema_version)
     resolved["analysis_tag"] = str(args.analysis_tag or "")
     resolved["replicates"] = int(args.replicates)
@@ -2473,6 +2566,7 @@ def main() -> None:
         grid_size=len(grid),
         workers_arg=int(args.workers),
         parallel_backend=str(args.parallel_backend),
+        max_cpu_utilization=float(args.max_cpu_utilization),
     )
     lane_count = int(lane_plan["lanes"])
     workers_per_lane = int(lane_plan["workers_per_lane"])

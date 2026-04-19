@@ -66,6 +66,10 @@ class ExperimentConfig:
     resume: bool = True
     parallel_workers: int = 0
     parallel_backend: str = "auto"  # auto|process|thread|off
+    round_parallelism: int = 0  # 0 -> auto, 1 -> sequential
+    max_cpu_utilization: float = 0.75
+    max_gpu_utilization: float = 0.75
+    round_state_sync: str = "batch-start"  # batch-start -> use learned state only at batch boundaries
     executor_backend: str = "auto"  # auto|cpu|kompute|kompute-sim
     kompute_runtime_mode: str = "native"  # native|simulated|auto
     kompute_warn_on_fallback: bool = True
@@ -128,7 +132,27 @@ class ResourcePlan:
     gpu_backend: str
     gpu_available: bool
     torch_available: bool
+    cpu_worker_budget: int
+    gpu_worker_budget: int
+    cpu_utilization_target: float
+    gpu_utilization_target: float
     platform: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RoundParallelPlan:
+    lanes: int
+    workers_per_round: int
+    parallel_backend: str
+    enabled: bool
+    cpu_worker_budget: int
+    gpu_worker_budget: int
+    cpu_utilization_target: float
+    gpu_utilization_target: float
+    learning_sync: str = "batch-start"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -1313,10 +1337,15 @@ def _detect_gpu_backend(preferred_device: str = "auto") -> Tuple[str, bool, bool
 
 def _resolve_resource_plan(config: ExperimentConfig, max_population: int) -> ResourcePlan:
     cpu_count = max(1, int(os.cpu_count() or 1))
+    cpu_util_target = clamp(float(config.max_cpu_utilization), 0.15, 1.0)
+    gpu_util_target = clamp(float(config.max_gpu_utilization), 0.15, 1.0)
+    cpu_worker_budget = max(1, min(cpu_count, int(math.floor(float(cpu_count) * cpu_util_target))))
+    gpu_worker_budget = max(1, min(cpu_count, int(math.floor(float(cpu_count) * gpu_util_target))))
     workers = int(config.parallel_workers)
     if workers <= 0:
-        workers = cpu_count
+        workers = cpu_worker_budget
     workers = max(1, min(workers, cpu_count))
+    workers = max(1, min(workers, cpu_worker_budget))
 
     requested_backend = str(config.parallel_backend).lower()
     if requested_backend not in {"auto", "process", "thread", "off"}:
@@ -1361,6 +1390,10 @@ def _resolve_resource_plan(config: ExperimentConfig, max_population: int) -> Res
             except ValueError:
                 pass
         workers = max(1, min(workers, thread_cap))
+    if executor_backend in {"kompute", "kompute-sim"} or auto_backend_prefers_kompute:
+        workers = max(1, min(workers, gpu_worker_budget))
+    if resolved_backend != "off" and workers <= 1:
+        resolved_backend = "off"
 
     gpu_backend, gpu_available, torch_available = _detect_gpu_backend(config.preferred_device)
     return ResourcePlan(
@@ -1370,7 +1403,67 @@ def _resolve_resource_plan(config: ExperimentConfig, max_population: int) -> Res
         gpu_backend=gpu_backend,
         gpu_available=gpu_available,
         torch_available=torch_available,
+        cpu_worker_budget=cpu_worker_budget,
+        gpu_worker_budget=gpu_worker_budget,
+        cpu_utilization_target=cpu_util_target,
+        gpu_utilization_target=gpu_util_target,
         platform=platform.platform(),
+    )
+
+
+def _resolve_round_parallel_plan(
+    config: ExperimentConfig,
+    resource_plan: ResourcePlan,
+) -> RoundParallelPlan:
+    total_rounds = max(1, int(config.rounds))
+    learning_sync_raw = str(config.round_state_sync).strip().lower()
+    learning_sync = "batch-start"
+    if learning_sync_raw in {"batch-start", "batch", "start-only", "round-start"}:
+        learning_sync = "batch-start"
+
+    budget_workers = max(
+        1,
+        min(
+            int(resource_plan.parallel_workers),
+            int(resource_plan.cpu_worker_budget),
+            int(resource_plan.gpu_worker_budget),
+        ),
+    )
+    requested_lanes = int(config.round_parallelism)
+    lanes = 1
+    if total_rounds > 1 and budget_workers > 1 and resource_plan.parallel_backend != "off":
+        if requested_lanes > 0:
+            lanes = max(1, min(requested_lanes, total_rounds, budget_workers))
+        else:
+            executor_backend = _normalize_executor_backend(config.executor_backend)
+            max_lanes = 4 if executor_backend in {"kompute", "kompute-sim"} else 6
+            if executor_backend in {"kompute", "kompute-sim"}:
+                target_workers_per_round = 2 if budget_workers >= 4 else 1
+            else:
+                target_workers_per_round = 3 if budget_workers >= 8 else (2 if budget_workers >= 4 else 1)
+            lanes = max(1, budget_workers // max(1, target_workers_per_round))
+            lanes = min(lanes, total_rounds)
+            lanes = min(lanes, max_lanes)
+        lanes = max(1, min(lanes, budget_workers))
+
+    workers_per_round = max(1, budget_workers // max(1, lanes))
+    parallel_backend = str(resource_plan.parallel_backend)
+    if lanes > 1 and parallel_backend == "process":
+        # Running multiple concurrent process pools is fragile and often slower than thread lanes.
+        parallel_backend = "thread"
+    if workers_per_round <= 1:
+        parallel_backend = "off"
+
+    return RoundParallelPlan(
+        lanes=lanes,
+        workers_per_round=max(1, workers_per_round),
+        parallel_backend=parallel_backend,
+        enabled=bool(lanes > 1),
+        cpu_worker_budget=int(resource_plan.cpu_worker_budget),
+        gpu_worker_budget=int(resource_plan.gpu_worker_budget),
+        cpu_utilization_target=float(resource_plan.cpu_utilization_target),
+        gpu_utilization_target=float(resource_plan.gpu_utilization_target),
+        learning_sync=learning_sync,
     )
 
 
@@ -6571,6 +6664,385 @@ def _run_attacker_round(
     return evolver, generation_log
 
 
+@dataclass
+class _RoundExecutionResult:
+    round_index: int
+    defender_score: float
+    attacker_score: float
+    reference_score: float
+    defender_signature: str
+    attacker_signature: str
+    reference_signature: str
+    defender_record: Dict[str, Any]
+    attacker_record: Dict[str, Any]
+    anti_records: List[Dict[str, Any]]
+    round_summary: Dict[str, Any]
+    round_report: str
+    defender_genome_lines: List[str]
+    attacker_genome_lines: List[str]
+    defender_log: List[Dict[str, Any]]
+    attacker_log: List[Dict[str, Any]]
+    best_attacker_payload: Dict[str, Any]
+    predictive_updates: Dict[str, Dict[str, Any]]
+
+
+def _deserialize_attacker_payload(payload: Optional[Dict[str, Any]]) -> Optional[GFSLGenome]:
+    if not isinstance(payload, dict) or not payload:
+        return None
+    try:
+        attacker = _deserialize_genome(payload)
+        ensure_attacker_genome_io(attacker)
+        _apply_runtime_operation_profile(attacker)
+        return attacker
+    except Exception:
+        return None
+
+
+def _run_round_from_snapshot(
+    *,
+    round_index: int,
+    config: ExperimentConfig,
+    resource_plan: ResourcePlan,
+    eval_executor_kwargs: Dict[str, Any],
+    scenarios: Sequence[ScenarioConfig],
+    archive_snapshot: Dict[str, Any],
+    attacker_payload: Optional[Dict[str, Any]],
+) -> _RoundExecutionResult:
+    local_archive = copy.deepcopy(archive_snapshot)
+    current_attacker = _deserialize_attacker_payload(attacker_payload)
+    shared_executor: Optional[concurrent.futures.Executor] = None
+    if resource_plan.parallel_backend != "off" and resource_plan.parallel_workers > 1:
+        shared_executor = _create_shared_executor(
+            resource_plan,
+            eval_executor_kwargs=eval_executor_kwargs,
+        )
+    try:
+        defender_evolver, defender_log = _run_defender_round(
+            config=config,
+            resource_plan=resource_plan,
+            shared_executor=shared_executor,
+            scenarios=scenarios,
+            archive=local_archive,
+            attacker=current_attacker,
+        )
+
+        preliminary_defender = defender_evolver.population[0]
+        attacker_round_config, attacker_budget_meta = _adaptive_attacker_config_from_defender_log(
+            base_config=config,
+            defender_log=defender_log,
+        )
+        if attacker_budget_meta.get("active"):
+            print(
+                "[pcpl-evolvo] adaptive attacker budget: pop={pop} gen={gen} reason={reason} reuse={reuse:.2f} uniq={uniq:.2f} gain={gain:.6f}".format(
+                    pop=int(attacker_budget_meta.get("population", config.attacker_population_size)),
+                    gen=int(attacker_budget_meta.get("generations", config.attacker_generations)),
+                    reason=str(attacker_budget_meta.get("reason", "adaptive")),
+                    reuse=float(attacker_budget_meta.get("reuse_ratio", 0.0)),
+                    uniq=float(attacker_budget_meta.get("uniqueness_ratio", 0.0)),
+                    gain=float(attacker_budget_meta.get("score_gain", 0.0)),
+                )
+            )
+
+        attacker_evolver, attacker_log = _run_attacker_round(
+            config=attacker_round_config,
+            resource_plan=resource_plan,
+            shared_executor=shared_executor,
+            scenarios=scenarios,
+            archive=local_archive,
+            defender=preliminary_defender,
+        )
+        best_attacker = attacker_evolver.population[0]
+        ensure_attacker_genome_io(best_attacker)
+
+        defender_profile = getattr(defender_evolver, "_predictive_controller_state", {})
+        if not isinstance(defender_profile, dict):
+            defender_profile = {}
+        attacker_profile = getattr(attacker_evolver, "_predictive_controller_state", {})
+        if not isinstance(attacker_profile, dict):
+            attacker_profile = {}
+        defender_supervised = getattr(defender_evolver, "_supervised_guide_state", {})
+        if not isinstance(defender_supervised, dict):
+            defender_supervised = {}
+        attacker_supervised = getattr(attacker_evolver, "_supervised_guide_state", {})
+        if not isinstance(attacker_supervised, dict):
+            attacker_supervised = {}
+
+        selection_key_variants = max(
+            int(KEY_VARIANT_FLOOR),
+            int(defender_profile.get("key_variant_count", config.key_variant_count)),
+            int(attacker_profile.get("key_variant_count", config.key_variant_count)),
+        )
+        selection_scenarios = _build_stage_scenarios(
+            scenarios,
+            cycle_fraction=1.0,
+            key_variant_count=selection_key_variants,
+            complexity="hard",
+            device_mhz=config.device_mhz,
+            provider_mhz=config.provider_mhz,
+            max_test_time_seconds=config.max_test_time_seconds,
+        )
+
+        top_candidates = [
+            genome for genome in defender_evolver.population
+            if len(genome.extract_effective_algorithm()) > 0
+        ]
+        if not top_candidates:
+            top_candidates = defender_evolver.population[:]
+        if not top_candidates:
+            raise RuntimeError("defender round produced empty candidate pool")
+        top_candidates = top_candidates[: min(5, len(top_candidates))]
+        for candidate in top_candidates:
+            ensure_genome_io(candidate)
+
+        attacker_panel: List[GFSLGenome] = []
+        panel_seen: set[str] = set()
+
+        ensure_attacker_genome_io(best_attacker)
+        attacker_panel.append(best_attacker)
+        panel_seen.add(_evaluation_signature(best_attacker))
+
+        panel_size = max(1, int(config.attacker_panel_size))
+        if panel_size > 1:
+            for entry in local_archive.get("attacker_elites", []):
+                if len(attacker_panel) >= panel_size:
+                    break
+                try:
+                    payload = entry.get("genome", {})
+                    if not isinstance(payload, dict):
+                        continue
+                    panel_attacker = _deserialize_genome(payload)
+                    ensure_attacker_genome_io(panel_attacker)
+                    signature = _evaluation_signature(panel_attacker)
+                    if signature in panel_seen:
+                        continue
+                    attacker_panel.append(panel_attacker)
+                    panel_seen.add(signature)
+                except Exception:
+                    continue
+
+        panel_scores: Dict[int, List[float]] = {id(candidate): [] for candidate in top_candidates}
+        panel_advantages: Dict[int, List[float]] = {id(candidate): [] for candidate in top_candidates}
+        panel_primary_metrics: Dict[int, List[Dict[str, Any]]] = {}
+
+        for panel_index, panel_attacker in enumerate(attacker_panel):
+            candidate_pending = list(enumerate(top_candidates))
+            _evaluate_pending_parallel(
+                pending=candidate_pending,
+                backend=resource_plan.parallel_backend,
+                workers=resource_plan.parallel_workers,
+                executor=shared_executor,
+                worker_fn=_defender_eval_worker,
+                build_task=lambda g, atk=panel_attacker: (
+                    g,
+                    selection_scenarios,
+                    atk,
+                    "full",
+                ),
+                attr_name="_pcpl_metrics",
+                store_metrics=True,
+            )
+            for candidate in top_candidates:
+                score = float(candidate.fitness or -float("inf"))
+                metrics = getattr(candidate, "_pcpl_metrics", [])
+                panel_scores[id(candidate)].append(score)
+                panel_advantages[id(candidate)].append(
+                    _mean_metric(metrics, "attacker_advantage_score")
+                )
+                if panel_index == 0:
+                    panel_primary_metrics[id(candidate)] = _metrics_rows(metrics)
+
+        panel_penalty = max(0.0, float(config.attacker_panel_penalty))
+        ranked_candidates: List[Tuple[float, GFSLGenome, float, float, float]] = []
+        for candidate in top_candidates:
+            scores = panel_scores.get(id(candidate), [])
+            advantages = panel_advantages.get(id(candidate), [])
+            if not scores:
+                scores = [float(candidate.fitness or -float("inf"))]
+            if not advantages:
+                advantages = [0.0]
+            base_score = float(scores[0])
+            worst_score = float(min(scores))
+            mean_score = float(sum(scores) / float(max(1, len(scores))))
+            worst_adv = float(max(advantages))
+            robust_score = (
+                (0.42 * base_score)
+                + (0.38 * worst_score)
+                + (0.20 * mean_score)
+                - (panel_penalty * worst_adv)
+            )
+            ranked_candidates.append(
+                (robust_score, candidate, base_score, worst_score, worst_adv)
+            )
+
+        ranked_candidates.sort(key=lambda item: item[0], reverse=True)
+        selected_robust_score, selected_defender, selected_score, selected_panel_worst_score, selected_panel_worst_adv = ranked_candidates[0]
+        _, selected_metrics = _evaluate_across_scenarios_runtime(
+            selection_scenarios,
+            selected_defender,
+            attacker=best_attacker,
+        )
+
+        reference_defender = build_reference_defender_genome()
+        ensure_genome_io(reference_defender)
+        reference_score, reference_metrics = _evaluate_across_scenarios_runtime(
+            selection_scenarios,
+            reference_defender,
+            attacker=best_attacker,
+        )
+
+        attack_adv = _mean_metric(selected_metrics, "attacker_advantage_score")
+        defender_signature = selected_defender.get_signature()
+        attacker_signature = best_attacker.get_signature()
+        reference_signature = reference_defender.get_signature()
+
+        defender_record = {
+            "role": "defender",
+            "round": round_index,
+            "timestamp": _utc_now_iso(),
+            "score": float(selected_score),
+            "robust_score": float(selected_robust_score),
+            "panel_worst_score": float(selected_panel_worst_score),
+            "panel_worst_attacker_adv": float(selected_panel_worst_adv),
+            "panel_size": int(len(attacker_panel)),
+            "signature": defender_signature,
+            "canonical_signature": _canonical_signature(selected_defender),
+            "metrics": _metrics_rows(selected_metrics),
+            "genome": _serialize_genome(selected_defender, role="defender"),
+        }
+        attacker_record = {
+            "role": "attacker",
+            "round": round_index,
+            "timestamp": _utc_now_iso(),
+            "score": float(attack_adv),
+            "signature": attacker_signature,
+            "canonical_signature": _canonical_signature(best_attacker),
+            "metrics": _metrics_rows(selected_metrics),
+            "genome": _serialize_genome(best_attacker, role="attacker"),
+        }
+
+        anti_limit = max(8, int(math.ceil(float(config.archive_limit) * 0.5)))
+        anti_slice_keep = min(
+            len(ranked_candidates),
+            max(1, min(3, int(math.ceil(float(config.elite_pool) * 0.08)))),
+        )
+        anti_records: List[Dict[str, Any]] = []
+        for robust_score, candidate, base_score, worst_score, worst_adv in ranked_candidates[:anti_slice_keep]:
+            anti_records.append(
+                {
+                    "role": "defender-anti-attacker",
+                    "round": round_index,
+                    "timestamp": _utc_now_iso(),
+                    "score": float(robust_score),
+                    "base_score": float(base_score),
+                    "worst_score": float(worst_score),
+                    "worst_attacker_adv": float(worst_adv),
+                    "signature": candidate.get_signature(),
+                    "canonical_signature": _canonical_signature(candidate),
+                    "metrics": panel_primary_metrics.get(id(candidate), []),
+                    "genome": _serialize_genome(candidate, role="defender"),
+                    "_limit": int(anti_limit),
+                }
+            )
+
+        defender_native_rows = _generation_native_counter_rows(defender_log)
+        attacker_native_rows = _generation_native_counter_rows(attacker_log)
+        round_summary = {
+            "round": round_index,
+            "timestamp": _utc_now_iso(),
+            "defender_score": float(selected_score),
+            "defender_signature": defender_signature,
+            "attacker_score": float(attack_adv),
+            "attacker_signature": attacker_signature,
+            "round_dir": "",
+            "defender_log": defender_log,
+            "attacker_log": attacker_log,
+            "generation_native_counters": {
+                "defender": defender_native_rows,
+                "attacker": attacker_native_rows,
+            },
+            "generation_native_totals": {
+                "defender": _aggregate_native_counter_rows(defender_native_rows),
+                "attacker": _aggregate_native_counter_rows(attacker_native_rows),
+            },
+            "selection_panel": {
+                "attacker_panel_size": int(len(attacker_panel)),
+                "attacker_panel_penalty": float(panel_penalty),
+                "defender_robust_score": float(selected_robust_score),
+                "defender_panel_worst_score": float(selected_panel_worst_score),
+                "defender_panel_worst_attacker_adv": float(selected_panel_worst_adv),
+                "anti_attacker_slice": int(anti_slice_keep),
+            },
+            "defender_stop_reason": (
+                str(defender_log[-1].get("stop_reason", ""))
+                if defender_log
+                else ""
+            ),
+            "attacker_stop_reason": (
+                str(attacker_log[-1].get("stop_reason", ""))
+                if attacker_log
+                else ""
+            ),
+            "metrics": _metrics_rows(selected_metrics),
+            "predictive_profile": {
+                "defender": defender_profile,
+                "attacker": attacker_profile,
+                "defender_supervised": defender_supervised,
+                "attacker_supervised": attacker_supervised,
+                "selection_key_variants": selection_key_variants,
+            },
+            "adaptive_attacker_budget": attacker_budget_meta,
+            "reference_anchor": {
+                "score": float(reference_score),
+                "signature": reference_signature,
+                "canonical_signature": _canonical_signature(reference_defender),
+                "score_delta": float(selected_score - reference_score),
+                "metrics": _metrics_rows(reference_metrics),
+            },
+        }
+        round_report = _build_round_report(
+            config=config,
+            round_index=round_index,
+            scenarios=scenarios,
+            defender_score=selected_score,
+            defender_signature=defender_signature,
+            defender_metrics=selected_metrics,
+            attacker_score=attack_adv,
+            attacker_signature=attacker_signature,
+            defender_log=defender_log,
+            attacker_log=attacker_log,
+            reference_score=reference_score,
+            reference_signature=reference_signature,
+            reference_metrics=reference_metrics,
+        )
+        return _RoundExecutionResult(
+            round_index=int(round_index),
+            defender_score=float(selected_score),
+            attacker_score=float(attack_adv),
+            reference_score=float(reference_score),
+            defender_signature=str(defender_signature),
+            attacker_signature=str(attacker_signature),
+            reference_signature=str(reference_signature),
+            defender_record=defender_record,
+            attacker_record=attacker_record,
+            anti_records=anti_records,
+            round_summary=round_summary,
+            round_report=round_report,
+            defender_genome_lines=list(selected_defender.to_human_readable()),
+            attacker_genome_lines=list(best_attacker.to_human_readable()),
+            defender_log=list(defender_log),
+            attacker_log=list(attacker_log),
+            best_attacker_payload=_serialize_genome(best_attacker, role="attacker"),
+            predictive_updates={
+                "defender": defender_profile,
+                "attacker": attacker_profile,
+                "defender_supervised": defender_supervised,
+                "attacker_supervised": attacker_supervised,
+            },
+        )
+    finally:
+        _shutdown_shared_executor(shared_executor)
+
+
 def run_continuous_experiment(
     config: ExperimentConfig,
     scenarios: Optional[Sequence[ScenarioConfig]] = None,
@@ -6590,6 +7062,12 @@ def run_continuous_experiment(
         config,
         max(config.population_size, config.attacker_population_size),
     )
+    round_plan = _resolve_round_parallel_plan(config, resource_plan)
+    round_resource_plan = replace(
+        resource_plan,
+        parallel_workers=int(round_plan.workers_per_round),
+        parallel_backend=str(round_plan.parallel_backend),
+    )
     executor_backend = _normalize_executor_backend(config.executor_backend)
     _set_operation_profile_mode(
         "kompute" if executor_backend in {"kompute", "kompute-sim"} else "default"
@@ -6608,24 +7086,37 @@ def run_continuous_experiment(
     if (
         autotune_enabled
         and executor_backend in {"kompute", "kompute-sim"}
-        and resource_plan.parallel_backend == "thread"
-        and int(resource_plan.parallel_workers) > 1
+        and round_resource_plan.parallel_backend == "thread"
+        and int(round_resource_plan.parallel_workers) > 1
         and str(resource_plan.gpu_backend).strip().lower() in {"rocm", "cuda", "mps"}
     ):
+        per_round_budget_workers = max(
+            1,
+            min(
+                int(resource_plan.cpu_worker_budget),
+                int(resource_plan.gpu_worker_budget),
+            )
+            // max(1, int(round_plan.lanes)),
+        )
         default_max_workers = max(
-            int(resource_plan.parallel_workers),
+            min(
+                int(per_round_budget_workers),
+                int(math.ceil(float(round_resource_plan.parallel_workers) * 1.50)),
+            ),
             min(
                 int(resource_plan.cpu_count),
-                int(math.ceil(float(resource_plan.parallel_workers) * 1.50)),
+                int(per_round_budget_workers),
             ),
         )
+        default_max_workers = max(int(round_resource_plan.parallel_workers), int(default_max_workers))
         min_workers = max(
             1,
             _env_int(
                 "EVOLVO_GPU_AUTOTUNE_MIN_WORKERS",
-                max(2, int(math.ceil(float(resource_plan.parallel_workers) * 0.5))),
+                max(2, int(math.ceil(float(round_resource_plan.parallel_workers) * 0.5))),
             ),
         )
+        min_workers = min(min_workers, int(default_max_workers))
         max_workers = max(
             min_workers,
             _env_int(
@@ -6633,19 +7124,28 @@ def run_continuous_experiment(
                 int(default_max_workers),
             ),
         )
+        max_workers = max(
+            min_workers,
+            min(
+                int(max_workers),
+                int(per_round_budget_workers),
+            ),
+        )
+        target_high_default = clamp(float(round_plan.gpu_utilization_target) * 100.0, 10.0, 99.0)
+        target_low_default = clamp(target_high_default * 0.68, 5.0, max(6.0, target_high_default - 3.0))
         gpu_autotuner = _GpuWorkerAutotuner(
             enabled=True,
             backend=str(resource_plan.gpu_backend),
             min_workers=min_workers,
             max_workers=max_workers,
-            current_workers=int(resource_plan.parallel_workers),
+            current_workers=int(round_resource_plan.parallel_workers),
             target_low_util=clamp(
-                _env_float("EVOLVO_GPU_AUTOTUNE_LOW", 48.0),
+                _env_float("EVOLVO_GPU_AUTOTUNE_LOW", target_low_default),
                 5.0,
                 95.0,
             ),
             target_high_util=clamp(
-                _env_float("EVOLVO_GPU_AUTOTUNE_HIGH", 86.0),
+                _env_float("EVOLVO_GPU_AUTOTUNE_HIGH", target_high_default),
                 10.0,
                 99.0,
             ),
@@ -6672,13 +7172,22 @@ def run_continuous_experiment(
     baseline_rows = _baseline_rows(scenario_list)
 
     print(
-        "[pcpl-evolvo] resources cpu={cpu} backend={backend} workers={workers} gpu={gpu} torch={torch} exec={exec_backend}".format(
+        "[pcpl-evolvo] resources cpu={cpu} backend={backend} workers={workers} gpu={gpu} torch={torch} exec={exec_backend} budget(cpu={cpu_budget},gpu={gpu_budget})".format(
             cpu=resource_plan.cpu_count,
-            backend=resource_plan.parallel_backend,
-            workers=resource_plan.parallel_workers,
+            backend=round_resource_plan.parallel_backend,
+            workers=round_resource_plan.parallel_workers,
             gpu=resource_plan.gpu_backend,
             torch=resource_plan.torch_available,
             exec_backend=str(eval_executor_kwargs.get("compute_backend", "cpu")),
+            cpu_budget=f"{round_plan.cpu_utilization_target:.2f}",
+            gpu_budget=f"{round_plan.gpu_utilization_target:.2f}",
+        )
+    )
+    print(
+        "[pcpl-evolvo] rounds parallel lanes={lanes} workers-per-round={workers} learning-sync={sync}".format(
+            lanes=int(round_plan.lanes),
+            workers=int(round_plan.workers_per_round),
+            sync=str(round_plan.learning_sync),
         )
     )
     if gpu_autotuner is not None and bool(gpu_autotuner.enabled):
@@ -6705,7 +7214,7 @@ def run_continuous_experiment(
                 interval=float(config.debug_eval_log_interval_seconds),
             )
         )
-    shared_executor: Optional[concurrent.futures.Executor] = None
+    round_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
     try:
         random.seed(config.seed)
@@ -6729,267 +7238,53 @@ def run_continuous_experiment(
             except Exception:
                 current_attacker = None
 
-        if resource_plan.parallel_backend != "off" and resource_plan.parallel_workers > 1:
-            shared_executor = _create_shared_executor(
-                resource_plan,
-                eval_executor_kwargs=eval_executor_kwargs,
-            )
-
         start_round = len(archive.get("rounds", []))
-        for offset in range(max(1, config.rounds)):
-            round_index = start_round + offset
+        total_rounds = max(1, int(config.rounds))
+        lane_count = int(max(1, round_plan.lanes))
+        if bool(round_plan.enabled) and lane_count > 1:
+            round_executor = concurrent.futures.ThreadPoolExecutor(max_workers=lane_count)
+
+        def _merge_round_result(result: _RoundExecutionResult) -> None:
+            nonlocal archive
+            nonlocal current_attacker
+            nonlocal last_defender_score
+            nonlocal last_attacker_score
+            nonlocal last_defender_signature
+            nonlocal last_attacker_signature
+            nonlocal last_reference_score
+            nonlocal last_reference_signature
+            nonlocal last_round_dir
+            nonlocal last_defender_log
+            nonlocal last_attacker_log
+
+            round_index = int(result.round_index)
             round_dir = rounds_dir / f"round-{round_index:04d}"
             round_dir.mkdir(parents=True, exist_ok=True)
 
-            # Defender evolution under current strongest attacker.
-            defender_evolver, defender_log = _run_defender_round(
-                config=config,
-                resource_plan=resource_plan,
-                shared_executor=shared_executor,
-                scenarios=scenario_list,
-                archive=archive,
-                attacker=current_attacker,
-            )
-
-            # Preliminary best defender from the round.
-            preliminary_defender = defender_evolver.population[0]
-
-            attacker_round_config, attacker_budget_meta = _adaptive_attacker_config_from_defender_log(
-                base_config=config,
-                defender_log=defender_log,
-            )
-            if attacker_budget_meta.get("active"):
-                print(
-                    "[pcpl-evolvo] adaptive attacker budget: pop={pop} gen={gen} reason={reason} reuse={reuse:.2f} uniq={uniq:.2f} gain={gain:.6f}".format(
-                        pop=int(attacker_budget_meta.get("population", config.attacker_population_size)),
-                        gen=int(attacker_budget_meta.get("generations", config.attacker_generations)),
-                        reason=str(attacker_budget_meta.get("reason", "adaptive")),
-                        reuse=float(attacker_budget_meta.get("reuse_ratio", 0.0)),
-                        uniq=float(attacker_budget_meta.get("uniqueness_ratio", 0.0)),
-                        gain=float(attacker_budget_meta.get("score_gain", 0.0)),
-                    )
-                )
-
-            # Attacker co-evolution against this defender.
-            attacker_evolver, attacker_log = _run_attacker_round(
-                config=attacker_round_config,
-                resource_plan=resource_plan,
-                shared_executor=shared_executor,
-                scenarios=scenario_list,
-                archive=archive,
-                defender=preliminary_defender,
-            )
-            best_attacker = attacker_evolver.population[0]
-            ensure_attacker_genome_io(best_attacker)
-
-            defender_profile = getattr(defender_evolver, "_predictive_controller_state", {})
-            if not isinstance(defender_profile, dict):
-                defender_profile = {}
-            attacker_profile = getattr(attacker_evolver, "_predictive_controller_state", {})
-            if not isinstance(attacker_profile, dict):
-                attacker_profile = {}
-            defender_supervised = getattr(defender_evolver, "_supervised_guide_state", {})
-            if not isinstance(defender_supervised, dict):
-                defender_supervised = {}
-            attacker_supervised = getattr(attacker_evolver, "_supervised_guide_state", {})
-            if not isinstance(attacker_supervised, dict):
-                attacker_supervised = {}
-            predictive_profile = archive.setdefault("predictive_profile", {})
-            if defender_profile:
-                predictive_profile["defender"] = defender_profile
-            if attacker_profile:
-                predictive_profile["attacker"] = attacker_profile
-            if defender_supervised:
-                predictive_profile["defender_supervised"] = defender_supervised
-            if attacker_supervised:
-                predictive_profile["attacker_supervised"] = attacker_supervised
-            selection_key_variants = max(
-                int(KEY_VARIANT_FLOOR),
-                int(defender_profile.get("key_variant_count", config.key_variant_count)),
-                int(attacker_profile.get("key_variant_count", config.key_variant_count)),
-            )
-            selection_scenarios = _build_stage_scenarios(
-                scenario_list,
-                cycle_fraction=1.0,
-                key_variant_count=selection_key_variants,
-                complexity="hard",
-                device_mhz=config.device_mhz,
-                provider_mhz=config.provider_mhz,
-                max_test_time_seconds=config.max_test_time_seconds,
-            )
-
-            # Select robust defender among top candidates against the new attacker.
-            top_candidates = [
-                genome for genome in defender_evolver.population
-                if len(genome.extract_effective_algorithm()) > 0
-            ]
-            if not top_candidates:
-                top_candidates = defender_evolver.population[:]
-            if not top_candidates:
-                raise RuntimeError("defender round produced empty candidate pool")
-            top_candidates = top_candidates[: min(5, len(top_candidates))]
-            for candidate in top_candidates:
-                ensure_genome_io(candidate)
-
-            attacker_panel: List[GFSLGenome] = []
-            panel_seen: set[str] = set()
-
-            ensure_attacker_genome_io(best_attacker)
-            attacker_panel.append(best_attacker)
-            panel_seen.add(_evaluation_signature(best_attacker))
-
-            panel_size = max(1, int(config.attacker_panel_size))
-            if panel_size > 1:
-                for entry in archive.get("attacker_elites", []):
-                    if len(attacker_panel) >= panel_size:
-                        break
-                    try:
-                        payload = entry.get("genome", {})
-                        if not isinstance(payload, dict):
-                            continue
-                        panel_attacker = _deserialize_genome(payload)
-                        ensure_attacker_genome_io(panel_attacker)
-                        signature = _evaluation_signature(panel_attacker)
-                        if signature in panel_seen:
-                            continue
-                        attacker_panel.append(panel_attacker)
-                        panel_seen.add(signature)
-                    except Exception:
-                        continue
-
-            panel_scores: Dict[int, List[float]] = {id(candidate): [] for candidate in top_candidates}
-            panel_advantages: Dict[int, List[float]] = {id(candidate): [] for candidate in top_candidates}
-            panel_primary_metrics: Dict[int, List[Dict[str, Any]]] = {}
-
-            for panel_index, panel_attacker in enumerate(attacker_panel):
-                candidate_pending = list(enumerate(top_candidates))
-                _evaluate_pending_parallel(
-                    pending=candidate_pending,
-                    backend=resource_plan.parallel_backend,
-                    workers=resource_plan.parallel_workers,
-                    executor=shared_executor,
-                    worker_fn=_defender_eval_worker,
-                    build_task=lambda g, atk=panel_attacker: (
-                        g,
-                        selection_scenarios,
-                        atk,
-                        "full",
-                    ),
-                    attr_name="_pcpl_metrics",
-                    store_metrics=True,
-                )
-                for candidate in top_candidates:
-                    score = float(candidate.fitness or -float("inf"))
-                    metrics = getattr(candidate, "_pcpl_metrics", [])
-                    panel_scores[id(candidate)].append(score)
-                    panel_advantages[id(candidate)].append(
-                        _mean_metric(metrics, "attacker_advantage_score")
-                    )
-                    if panel_index == 0:
-                        panel_primary_metrics[id(candidate)] = _metrics_rows(metrics)
-
-            panel_penalty = max(0.0, float(config.attacker_panel_penalty))
-            ranked_candidates: List[Tuple[float, GFSLGenome, float, float, float]] = []
-            for candidate in top_candidates:
-                scores = panel_scores.get(id(candidate), [])
-                advantages = panel_advantages.get(id(candidate), [])
-                if not scores:
-                    scores = [float(candidate.fitness or -float("inf"))]
-                if not advantages:
-                    advantages = [0.0]
-                base_score = float(scores[0])
-                worst_score = float(min(scores))
-                mean_score = float(sum(scores) / float(max(1, len(scores))))
-                worst_adv = float(max(advantages))
-                robust_score = (
-                    (0.42 * base_score)
-                    + (0.38 * worst_score)
-                    + (0.20 * mean_score)
-                    - (panel_penalty * worst_adv)
-                )
-                ranked_candidates.append(
-                    (robust_score, candidate, base_score, worst_score, worst_adv)
-                )
-
-            ranked_candidates.sort(key=lambda item: item[0], reverse=True)
-            selected_robust_score, selected_defender, selected_score, selected_panel_worst_score, selected_panel_worst_adv = ranked_candidates[0]
-            _, selected_metrics = _evaluate_across_scenarios_runtime(
-                selection_scenarios,
-                selected_defender,
-                attacker=best_attacker,
-            )
-
-            reference_defender = build_reference_defender_genome()
-            ensure_genome_io(reference_defender)
-            reference_score, reference_metrics = _evaluate_across_scenarios_runtime(
-                selection_scenarios,
-                reference_defender,
-                attacker=best_attacker,
-            )
-
-            attack_adv = _mean_metric(selected_metrics, "attacker_advantage_score")
-
-            defender_signature = selected_defender.get_signature()
-            attacker_signature = best_attacker.get_signature()
-            reference_signature = reference_defender.get_signature()
-
-            defender_record = {
-                "role": "defender",
-                "round": round_index,
-                "timestamp": _utc_now_iso(),
-                "score": float(selected_score),
-                "robust_score": float(selected_robust_score),
-                "panel_worst_score": float(selected_panel_worst_score),
-                "panel_worst_attacker_adv": float(selected_panel_worst_adv),
-                "panel_size": int(len(attacker_panel)),
-                "signature": defender_signature,
-                "canonical_signature": _canonical_signature(selected_defender),
-                "metrics": _metrics_rows(selected_metrics),
-                "genome": _serialize_genome(selected_defender, role="defender"),
-            }
-            attacker_record = {
-                "role": "attacker",
-                "round": round_index,
-                "timestamp": _utc_now_iso(),
-                "score": float(attack_adv),
-                "signature": attacker_signature,
-                "canonical_signature": _canonical_signature(best_attacker),
-                "metrics": _metrics_rows(selected_metrics),
-                "genome": _serialize_genome(best_attacker, role="attacker"),
-            }
-
             archive["defender_elites"] = _insert_elite(
                 archive.get("defender_elites", []),
-                defender_record,
+                result.defender_record,
                 limit=config.archive_limit,
             )
             archive["attacker_elites"] = _insert_elite(
                 archive.get("attacker_elites", []),
-                attacker_record,
+                result.attacker_record,
                 limit=config.archive_limit,
-            )
-            anti_limit = max(8, int(math.ceil(float(config.archive_limit) * 0.5)))
-            anti_slice_keep = min(
-                len(ranked_candidates),
-                max(1, min(3, int(math.ceil(float(config.elite_pool) * 0.08)))),
             )
             anti_entries = archive.get("defender_anti_attacker_elites", [])
             if not isinstance(anti_entries, list):
                 anti_entries = []
-            for robust_score, candidate, base_score, worst_score, worst_adv in ranked_candidates[:anti_slice_keep]:
-                anti_record = {
-                    "role": "defender-anti-attacker",
-                    "round": round_index,
-                    "timestamp": _utc_now_iso(),
-                    "score": float(robust_score),
-                    "base_score": float(base_score),
-                    "worst_score": float(worst_score),
-                    "worst_attacker_adv": float(worst_adv),
-                    "signature": candidate.get_signature(),
-                    "canonical_signature": _canonical_signature(candidate),
-                    "metrics": panel_primary_metrics.get(id(candidate), []),
-                    "genome": _serialize_genome(candidate, role="defender"),
-                }
+            for anti_record_raw in result.anti_records:
+                anti_record = dict(anti_record_raw)
+                anti_limit = max(
+                    8,
+                    int(
+                        anti_record.pop(
+                            "_limit",
+                            max(8, int(math.ceil(float(config.archive_limit) * 0.5))),
+                        )
+                    ),
+                )
                 anti_entries = _insert_elite(
                     anti_entries,
                     anti_record,
@@ -6997,107 +7292,49 @@ def run_continuous_experiment(
                 )
             archive["defender_anti_attacker_elites"] = anti_entries
 
-            defender_native_rows = _generation_native_counter_rows(defender_log)
-            attacker_native_rows = _generation_native_counter_rows(attacker_log)
-            round_summary = {
-                "round": round_index,
-                "timestamp": _utc_now_iso(),
-                "defender_score": float(selected_score),
-                "defender_signature": defender_signature,
-                "attacker_score": float(attack_adv),
-                "attacker_signature": attacker_signature,
-                "selection_panel": {
-                    "attacker_panel_size": int(len(attacker_panel)),
-                    "attacker_panel_penalty": float(panel_penalty),
-                    "defender_robust_score": float(selected_robust_score),
-                    "defender_panel_worst_score": float(selected_panel_worst_score),
-                    "defender_panel_worst_attacker_adv": float(selected_panel_worst_adv),
-                    "anti_attacker_slice": int(anti_slice_keep),
-                },
-                "round_dir": str(round_dir),
-                "defender_log": defender_log,
-                "attacker_log": attacker_log,
-                "generation_native_counters": {
-                    "defender": defender_native_rows,
-                    "attacker": attacker_native_rows,
-                },
-                "generation_native_totals": {
-                    "defender": _aggregate_native_counter_rows(defender_native_rows),
-                    "attacker": _aggregate_native_counter_rows(attacker_native_rows),
-                },
-                "defender_stop_reason": (
-                    str(defender_log[-1].get("stop_reason", ""))
-                    if defender_log
-                    else ""
-                ),
-                "attacker_stop_reason": (
-                    str(attacker_log[-1].get("stop_reason", ""))
-                    if attacker_log
-                    else ""
-                ),
-                "metrics": _metrics_rows(selected_metrics),
-                "predictive_profile": {
-                    "defender": defender_profile,
-                    "attacker": attacker_profile,
-                    "defender_supervised": defender_supervised,
-                    "attacker_supervised": attacker_supervised,
-                    "selection_key_variants": selection_key_variants,
-                },
-                "adaptive_attacker_budget": attacker_budget_meta,
-                "reference_anchor": {
-                    "score": float(reference_score),
-                    "signature": reference_signature,
-                    "canonical_signature": _canonical_signature(reference_defender),
-                    "score_delta": float(selected_score - reference_score),
-                    "metrics": _metrics_rows(reference_metrics),
-                },
-            }
+            predictive_profile = archive.setdefault("predictive_profile", {})
+            if not isinstance(predictive_profile, dict):
+                predictive_profile = {}
+                archive["predictive_profile"] = predictive_profile
+            for key, payload in result.predictive_updates.items():
+                if isinstance(payload, dict) and payload:
+                    predictive_profile[str(key)] = payload
+
+            round_summary = dict(result.round_summary)
+            round_summary["round_dir"] = str(round_dir)
             archive.setdefault("rounds", []).append(
                 _compact_round_summary_for_archive(round_summary)
             )
 
-            # Round artifacts.
             (round_dir / "defender-genome.txt").write_text(
-                "\n".join(selected_defender.to_human_readable()) + "\n",
+                "\n".join(result.defender_genome_lines) + "\n",
                 encoding="utf-8",
             )
             (round_dir / "attacker-genome.txt").write_text(
-                "\n".join(best_attacker.to_human_readable()) + "\n",
+                "\n".join(result.attacker_genome_lines) + "\n",
                 encoding="utf-8",
             )
             (round_dir / "round-results.json").write_text(
                 json.dumps(round_summary, indent=2),
                 encoding="utf-8",
             )
-            round_report = _build_round_report(
-                config=config,
-                round_index=round_index,
-                scenarios=scenario_list,
-                defender_score=selected_score,
-                defender_signature=defender_signature,
-                defender_metrics=selected_metrics,
-                attacker_score=attack_adv,
-                attacker_signature=attacker_signature,
-                defender_log=defender_log,
-                attacker_log=attacker_log,
-                reference_score=reference_score,
-                reference_signature=reference_signature,
-                reference_metrics=reference_metrics,
-            )
-            (round_dir / "round-report.md").write_text(round_report, encoding="utf-8")
+            (round_dir / "round-report.md").write_text(result.round_report, encoding="utf-8")
 
             _save_archive(archive_path, archive)
 
-            current_attacker = best_attacker
-            last_defender_score = selected_score
-            last_attacker_score = attack_adv
-            last_defender_signature = defender_signature
-            last_attacker_signature = attacker_signature
-            last_reference_score = reference_score
-            last_reference_signature = reference_signature
+            next_attacker = _deserialize_attacker_payload(result.best_attacker_payload)
+            if next_attacker is not None:
+                current_attacker = next_attacker
+            last_defender_score = float(result.defender_score)
+            last_attacker_score = float(result.attacker_score)
+            last_defender_signature = str(result.defender_signature)
+            last_attacker_signature = str(result.attacker_signature)
+            last_reference_score = float(result.reference_score)
+            last_reference_signature = str(result.reference_signature)
             last_round_dir = round_dir
-            last_defender_log = list(defender_log)
-            last_attacker_log = list(attacker_log)
+            last_defender_log = list(result.defender_log)
+            last_attacker_log = list(result.attacker_log)
+
             partial_summary = {
                 "status": "running",
                 "config": {
@@ -7107,6 +7344,8 @@ def run_continuous_experiment(
                 "resources": {
                     **resource_plan.to_dict(),
                     "executor_backend": _normalize_executor_backend(config.executor_backend),
+                    "round_parallel_plan": round_plan.to_dict(),
+                    "per_round_resource_plan": round_resource_plan.to_dict(),
                 },
                 "rounds_completed": len(archive.get("rounds", [])),
                 "last_round": {
@@ -7155,16 +7394,63 @@ def run_continuous_experiment(
             print(
                 "[pcpl-evolvo] round={round:04d} defender={def_score:.6f} attacker={atk_score:.6f}".format(
                     round=round_index,
-                    def_score=selected_score,
-                    atk_score=attack_adv,
+                    def_score=float(result.defender_score),
+                    atk_score=float(result.attacker_score),
                 )
             )
+
+        offset = 0
+        while offset < total_rounds:
+            batch_size = min(lane_count, total_rounds - offset)
+            batch_archive_snapshot = copy.deepcopy(archive)
+            attacker_payload = (
+                _serialize_genome(current_attacker, role="attacker")
+                if current_attacker is not None
+                else None
+            )
+            if batch_size <= 1 or round_executor is None:
+                round_index = start_round + offset
+                result = _run_round_from_snapshot(
+                    round_index=round_index,
+                    config=config,
+                    resource_plan=round_resource_plan,
+                    eval_executor_kwargs=eval_executor_kwargs,
+                    scenarios=scenario_list,
+                    archive_snapshot=batch_archive_snapshot,
+                    attacker_payload=attacker_payload,
+                )
+                _merge_round_result(result)
+                offset += 1
+                continue
+
+            pending: Dict[concurrent.futures.Future[_RoundExecutionResult], int] = {}
+            for lane_offset in range(batch_size):
+                round_index = start_round + offset + lane_offset
+                pending[
+                    round_executor.submit(
+                        _run_round_from_snapshot,
+                        round_index=round_index,
+                        config=config,
+                        resource_plan=round_resource_plan,
+                        eval_executor_kwargs=eval_executor_kwargs,
+                        scenarios=scenario_list,
+                        archive_snapshot=copy.deepcopy(batch_archive_snapshot),
+                        attacker_payload=copy.deepcopy(attacker_payload),
+                    )
+                ] = round_index
+            batch_results: List[_RoundExecutionResult] = []
+            for future in concurrent.futures.as_completed(tuple(pending.keys())):
+                batch_results.append(future.result())
+            batch_results.sort(key=lambda item: int(item.round_index))
+            for result in batch_results:
+                _merge_round_result(result)
+            offset += batch_size
 
         # Build global summary and report.
         view_paths = _write_view_outputs(
             out_dir=out_dir,
             config=config,
-            resource_plan=resource_plan,
+            resource_plan=round_resource_plan,
             archive=archive,
             baseline_rows=baseline_rows,
         )
@@ -7192,6 +7478,8 @@ def run_continuous_experiment(
             "resources": {
                 **resource_plan.to_dict(),
                 "executor_backend": _normalize_executor_backend(config.executor_backend),
+                "round_parallel_plan": round_plan.to_dict(),
+                "per_round_resource_plan": round_resource_plan.to_dict(),
             },
             "baselines": baseline_rows,
             "rounds_completed": len(archive.get("rounds", [])),
@@ -7251,10 +7539,19 @@ def run_continuous_experiment(
         )
         report_lines.append(
             "- resources: backend={backend} workers={workers} gpu={gpu} exec={exec_backend}".format(
-                backend=resource_plan.parallel_backend,
-                workers=resource_plan.parallel_workers,
+                backend=round_resource_plan.parallel_backend,
+                workers=round_resource_plan.parallel_workers,
                 gpu=resource_plan.gpu_backend,
                 exec_backend=_normalize_executor_backend(config.executor_backend),
+            )
+        )
+        report_lines.append(
+            "- round parallelization: lanes={lanes} workers-per-round={workers} learning-sync={sync} budget(cpu={cpu:.2f},gpu={gpu:.2f})".format(
+                lanes=int(round_plan.lanes),
+                workers=int(round_plan.workers_per_round),
+                sync=str(round_plan.learning_sync),
+                cpu=float(round_plan.cpu_utilization_target),
+                gpu=float(round_plan.gpu_utilization_target),
             )
         )
         report_lines.append(
@@ -7489,6 +7786,8 @@ def run_continuous_experiment(
             "resource_plan": {
                 **resource_plan.to_dict(),
                 "executor_backend": _normalize_executor_backend(config.executor_backend),
+                "round_parallel_plan": round_plan.to_dict(),
+                "per_round_resource_plan": round_resource_plan.to_dict(),
             },
             "predictive_profile": predictive_profile,
             **view_paths,
@@ -7501,7 +7800,11 @@ def run_continuous_experiment(
             timeout_seconds=0.0,
             log_interval_seconds=0.0,
         )
-        _shutdown_shared_executor(shared_executor)
+        if round_executor is not None:
+            try:
+                round_executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
 
 
 def run_experiment(
