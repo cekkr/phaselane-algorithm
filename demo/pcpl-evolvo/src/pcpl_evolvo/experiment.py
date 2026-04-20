@@ -67,6 +67,7 @@ class ExperimentConfig:
     parallel_workers: int = 0
     parallel_backend: str = "auto"  # auto|process|thread|off
     round_parallelism: int = 0  # 0 -> auto, 1 -> sequential
+    minimum_parallel_rounds: int = 1  # floor for concurrent round lanes (best effort)
     max_cpu_utilization: float = 0.75
     max_gpu_utilization: float = 0.75
     round_state_sync: str = "batch-start"  # batch-start -> use learned state only at batch boundaries
@@ -1430,6 +1431,7 @@ def _resolve_round_parallel_plan(
     resource_plan: ResourcePlan,
 ) -> RoundParallelPlan:
     total_rounds = max(1, int(config.rounds))
+    minimum_parallel_rounds = max(1, int(config.minimum_parallel_rounds))
     learning_sync_raw = str(config.round_state_sync).strip().lower()
     learning_sync = "batch-start"
     if learning_sync_raw in {"batch-start", "batch", "start-only", "round-start"}:
@@ -1502,6 +1504,15 @@ def _resolve_round_parallel_plan(
             lanes = min(lanes, total_rounds)
             lanes = min(lanes, max_lanes)
         lanes = max(1, min(lanes, budget_workers))
+        minimum_feasible_lanes = max(
+            1,
+            min(
+                int(minimum_parallel_rounds),
+                int(total_rounds),
+                int(budget_workers),
+            ),
+        )
+        lanes = max(int(lanes), int(minimum_feasible_lanes))
 
     workers_per_round = max(1, budget_workers // max(1, lanes))
     parallel_backend = str(resource_plan.parallel_backend)

@@ -938,6 +938,7 @@ def _build_experiment_config(
         parallel_workers=workers,
         parallel_backend=args.parallel_backend,
         round_parallelism=int(args.round_parallelism),
+        minimum_parallel_rounds=int(args.minimum_parallel_rounds),
         max_cpu_utilization=float(args.max_cpu_utilization),
         max_gpu_utilization=float(args.max_gpu_utilization),
         round_state_sync=str(args.round_state_sync),
@@ -1119,6 +1120,7 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "workers": "workers",
         "parallel_backend": "parallel_backend",
         "round_parallelism": "round_parallelism",
+        "minimum_parallel_rounds": "minimum_parallel_rounds",
         "max_cpu_utilization": "max_cpu_utilization",
         "max_gpu_utilization": "max_gpu_utilization",
         "round_state_sync": "round_state_sync",
@@ -1252,6 +1254,10 @@ def _resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         0,
         int(resolved.get("round_parallelism", 0)),
     )
+    resolved["minimum_parallel_rounds"] = max(
+        1,
+        int(resolved.get("minimum_parallel_rounds", 1)),
+    )
     resolved["max_cpu_utilization"] = _clamp_float(
         float(resolved.get("max_cpu_utilization", 0.75)),
         0.10,
@@ -1337,6 +1343,7 @@ def _apply_runtime_config(args: argparse.Namespace, resolved: Dict[str, Any]) ->
         "workers",
         "parallel_backend",
         "round_parallelism",
+        "minimum_parallel_rounds",
         "max_cpu_utilization",
         "max_gpu_utilization",
         "round_state_sync",
@@ -1424,8 +1431,9 @@ def _print_effective_config(resolved: Dict[str, Any]) -> None:
         )
     )
     print(
-        "[pcpl-evolvo] round-parallel lanes={lanes} caps(cpu={cpu:.2f},gpu={gpu:.2f}) learned-sync={sync}".format(
+        "[pcpl-evolvo] round-parallel lanes={lanes} minimum={minimum} caps(cpu={cpu:.2f},gpu={gpu:.2f}) learned-sync={sync}".format(
             lanes=int(resolved["round_parallelism"]),
+            minimum=int(resolved["minimum_parallel_rounds"]),
             cpu=float(resolved["max_cpu_utilization"]),
             gpu=float(resolved["max_gpu_utilization"]),
             sync=str(resolved["round_state_sync"]),
@@ -1856,6 +1864,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Concurrent round lanes. 0 means auto (safe batch-start snapshots, merged in round order)."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-parallel-rounds",
+        type=int,
+        default=None,
+        help=(
+            "Minimum concurrent round lanes to enforce (best effort, bounded by rounds/workers)."
         ),
     )
     parser.add_argument(
@@ -2377,6 +2393,8 @@ def main() -> None:
         raise ValueError("--debug-eval-log-interval-seconds must be >= 0")
     if int(args.round_parallelism) < 0:
         raise ValueError("--round-parallelism must be >= 0")
+    if int(args.minimum_parallel_rounds) < 1:
+        raise ValueError("--minimum-parallel-rounds must be >= 1")
     if not (0.0 < float(args.max_cpu_utilization) <= 1.0):
         raise ValueError("--max-cpu-utilization must be in (0, 1]")
     if not (0.0 < float(args.max_gpu_utilization) <= 1.0):

@@ -38,7 +38,7 @@ KOMPUTE_NATIVE_ENABLE_BOOLEAN_LOGIC = True
 KOMPUTE_NATIVE_ENABLE_LIST_QUERY = True
 
 # If False, process-pool parallelism is automatically downgraded to threads in Kompute mode.
-KOMPUTE_ALLOW_PROCESS_POOL = False
+KOMPUTE_ALLOW_PROCESS_POOL = True
 
 
 ACCELERATION_DEFAULTS = {

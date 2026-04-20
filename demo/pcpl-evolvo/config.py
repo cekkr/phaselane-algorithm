@@ -16,7 +16,7 @@ DEFAULT_MODE = "paper"
 
 
 BASE_DEFAULTS: Dict[str, Any] = {
-    "seed": 94960397,
+    "seed": 9490397,
     "population_size": 96,
     "generations": 56,
     "initial_instructions": 16,
@@ -29,6 +29,7 @@ BASE_DEFAULTS: Dict[str, Any] = {
     "workers": 0,
     "parallel_backend": "process",
     "round_parallelism": 0,
+    "minimum_parallel_rounds": 1,
     "max_cpu_utilization": 0.75,
     "max_gpu_utilization": 0.75,
     "round_state_sync": "batch-start",

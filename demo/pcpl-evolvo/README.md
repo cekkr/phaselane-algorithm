@@ -238,6 +238,7 @@ PowerShell:
 - `--elite-pool`, `--archive-limit`
 - `--no-resume` (start fresh even if archive exists)
 - `--parallel-backend {auto,process,thread,off}`, `--workers` (`0` = all CPUs)
+- `--round-parallelism` (`0` = auto lanes) and `--minimum-parallel-rounds` (best-effort floor for concurrent rounds)
 - `--executor-backend {auto,cpu,kompute,kompute-sim}` (GFSL executor path for scenario evaluation)
 - `--kompute-check-libs` (Vulkan/Kompute dependency doctor and manager init probe)
 - `--kompute-self-test` (fast raw `kp` + evolvo native dispatch smoke test)
