@@ -7324,6 +7324,11 @@ def run_continuous_experiment(
             cpu_load=host_cpu_load_text,
         )
     )
+    if int(round_plan.lanes) > 1 and str(round_resource_plan.parallel_backend) == "off":
+        print(
+            "[pcpl-evolvo] warning: round lanes are high but per-round workers resolved to 1 (backend=off). "
+            "This can make first checkpoints very slow; lower --round-parallelism/--minimum-parallel-rounds or raise worker budget."
+        )
     if gpu_autotuner is not None and bool(gpu_autotuner.enabled):
         print(
             "[pcpl-evolvo] gpu autotune backend={backend} workers={curr}[{wmin}-{wmax}] target={low:.1f}-{high:.1f}% probe={probe:.1f}s cooldown={cooldown:.1f}s step={step}".format(
@@ -7377,6 +7382,94 @@ def run_continuous_experiment(
         lane_count = int(max(1, round_plan.lanes))
         if bool(round_plan.enabled) and lane_count > 1:
             round_executor = concurrent.futures.ThreadPoolExecutor(max_workers=lane_count)
+
+        def _write_running_summary(
+            *,
+            active_batch_rounds: Optional[Sequence[int]] = None,
+            batch_completed_rounds: int = 0,
+        ) -> None:
+            partial_summary: Dict[str, Any] = {
+                "status": "running",
+                "config": {
+                    **asdict(config),
+                    "out_dir": str(out_dir),
+                },
+                "resources": {
+                    **resource_plan.to_dict(),
+                    "executor_backend": _normalize_executor_backend(config.executor_backend),
+                    "round_parallel_plan": round_plan.to_dict(),
+                    "per_round_resource_plan": round_resource_plan.to_dict(),
+                },
+                "rounds_completed": len(archive.get("rounds", [])),
+                "last_round": {
+                    "score": (
+                        float(last_defender_score)
+                        if math.isfinite(float(last_defender_score))
+                        else None
+                    ),
+                    "signature": str(last_defender_signature) if str(last_defender_signature) else None,
+                    "attacker_score": (
+                        float(last_attacker_score)
+                        if math.isfinite(float(last_attacker_score))
+                        else None
+                    ),
+                    "attacker_signature": (
+                        str(last_attacker_signature)
+                        if str(last_attacker_signature)
+                        else None
+                    ),
+                    "reference_score": (
+                        float(last_reference_score)
+                        if math.isfinite(float(last_reference_score))
+                        else None
+                    ),
+                    "reference_signature": (
+                        str(last_reference_signature)
+                        if str(last_reference_signature)
+                        else None
+                    ),
+                    "score_delta_vs_reference": (
+                        float(last_defender_score - last_reference_score)
+                        if (
+                            math.isfinite(float(last_defender_score))
+                            and math.isfinite(float(last_reference_score))
+                        )
+                        else None
+                    ),
+                    "round_dir": str(last_round_dir) if last_round_dir else None,
+                    "generation_native_counters": {
+                        "defender": _generation_native_counter_rows(last_defender_log),
+                        "attacker": _generation_native_counter_rows(last_attacker_log),
+                    },
+                    "generation_native_totals": {
+                        "defender": _aggregate_native_counter_rows(
+                            _generation_native_counter_rows(last_defender_log)
+                        ),
+                        "attacker": _aggregate_native_counter_rows(
+                            _generation_native_counter_rows(last_attacker_log)
+                        ),
+                    },
+                },
+            }
+            if active_batch_rounds:
+                partial_summary["active_batch"] = {
+                    "rounds": [int(item) for item in active_batch_rounds],
+                    "completed_in_batch": int(max(0, batch_completed_rounds)),
+                }
+            try:
+                _save_archive(archive_path, archive)
+            except Exception:
+                pass
+            try:
+                (out_dir / "results.json").write_text(
+                    json.dumps(partial_summary, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+
+        # Persist a startup checkpoint immediately so long first batches are observable.
+        _write_running_summary(active_batch_rounds=None, batch_completed_rounds=0)
 
         def _merge_round_result(result: _RoundExecutionResult) -> None:
             nonlocal archive
@@ -7454,8 +7547,6 @@ def run_continuous_experiment(
             )
             (round_dir / "round-report.md").write_text(result.round_report, encoding="utf-8")
 
-            _save_archive(archive_path, archive)
-
             next_attacker = _deserialize_attacker_payload(result.best_attacker_payload)
             if next_attacker is not None:
                 current_attacker = next_attacker
@@ -7468,62 +7559,7 @@ def run_continuous_experiment(
             last_round_dir = round_dir
             last_defender_log = list(result.defender_log)
             last_attacker_log = list(result.attacker_log)
-
-            partial_summary = {
-                "status": "running",
-                "config": {
-                    **asdict(config),
-                    "out_dir": str(out_dir),
-                },
-                "resources": {
-                    **resource_plan.to_dict(),
-                    "executor_backend": _normalize_executor_backend(config.executor_backend),
-                    "round_parallel_plan": round_plan.to_dict(),
-                    "per_round_resource_plan": round_resource_plan.to_dict(),
-                },
-                "rounds_completed": len(archive.get("rounds", [])),
-                "last_round": {
-                    "score": float(last_defender_score),
-                    "signature": str(last_defender_signature),
-                    "attacker_score": float(last_attacker_score),
-                    "attacker_signature": str(last_attacker_signature),
-                    "reference_score": (
-                        float(last_reference_score)
-                        if math.isfinite(float(last_reference_score))
-                        else None
-                    ),
-                    "reference_signature": (
-                        str(last_reference_signature)
-                        if str(last_reference_signature)
-                        else None
-                    ),
-                    "score_delta_vs_reference": (
-                        float(last_defender_score - last_reference_score)
-                        if math.isfinite(float(last_reference_score))
-                        else None
-                    ),
-                    "round_dir": str(last_round_dir) if last_round_dir else None,
-                    "generation_native_counters": {
-                        "defender": _generation_native_counter_rows(last_defender_log),
-                        "attacker": _generation_native_counter_rows(last_attacker_log),
-                    },
-                    "generation_native_totals": {
-                        "defender": _aggregate_native_counter_rows(
-                            _generation_native_counter_rows(last_defender_log)
-                        ),
-                        "attacker": _aggregate_native_counter_rows(
-                            _generation_native_counter_rows(last_attacker_log)
-                        ),
-                    },
-                },
-            }
-            try:
-                (out_dir / "results.json").write_text(
-                    json.dumps(partial_summary, indent=2),
-                    encoding="utf-8",
-                )
-            except Exception:
-                pass
+            _write_running_summary(active_batch_rounds=None, batch_completed_rounds=0)
 
             print(
                 "[pcpl-evolvo] round={round:04d} defender={def_score:.6f} attacker={atk_score:.6f}".format(
@@ -7560,6 +7596,10 @@ def run_continuous_experiment(
                         round_idx=int(batch_round_indices[0]),
                     )
                 )
+            _write_running_summary(
+                active_batch_rounds=batch_round_indices,
+                batch_completed_rounds=0,
+            )
             if batch_size <= 1 or round_executor is None:
                 round_index = start_round + offset
                 result = _run_round_from_snapshot(
@@ -7590,15 +7630,26 @@ def run_continuous_experiment(
                         attacker_payload=copy.deepcopy(attacker_payload),
                     )
                 ] = round_index
-            batch_results: List[_RoundExecutionResult] = []
+            batch_results: Dict[int, _RoundExecutionResult] = {}
+            merged_results: List[_RoundExecutionResult] = []
+            next_round_to_merge = int(batch_round_indices[0])
             for future in concurrent.futures.as_completed(tuple(pending.keys())):
-                batch_results.append(future.result())
-            batch_results.sort(key=lambda item: int(item.round_index))
-            for result in batch_results:
-                _merge_round_result(result)
+                round_index = int(pending[future])
+                batch_results[round_index] = future.result()
+                while next_round_to_merge in batch_results:
+                    result = batch_results.pop(next_round_to_merge)
+                    _merge_round_result(result)
+                    merged_results.append(result)
+                    next_round_to_merge += 1
+                _write_running_summary(
+                    active_batch_rounds=batch_round_indices,
+                    batch_completed_rounds=len(merged_results),
+                )
             print(
                 "[pcpl-evolvo] round-batch complete rounds={rounds}".format(
-                    rounds=",".join(f"{int(item.round_index):04d}" for item in batch_results),
+                    rounds=",".join(
+                        f"{int(item.round_index):04d}" for item in merged_results
+                    ),
                 )
             )
             offset += batch_size
