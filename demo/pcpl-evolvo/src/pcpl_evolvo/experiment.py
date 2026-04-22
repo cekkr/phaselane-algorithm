@@ -6965,6 +6965,34 @@ def _run_round_from_snapshot(
 
         ranked_candidates = _rank_from_panel_scores()
         timeout_cut = float(_timeout_cut_score(role="defender"))
+        direct_eval_timeout = _stage_eval_timeout_seconds(role="defender", stage="full")
+
+        def _evaluate_defender_direct(
+            defender: GFSLGenome,
+            *,
+            attacker: Optional[GFSLGenome],
+        ) -> Tuple[float, Sequence[Any]]:
+            ensure_genome_io(defender)
+            if attacker is not None:
+                ensure_attacker_genome_io(attacker)
+            over_budget, cut_score = _is_genome_over_complexity_budget(
+                defender,
+                role="defender",
+            )
+            if over_budget:
+                return float(cut_score), []
+            try:
+                return _evaluate_with_timeout(
+                    selection_scenarios,
+                    defender,
+                    attacker=attacker,
+                    timeout_seconds=direct_eval_timeout,
+                )
+            except TimeoutError:
+                return timeout_cut, []
+            except Exception:
+                return timeout_cut, []
+
         panel_timeout_recheck = bool(
             ranked_candidates
             and max(float(item[2]) for item in ranked_candidates) <= (timeout_cut + 1e-9)
@@ -6980,15 +7008,10 @@ def _run_round_from_snapshot(
             panel_primary_metrics = {}
             for panel_index, panel_attacker in enumerate(attacker_panel):
                 for candidate in top_candidates:
-                    try:
-                        score, candidate_metrics = _evaluate_across_scenarios_runtime(
-                            selection_scenarios,
-                            candidate,
-                            attacker=panel_attacker,
-                        )
-                    except Exception:
-                        score = timeout_cut
-                        candidate_metrics = []
+                    score, candidate_metrics = _evaluate_defender_direct(
+                        candidate,
+                        attacker=panel_attacker,
+                    )
                     panel_scores[id(candidate)].append(float(score))
                     panel_advantages[id(candidate)].append(
                         _mean_metric(candidate_metrics, "attacker_advantage_score")
@@ -6998,8 +7021,7 @@ def _run_round_from_snapshot(
             ranked_candidates = _rank_from_panel_scores()
 
         selected_robust_score, selected_defender, selected_panel_base_score, selected_panel_worst_score, selected_panel_worst_adv = ranked_candidates[0]
-        selected_eval_score, selected_metrics = _evaluate_across_scenarios_runtime(
-            selection_scenarios,
+        selected_eval_score, selected_metrics = _evaluate_defender_direct(
             selected_defender,
             attacker=best_attacker,
         )
@@ -7011,8 +7033,7 @@ def _run_round_from_snapshot(
 
         reference_defender = build_reference_defender_genome()
         ensure_genome_io(reference_defender)
-        reference_score, reference_metrics = _evaluate_across_scenarios_runtime(
-            selection_scenarios,
+        reference_score, reference_metrics = _evaluate_defender_direct(
             reference_defender,
             attacker=best_attacker,
         )
