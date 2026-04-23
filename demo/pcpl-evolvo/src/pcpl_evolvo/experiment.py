@@ -624,6 +624,16 @@ TARGET_CALIBRATION_MAX_MULTIPLIER = 16.0
 SYNC_LOSS_GATE_MIN_PERCENTILE = 0.30
 SYNC_LOSS_GATE_MAX_PERCENTILE = 0.90
 ANTI_NEUTRALITY_MIN_WINDOW = 4
+EVAL_STATUS_VALID = "valid"
+EVAL_STATUS_VALID_NO_METRICS = "valid-no-metrics"
+EVAL_STATUS_TIMEOUT_CUT = "timeout-cut"
+EVAL_STATUS_COMPLEXITY_CUT = "complexity-cut"
+EVAL_STATUS_ERROR_EMPTY = "error-empty"
+EVAL_TIMEOUT_RATIO_GATE_SKIP = 0.55
+SELECTION_RESCUE_TIMEOUT_MULTIPLIER = 2.0
+SELECTION_RESCUE_MIN_TIMEOUT_SECONDS = 20.0
+SELECTION_RESCUE_CYCLE_FRACTION = 0.70
+SELECTION_RESCUE_KEY_VARIANTS = 2
 
 
 def _complexity_limits(role: str) -> Tuple[int, int]:
@@ -691,6 +701,93 @@ def _is_genome_over_complexity_budget(genome: GFSLGenome, *, role: str) -> Tuple
 
 def _timeout_cut_score(*, role: str) -> float:
     return -3.00 if str(role).lower() == "defender" else -1.50
+
+
+def _role_from_worker_fn(worker_fn) -> str:
+    if worker_fn in {_defender_eval_worker, _defender_eval_worker_batch}:
+        return "defender"
+    if worker_fn in {_attacker_eval_worker, _attacker_eval_worker_batch}:
+        return "attacker"
+    return "defender"
+
+
+def _classify_eval_result(
+    *,
+    role: str,
+    genome: GFSLGenome,
+    score: float,
+    rows: Sequence[Dict[str, Any]],
+    store_metrics: bool,
+) -> str:
+    if rows:
+        return EVAL_STATUS_VALID
+    over_budget, _cut_score = _is_genome_over_complexity_budget(genome, role=role)
+    if over_budget:
+        return EVAL_STATUS_COMPLEXITY_CUT
+    timeout_cut = float(_timeout_cut_score(role=role))
+    if math.isfinite(float(score)) and abs(float(score) - timeout_cut) <= 1e-9:
+        return EVAL_STATUS_TIMEOUT_CUT
+    if not bool(store_metrics) and math.isfinite(float(score)):
+        return EVAL_STATUS_VALID_NO_METRICS
+    return EVAL_STATUS_ERROR_EMPTY
+
+
+def _set_genome_eval_status(
+    *,
+    genome: GFSLGenome,
+    role: str,
+    stage: str,
+    status: str,
+    score: float,
+    metrics_present: bool,
+) -> None:
+    genome._pcpl_eval_role = str(role)  # type: ignore[attr-defined]
+    genome._pcpl_eval_stage = str(stage)  # type: ignore[attr-defined]
+    genome._pcpl_eval_status = str(status)  # type: ignore[attr-defined]
+    genome._pcpl_eval_score = float(score)  # type: ignore[attr-defined]
+    genome._pcpl_eval_metrics_present = bool(metrics_present)  # type: ignore[attr-defined]
+
+
+def _accumulate_eval_status_counts(
+    *,
+    stage_stats: Dict[str, float],
+    eval_stats: Dict[str, float],
+) -> None:
+    stage_stats["eval_valid"] = float(stage_stats.get("eval_valid", 0.0)) + float(
+        eval_stats.get("valid", 0.0)
+    )
+    stage_stats["eval_valid_no_metrics"] = float(
+        stage_stats.get("eval_valid_no_metrics", 0.0)
+    ) + float(eval_stats.get("valid_no_metrics", 0.0))
+    stage_stats["eval_timeout_cut"] = float(
+        stage_stats.get("eval_timeout_cut", 0.0)
+    ) + float(eval_stats.get("timeout_cut", 0.0))
+    stage_stats["eval_complexity_cut"] = float(
+        stage_stats.get("eval_complexity_cut", 0.0)
+    ) + float(eval_stats.get("complexity_cut", 0.0))
+    stage_stats["eval_error_empty"] = float(
+        stage_stats.get("eval_error_empty", 0.0)
+    ) + float(eval_stats.get("error_empty", 0.0))
+
+
+def _finalize_eval_status_ratios(stage_stats: Dict[str, float]) -> None:
+    total = (
+        float(stage_stats.get("eval_valid", 0.0))
+        + float(stage_stats.get("eval_valid_no_metrics", 0.0))
+        + float(stage_stats.get("eval_timeout_cut", 0.0))
+        + float(stage_stats.get("eval_complexity_cut", 0.0))
+        + float(stage_stats.get("eval_error_empty", 0.0))
+    )
+    if total <= 0.0:
+        stage_stats["eval_timeout_ratio"] = 0.0
+        stage_stats["eval_valid_ratio"] = 0.0
+        return
+    stage_stats["eval_timeout_ratio"] = float(stage_stats.get("eval_timeout_cut", 0.0)) / float(
+        total
+    )
+    stage_stats["eval_valid_ratio"] = float(stage_stats.get("eval_valid", 0.0)) / float(
+        total
+    )
 
 
 def _normalize_eval_stage(stage: Optional[str]) -> str:
@@ -1977,14 +2074,36 @@ def _evaluate_pending_dedup_cache_parallel(
     max_cache_entries: int,
     store_metrics: bool = True,
 ) -> Dict[str, float]:
+    role = _role_from_worker_fn(worker_fn)
     stats = {
         "total": 0.0,
         "unique_eval": 0.0,
         "cache_hits": 0.0,
         "dup_reuse": 0.0,
+        "valid": 0.0,
+        "valid_no_metrics": 0.0,
+        "timeout_cut": 0.0,
+        "complexity_cut": 0.0,
+        "error_empty": 0.0,
+        "timeout_ratio": 0.0,
     }
     if not pending:
         return stats
+
+    def _bump_status(status: str) -> None:
+        if status == EVAL_STATUS_VALID:
+            stats["valid"] += 1.0
+            return
+        if status == EVAL_STATUS_VALID_NO_METRICS:
+            stats["valid_no_metrics"] += 1.0
+            return
+        if status == EVAL_STATUS_TIMEOUT_CUT:
+            stats["timeout_cut"] += 1.0
+            return
+        if status == EVAL_STATUS_COMPLEXITY_CUT:
+            stats["complexity_cut"] += 1.0
+            return
+        stats["error_empty"] += 1.0
 
     for _, genome in pending:
         _apply_runtime_operation_profile(genome)
@@ -2011,6 +2130,22 @@ def _evaluate_pending_dedup_cache_parallel(
                 elif hasattr(genome, attr_name):
                     delattr(genome, attr_name)
                 genome.fitness = float(score)
+                cached_status = _classify_eval_result(
+                    role=role,
+                    genome=genome,
+                    score=float(score),
+                    rows=rows,
+                    store_metrics=bool(store_metrics),
+                )
+                _set_genome_eval_status(
+                    genome=genome,
+                    role=role,
+                    stage="cached",
+                    status=cached_status,
+                    score=float(score),
+                    metrics_present=bool(rows),
+                )
+                _bump_status(cached_status)
             stats["cache_hits"] += float(len(genomes))
             continue
 
@@ -2041,6 +2176,8 @@ def _evaluate_pending_dedup_cache_parallel(
             cache[key] = (score, rows)
             while len(cache) > max_cache_entries:
                 cache.popitem(last=False)
+            status = str(getattr(genome, "_pcpl_eval_status", EVAL_STATUS_ERROR_EMPTY))
+            _bump_status(status)
 
             for dup in groups[key][1:]:
                 if store_metrics:
@@ -2051,6 +2188,25 @@ def _evaluate_pending_dedup_cache_parallel(
                 elif hasattr(dup, attr_name):
                     delattr(dup, attr_name)
                 dup.fitness = score
+                _set_genome_eval_status(
+                    genome=dup,
+                    role=str(getattr(genome, "_pcpl_eval_role", role)),
+                    stage=str(getattr(genome, "_pcpl_eval_stage", "cached")),
+                    status=status,
+                    score=float(score),
+                    metrics_present=bool(rows),
+                )
+                _bump_status(status)
+
+    total_status = (
+        float(stats.get("valid", 0.0))
+        + float(stats.get("valid_no_metrics", 0.0))
+        + float(stats.get("timeout_cut", 0.0))
+        + float(stats.get("complexity_cut", 0.0))
+        + float(stats.get("error_empty", 0.0))
+    )
+    if total_status > 0.0:
+        stats["timeout_ratio"] = float(stats.get("timeout_cut", 0.0)) / float(total_status)
 
     return stats
 
@@ -2068,7 +2224,15 @@ def _replace_genome_contents(target: GFSLGenome, source: GFSLGenome) -> None:
     target.fitness = None
     _apply_runtime_operation_profile(target)
     _invalidate_genome_caches(target)
-    for attr in ("_pcpl_metrics", "_attack_metrics"):
+    for attr in (
+        "_pcpl_metrics",
+        "_attack_metrics",
+        "_pcpl_eval_role",
+        "_pcpl_eval_stage",
+        "_pcpl_eval_status",
+        "_pcpl_eval_score",
+        "_pcpl_eval_metrics_present",
+    ):
         if hasattr(target, attr):
             delattr(target, attr)
     if hasattr(source, "_pcpl_scaffold_injected"):
@@ -2204,6 +2368,11 @@ def _evaluate_idle_random_trials(
         "trial_cache_hits": 0.0,
         "trial_dup_reuse": 0.0,
         "trial_injected": 0.0,
+        "trial_valid": 0.0,
+        "trial_valid_no_metrics": 0.0,
+        "trial_timeout_cut": 0.0,
+        "trial_complexity_cut": 0.0,
+        "trial_error_empty": 0.0,
     }
     budget = _idle_random_trial_budget(
         workers=workers,
@@ -2242,6 +2411,11 @@ def _evaluate_idle_random_trials(
     stats["trial_unique_eval"] = float(eval_stats.get("unique_eval", 0.0))
     stats["trial_cache_hits"] = float(eval_stats.get("cache_hits", 0.0))
     stats["trial_dup_reuse"] = float(eval_stats.get("dup_reuse", 0.0))
+    stats["trial_valid"] = float(eval_stats.get("valid", 0.0))
+    stats["trial_valid_no_metrics"] = float(eval_stats.get("valid_no_metrics", 0.0))
+    stats["trial_timeout_cut"] = float(eval_stats.get("timeout_cut", 0.0))
+    stats["trial_complexity_cut"] = float(eval_stats.get("complexity_cut", 0.0))
+    stats["trial_error_empty"] = float(eval_stats.get("error_empty", 0.0))
 
     replace_targets = sorted(
         [genome for _, genome in pending],
@@ -3461,10 +3635,12 @@ def _evaluate_pending_parallel(
     for _, genome in pending:
         _apply_runtime_operation_profile(genome)
 
+    role = _role_from_worker_fn(worker_fn)
     workers = _autotuned_worker_count(requested=workers, backend=backend)
     if backend == "off" or workers <= 1:
         for _, genome in pending:
-            score, rows = worker_fn(build_task(genome))
+            task = build_task(genome)
+            score, rows = worker_fn(task)
             if store_metrics:
                 if rows:
                     setattr(genome, attr_name, _metrics_from_rows(rows))
@@ -3473,6 +3649,22 @@ def _evaluate_pending_parallel(
             elif hasattr(genome, attr_name):
                 delattr(genome, attr_name)
             genome.fitness = float(score)
+            stage = _task_eval_stage(task)
+            status = _classify_eval_result(
+                role=role,
+                genome=genome,
+                score=float(score),
+                rows=rows,
+                store_metrics=bool(store_metrics),
+            )
+            _set_genome_eval_status(
+                genome=genome,
+                role=role,
+                stage=stage,
+                status=status,
+                score=float(score),
+                metrics_present=bool(rows),
+            )
         return
 
     tasks = [build_task(genome) for _, genome in pending]
@@ -3694,7 +3886,9 @@ def _evaluate_pending_parallel(
         return list(exec_obj.map(fn, task_list))
 
     def assign(results: Sequence[Tuple[float, List[Dict[str, Any]]]]) -> None:
-        for (_, genome), (score, rows) in zip(pending, results):
+        for idx, ((_, genome), payload) in enumerate(zip(pending, results)):
+            score = float(payload[0]) if len(payload) > 0 else -float("inf")
+            rows = payload[1] if len(payload) > 1 else []
             if store_metrics:
                 if rows:
                     setattr(genome, attr_name, _metrics_from_rows(rows))
@@ -3703,6 +3897,22 @@ def _evaluate_pending_parallel(
             elif hasattr(genome, attr_name):
                 delattr(genome, attr_name)
             genome.fitness = float(score)
+            stage = _task_eval_stage(tasks[idx]) if idx < len(tasks) else "full"
+            status = _classify_eval_result(
+                role=role,
+                genome=genome,
+                score=float(score),
+                rows=rows,
+                store_metrics=bool(store_metrics),
+            )
+            _set_genome_eval_status(
+                genome=genome,
+                role=role,
+                stage=stage,
+                status=status,
+                score=float(score),
+                metrics_present=bool(rows),
+            )
 
     if (
         backend == "process"
@@ -4175,14 +4385,29 @@ def _compact_round_summary_for_archive(entry: Dict[str, Any]) -> Dict[str, Any]:
         "attacker_stop_reason": str(entry.get("attacker_stop_reason", "")),
         "predictive_profile": predictor_payload,
         "adaptive_attacker_budget": adaptive_payload,
+        "archive_eligible": bool(entry.get("archive_eligible", True)),
+        "archive_skip_reason": str(entry.get("archive_skip_reason", "")),
         "selection_panel": {
             "attacker_panel_size": int(panel_payload.get("attacker_panel_size", 0)),
+            "attacker_panel_requested_size": int(
+                panel_payload.get("attacker_panel_requested_size", 0)
+            ),
             "attacker_panel_penalty": float(panel_payload.get("attacker_panel_penalty", 0.0)),
             "timeout_recheck": bool(panel_payload.get("timeout_recheck", False)),
+            "timeout_rescue_used": bool(panel_payload.get("timeout_rescue_used", False)),
+            "progressive_stop_reason": str(panel_payload.get("progressive_stop_reason", "")),
+            "selection_cycle_fraction": float(
+                panel_payload.get("selection_cycle_fraction", 0.0)
+            ),
+            "selection_key_variants": int(panel_payload.get("selection_key_variants", 0)),
+            "selection_complexity": str(panel_payload.get("selection_complexity", "")),
             "defender_robust_score": float(panel_payload.get("defender_robust_score", 0.0)),
             "defender_panel_worst_score": float(panel_payload.get("defender_panel_worst_score", 0.0)),
             "defender_panel_worst_attacker_adv": float(panel_payload.get("defender_panel_worst_attacker_adv", 0.0)),
             "anti_attacker_slice": int(panel_payload.get("anti_attacker_slice", 0)),
+            "metrics_present": bool(panel_payload.get("metrics_present", False)),
+            "archive_eligible": bool(panel_payload.get("archive_eligible", True)),
+            "archive_skip_reason": str(panel_payload.get("archive_skip_reason", "")),
         },
         "reference_anchor": {
             "score": float(reference_payload.get("score", 0.0)),
@@ -5185,8 +5410,18 @@ def _run_defender_round(
             "sync_gate_penalized": int(stage_stats.get("sync_gate_penalized", 0.0)),
             "sync_gate_threshold": float(stage_stats.get("sync_gate_threshold", 0.0)),
             "sync_gate_percentile": float(stage_stats.get("sync_gate_percentile", 0.0)),
+            "sync_gate_skipped_timeout": int(stage_stats.get("sync_gate_skipped_timeout", 0.0)),
             "neutrality_penalized": int(stage_stats.get("neutrality_penalized", 0.0)),
             "neutrality_rewarded": int(stage_stats.get("neutrality_rewarded", 0.0)),
+            "neutrality_skipped_timeout": int(stage_stats.get("neutrality_skipped_timeout", 0.0)),
+            "eval_valid": int(stage_stats.get("eval_valid", 0.0)),
+            "eval_valid_no_metrics": int(stage_stats.get("eval_valid_no_metrics", 0.0)),
+            "eval_timeout_cut": int(stage_stats.get("eval_timeout_cut", 0.0)),
+            "eval_complexity_cut": int(stage_stats.get("eval_complexity_cut", 0.0)),
+            "eval_error_empty": int(stage_stats.get("eval_error_empty", 0.0)),
+            "eval_timeout_ratio": float(stage_stats.get("eval_timeout_ratio", 0.0)),
+            "eval_valid_ratio": float(stage_stats.get("eval_valid_ratio", 0.0)),
+            "full_timeout_ratio": float(stage_stats.get("full_timeout_ratio", 0.0)),
             "mutation_rate": float(stage_stats.get("mutation_rate", evolver.mutation_rate)),
             "batch_seconds": float(stage_stats.get("batch_seconds", 0.0)),
             "target_batch_seconds": float(
@@ -5207,7 +5442,7 @@ def _run_defender_round(
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} objective={objective:.5f} total={total:.5f} sync={sync:.4f} hs={hs:.4f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} gate={gate}@{gthr:.3f}/{gp:.2f} neu={np}/{nr} imm={imm} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
+            "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} objective={objective:.5f} total={total:.5f} sync={sync:.4f} hs={hs:.4f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} gate={gate}@{gthr:.3f}/{gp:.2f}/skip{gskip} neu={np}/{nr}/skip{nskip} estatus=v{ev}/vm{evm}/to{eto}/cx{ecx}/err{eer}@{etor:.2f} imm={imm} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 objective=row["best_objective_score"],
@@ -5237,8 +5472,16 @@ def _run_defender_round(
                 gate=row["sync_gate_penalized"],
                 gthr=row["sync_gate_threshold"],
                 gp=row["sync_gate_percentile"],
+                gskip=row["sync_gate_skipped_timeout"],
                 np=row["neutrality_penalized"],
                 nr=row["neutrality_rewarded"],
+                nskip=row["neutrality_skipped_timeout"],
+                ev=row["eval_valid"],
+                evm=row["eval_valid_no_metrics"],
+                eto=row["eval_timeout_cut"],
+                ecx=row["eval_complexity_cut"],
+                eer=row["eval_error_empty"],
+                etor=row["eval_timeout_ratio"],
                 imm=row["stall_immigrants"],
                 ub=row["underutilization_boost"],
                 mut=row["mutation_rate"],
@@ -5296,8 +5539,18 @@ def _run_defender_round(
             "sync_gate_threshold": 0.0,
             "sync_gate_percentile": 0.0,
             "sync_gate_flatness": 0.0,
+            "sync_gate_skipped_timeout": 0.0,
             "neutrality_penalized": 0.0,
             "neutrality_rewarded": 0.0,
+            "neutrality_skipped_timeout": 0.0,
+            "eval_valid": 0.0,
+            "eval_valid_no_metrics": 0.0,
+            "eval_timeout_cut": 0.0,
+            "eval_complexity_cut": 0.0,
+            "eval_error_empty": 0.0,
+            "eval_timeout_ratio": 0.0,
+            "eval_valid_ratio": 0.0,
+            "full_timeout_ratio": 0.0,
             "mutation_rate": float(evolver.mutation_rate),
             "quick_throttle": 1.0,
             "target_batch_seconds": float(target_seconds),
@@ -5376,6 +5629,10 @@ def _run_defender_round(
             local_stage["eval_unique"] += float(eval_stats["unique_eval"])
             local_stage["cache_hits"] += float(eval_stats["cache_hits"])
             local_stage["dup_reuse"] += float(eval_stats["dup_reuse"])
+            _accumulate_eval_status_counts(
+                stage_stats=local_stage,
+                eval_stats=eval_stats,
+            )
             trial_stats = _evaluate_idle_random_trials(
                 pending=pending,
                 workers=resource_plan.parallel_workers,
@@ -5409,6 +5666,16 @@ def _run_defender_round(
             local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
             local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
             local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
+            _accumulate_eval_status_counts(
+                stage_stats=local_stage,
+                eval_stats={
+                    "valid": float(trial_stats.get("trial_valid", 0.0)),
+                    "valid_no_metrics": float(trial_stats.get("trial_valid_no_metrics", 0.0)),
+                    "timeout_cut": float(trial_stats.get("trial_timeout_cut", 0.0)),
+                    "complexity_cut": float(trial_stats.get("trial_complexity_cut", 0.0)),
+                    "error_empty": float(trial_stats.get("trial_error_empty", 0.0)),
+                },
+            )
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             local_stage["target_batch_seconds"] = float(
                 target_calibrator.observe(local_stage["batch_seconds"])
@@ -5419,6 +5686,7 @@ def _run_defender_round(
                 evolver=evolver,
                 stage_stats=local_stage,
             )
+            _finalize_eval_status_ratios(local_stage)
             local_stage["mutation_rate"] = float(evolver.mutation_rate)
             stage_stats.clear()
             stage_stats.update(local_stage)
@@ -5479,6 +5747,10 @@ def _run_defender_round(
         local_stage["eval_unique"] += float(quick_stats["unique_eval"])
         local_stage["cache_hits"] += float(quick_stats["cache_hits"])
         local_stage["dup_reuse"] += float(quick_stats["dup_reuse"])
+        _accumulate_eval_status_counts(
+            stage_stats=local_stage,
+            eval_stats=quick_stats,
+        )
         pending_genomes = [genome for _, genome in pending]
         _mark_duplicate_genomes(
             pending_genomes,
@@ -5559,6 +5831,16 @@ def _run_defender_round(
             local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
             local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
             local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
+            _accumulate_eval_status_counts(
+                stage_stats=local_stage,
+                eval_stats={
+                    "valid": float(trial_stats.get("trial_valid", 0.0)),
+                    "valid_no_metrics": float(trial_stats.get("trial_valid_no_metrics", 0.0)),
+                    "timeout_cut": float(trial_stats.get("trial_timeout_cut", 0.0)),
+                    "complexity_cut": float(trial_stats.get("trial_complexity_cut", 0.0)),
+                    "error_empty": float(trial_stats.get("trial_error_empty", 0.0)),
+                },
+            )
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             local_stage["target_batch_seconds"] = float(
                 target_calibrator.observe(local_stage["batch_seconds"])
@@ -5571,6 +5853,7 @@ def _run_defender_round(
                 evolver=evolver,
                 stage_stats=local_stage,
             )
+            _finalize_eval_status_ratios(local_stage)
             local_stage["mutation_rate"] = float(evolver.mutation_rate)
             stage_stats.clear()
             stage_stats.update({
@@ -5607,6 +5890,10 @@ def _run_defender_round(
         local_stage["eval_unique"] += float(mid_stats["unique_eval"])
         local_stage["cache_hits"] += float(mid_stats["cache_hits"])
         local_stage["dup_reuse"] += float(mid_stats["dup_reuse"])
+        _accumulate_eval_status_counts(
+            stage_stats=local_stage,
+            eval_stats=mid_stats,
+        )
         mid_genomes = [genome for _, genome in mid_pending]
         _mark_duplicate_genomes(
             mid_genomes,
@@ -5687,6 +5974,16 @@ def _run_defender_round(
             local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
             local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
             local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
+            _accumulate_eval_status_counts(
+                stage_stats=local_stage,
+                eval_stats={
+                    "valid": float(trial_stats.get("trial_valid", 0.0)),
+                    "valid_no_metrics": float(trial_stats.get("trial_valid_no_metrics", 0.0)),
+                    "timeout_cut": float(trial_stats.get("trial_timeout_cut", 0.0)),
+                    "complexity_cut": float(trial_stats.get("trial_complexity_cut", 0.0)),
+                    "error_empty": float(trial_stats.get("trial_error_empty", 0.0)),
+                },
+            )
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             local_stage["target_batch_seconds"] = float(
                 target_calibrator.observe(local_stage["batch_seconds"])
@@ -5699,6 +5996,7 @@ def _run_defender_round(
                 evolver=evolver,
                 stage_stats=local_stage,
             )
+            _finalize_eval_status_ratios(local_stage)
             local_stage["mutation_rate"] = float(evolver.mutation_rate)
             stage_stats.clear()
             stage_stats.update({
@@ -5734,18 +6032,31 @@ def _run_defender_round(
         local_stage["eval_unique"] += float(full_stats["unique_eval"])
         local_stage["cache_hits"] += float(full_stats["cache_hits"])
         local_stage["dup_reuse"] += float(full_stats["dup_reuse"])
-        gate_stats = _apply_defender_sync_loss_gate(
-            full_pending=full_pending,
-            generation_log=generation_log,
-            config=config,
+        _accumulate_eval_status_counts(
+            stage_stats=local_stage,
+            eval_stats=full_stats,
         )
-        local_stage.update(gate_stats)
-        neutrality_stats = _apply_defender_anti_neutrality(
-            full_pending=full_pending,
-            generation_log=generation_log,
-            config=config,
-        )
-        local_stage.update(neutrality_stats)
+        full_timeout_ratio = float(full_stats.get("timeout_ratio", 0.0))
+        local_stage["full_timeout_ratio"] = float(full_timeout_ratio)
+        if (
+            float(full_stats.get("valid", 0.0)) > 0.0
+            and full_timeout_ratio < float(EVAL_TIMEOUT_RATIO_GATE_SKIP)
+        ):
+            gate_stats = _apply_defender_sync_loss_gate(
+                full_pending=full_pending,
+                generation_log=generation_log,
+                config=config,
+            )
+            local_stage.update(gate_stats)
+            neutrality_stats = _apply_defender_anti_neutrality(
+                full_pending=full_pending,
+                generation_log=generation_log,
+                config=config,
+            )
+            local_stage.update(neutrality_stats)
+        else:
+            local_stage["sync_gate_skipped_timeout"] = 1.0
+            local_stage["neutrality_skipped_timeout"] = 1.0
 
         # Probe a small random sample from cut genomes to estimate false negatives.
         survivor_ids = {id(genome) for _, genome in full_pending}
@@ -5786,6 +6097,10 @@ def _run_defender_round(
             local_stage["eval_unique"] += float(probe_stats["unique_eval"])
             local_stage["cache_hits"] += float(probe_stats["cache_hits"])
             local_stage["dup_reuse"] += float(probe_stats["dup_reuse"])
+            _accumulate_eval_status_counts(
+                stage_stats=local_stage,
+                eval_stats=probe_stats,
+            )
             cutoff = min(float(genome.fitness or -float("inf")) for _, genome in full_pending)
             probe_wins = 0
             for _, probe_genome in probe_pending:
@@ -5834,6 +6149,16 @@ def _run_defender_round(
         local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
         local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
         local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
+        _accumulate_eval_status_counts(
+            stage_stats=local_stage,
+            eval_stats={
+                "valid": float(trial_stats.get("trial_valid", 0.0)),
+                "valid_no_metrics": float(trial_stats.get("trial_valid_no_metrics", 0.0)),
+                "timeout_cut": float(trial_stats.get("trial_timeout_cut", 0.0)),
+                "complexity_cut": float(trial_stats.get("trial_complexity_cut", 0.0)),
+                "error_empty": float(trial_stats.get("trial_error_empty", 0.0)),
+            },
+        )
 
         local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
         local_stage["target_batch_seconds"] = float(
@@ -5847,6 +6172,7 @@ def _run_defender_round(
             evolver=evolver,
             stage_stats=local_stage,
         )
+        _finalize_eval_status_ratios(local_stage)
         local_stage["mutation_rate"] = float(evolver.mutation_rate)
         stage_stats.clear()
         stage_stats.update({
@@ -6091,6 +6417,12 @@ def _run_attacker_round(
             "random_injected": int(stage_stats.get("random_injected", 0.0)),
             "parallel_rebalanced": int(stage_stats.get("parallel_rebalanced", 0.0)),
             "underutilization_boost": float(stage_stats.get("underutilization_boost", 0.0)),
+            "eval_valid": int(stage_stats.get("eval_valid", 0.0)),
+            "eval_valid_no_metrics": int(stage_stats.get("eval_valid_no_metrics", 0.0)),
+            "eval_timeout_cut": int(stage_stats.get("eval_timeout_cut", 0.0)),
+            "eval_complexity_cut": int(stage_stats.get("eval_complexity_cut", 0.0)),
+            "eval_error_empty": int(stage_stats.get("eval_error_empty", 0.0)),
+            "eval_timeout_ratio": float(stage_stats.get("eval_timeout_ratio", 0.0)),
             "mutation_rate": float(stage_stats.get("mutation_rate", evolver.mutation_rate)),
             "batch_seconds": float(stage_stats.get("batch_seconds", 0.0)),
             "target_batch_seconds": float(
@@ -6111,7 +6443,7 @@ def _run_attacker_round(
         }
         generation_log.append(row)
         print(
-            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} imm={imm} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
+            "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} estatus=v{ev}/vm{evm}/to{eto}/cx{ecx}/err{eer}@{etor:.2f} imm={imm} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
                 gen=gen,
                 score=best_fitness,
                 lane=row["lane_success"],
@@ -6133,6 +6465,12 @@ def _run_attacker_round(
                 reb=row["parallel_rebalanced"],
                 rt=row["random_trials"],
                 ri=row["random_injected"],
+                ev=row["eval_valid"],
+                evm=row["eval_valid_no_metrics"],
+                eto=row["eval_timeout_cut"],
+                ecx=row["eval_complexity_cut"],
+                eer=row["eval_error_empty"],
+                etor=row["eval_timeout_ratio"],
                 imm=row["stall_immigrants"],
                 ub=row["underutilization_boost"],
                 mut=row["mutation_rate"],
@@ -6186,6 +6524,13 @@ def _run_attacker_round(
             "dup_reuse": 0.0,
             "parallel_rebalanced": 0.0,
             "underutilization_boost": 0.0,
+            "eval_valid": 0.0,
+            "eval_valid_no_metrics": 0.0,
+            "eval_timeout_cut": 0.0,
+            "eval_complexity_cut": 0.0,
+            "eval_error_empty": 0.0,
+            "eval_timeout_ratio": 0.0,
+            "eval_valid_ratio": 0.0,
             "mutation_rate": float(evolver.mutation_rate),
             "quick_throttle": 1.0,
             "target_batch_seconds": float(target_seconds),
@@ -6263,6 +6608,10 @@ def _run_attacker_round(
             local_stage["eval_unique"] += float(eval_stats["unique_eval"])
             local_stage["cache_hits"] += float(eval_stats["cache_hits"])
             local_stage["dup_reuse"] += float(eval_stats["dup_reuse"])
+            _accumulate_eval_status_counts(
+                stage_stats=local_stage,
+                eval_stats=eval_stats,
+            )
             trial_stats = _evaluate_idle_random_trials(
                 pending=pending,
                 workers=resource_plan.parallel_workers,
@@ -6296,6 +6645,16 @@ def _run_attacker_round(
             local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
             local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
             local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
+            _accumulate_eval_status_counts(
+                stage_stats=local_stage,
+                eval_stats={
+                    "valid": float(trial_stats.get("trial_valid", 0.0)),
+                    "valid_no_metrics": float(trial_stats.get("trial_valid_no_metrics", 0.0)),
+                    "timeout_cut": float(trial_stats.get("trial_timeout_cut", 0.0)),
+                    "complexity_cut": float(trial_stats.get("trial_complexity_cut", 0.0)),
+                    "error_empty": float(trial_stats.get("trial_error_empty", 0.0)),
+                },
+            )
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             local_stage["target_batch_seconds"] = float(
                 target_calibrator.observe(local_stage["batch_seconds"])
@@ -6306,6 +6665,7 @@ def _run_attacker_round(
                 evolver=evolver,
                 stage_stats=local_stage,
             )
+            _finalize_eval_status_ratios(local_stage)
             local_stage["mutation_rate"] = float(evolver.mutation_rate)
             stage_stats.clear()
             stage_stats.update(local_stage)
@@ -6365,6 +6725,10 @@ def _run_attacker_round(
         local_stage["eval_unique"] += float(quick_stats["unique_eval"])
         local_stage["cache_hits"] += float(quick_stats["cache_hits"])
         local_stage["dup_reuse"] += float(quick_stats["dup_reuse"])
+        _accumulate_eval_status_counts(
+            stage_stats=local_stage,
+            eval_stats=quick_stats,
+        )
         pending_genomes = [genome for _, genome in pending]
         _mark_duplicate_genomes(
             pending_genomes,
@@ -6445,6 +6809,16 @@ def _run_attacker_round(
             local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
             local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
             local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
+            _accumulate_eval_status_counts(
+                stage_stats=local_stage,
+                eval_stats={
+                    "valid": float(trial_stats.get("trial_valid", 0.0)),
+                    "valid_no_metrics": float(trial_stats.get("trial_valid_no_metrics", 0.0)),
+                    "timeout_cut": float(trial_stats.get("trial_timeout_cut", 0.0)),
+                    "complexity_cut": float(trial_stats.get("trial_complexity_cut", 0.0)),
+                    "error_empty": float(trial_stats.get("trial_error_empty", 0.0)),
+                },
+            )
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             local_stage["target_batch_seconds"] = float(
                 target_calibrator.observe(local_stage["batch_seconds"])
@@ -6457,6 +6831,7 @@ def _run_attacker_round(
                 evolver=evolver,
                 stage_stats=local_stage,
             )
+            _finalize_eval_status_ratios(local_stage)
             local_stage["mutation_rate"] = float(evolver.mutation_rate)
             stage_stats.clear()
             stage_stats.update({
@@ -6492,6 +6867,10 @@ def _run_attacker_round(
         local_stage["eval_unique"] += float(mid_stats["unique_eval"])
         local_stage["cache_hits"] += float(mid_stats["cache_hits"])
         local_stage["dup_reuse"] += float(mid_stats["dup_reuse"])
+        _accumulate_eval_status_counts(
+            stage_stats=local_stage,
+            eval_stats=mid_stats,
+        )
         mid_genomes = [genome for _, genome in mid_pending]
         _mark_duplicate_genomes(
             mid_genomes,
@@ -6572,6 +6951,16 @@ def _run_attacker_round(
             local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
             local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
             local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
+            _accumulate_eval_status_counts(
+                stage_stats=local_stage,
+                eval_stats={
+                    "valid": float(trial_stats.get("trial_valid", 0.0)),
+                    "valid_no_metrics": float(trial_stats.get("trial_valid_no_metrics", 0.0)),
+                    "timeout_cut": float(trial_stats.get("trial_timeout_cut", 0.0)),
+                    "complexity_cut": float(trial_stats.get("trial_complexity_cut", 0.0)),
+                    "error_empty": float(trial_stats.get("trial_error_empty", 0.0)),
+                },
+            )
             local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
             local_stage["target_batch_seconds"] = float(
                 target_calibrator.observe(local_stage["batch_seconds"])
@@ -6584,6 +6973,7 @@ def _run_attacker_round(
                 evolver=evolver,
                 stage_stats=local_stage,
             )
+            _finalize_eval_status_ratios(local_stage)
             local_stage["mutation_rate"] = float(evolver.mutation_rate)
             stage_stats.clear()
             stage_stats.update({
@@ -6618,6 +7008,10 @@ def _run_attacker_round(
         local_stage["eval_unique"] += float(full_stats["unique_eval"])
         local_stage["cache_hits"] += float(full_stats["cache_hits"])
         local_stage["dup_reuse"] += float(full_stats["dup_reuse"])
+        _accumulate_eval_status_counts(
+            stage_stats=local_stage,
+            eval_stats=full_stats,
+        )
 
         survivor_ids = {id(genome) for _, genome in full_pending}
         cut_candidates = [
@@ -6657,6 +7051,10 @@ def _run_attacker_round(
             local_stage["eval_unique"] += float(probe_stats["unique_eval"])
             local_stage["cache_hits"] += float(probe_stats["cache_hits"])
             local_stage["dup_reuse"] += float(probe_stats["dup_reuse"])
+            _accumulate_eval_status_counts(
+                stage_stats=local_stage,
+                eval_stats=probe_stats,
+            )
             cutoff = min(float(genome.fitness or -float("inf")) for _, genome in full_pending)
             probe_wins = 0
             for _, probe_genome in probe_pending:
@@ -6705,6 +7103,16 @@ def _run_attacker_round(
         local_stage["eval_unique"] += float(trial_stats["trial_unique_eval"])
         local_stage["cache_hits"] += float(trial_stats["trial_cache_hits"])
         local_stage["dup_reuse"] += float(trial_stats["trial_dup_reuse"])
+        _accumulate_eval_status_counts(
+            stage_stats=local_stage,
+            eval_stats={
+                "valid": float(trial_stats.get("trial_valid", 0.0)),
+                "valid_no_metrics": float(trial_stats.get("trial_valid_no_metrics", 0.0)),
+                "timeout_cut": float(trial_stats.get("trial_timeout_cut", 0.0)),
+                "complexity_cut": float(trial_stats.get("trial_complexity_cut", 0.0)),
+                "error_empty": float(trial_stats.get("trial_error_empty", 0.0)),
+            },
+        )
 
         local_stage["batch_seconds"] = float(time.perf_counter() - eval_started)
         local_stage["target_batch_seconds"] = float(
@@ -6718,6 +7126,7 @@ def _run_attacker_round(
             evolver=evolver,
             stage_stats=local_stage,
         )
+        _finalize_eval_status_ratios(local_stage)
         local_stage["mutation_rate"] = float(evolver.mutation_rate)
         stage_stats.clear()
         stage_stats.update({
@@ -6770,6 +7179,8 @@ class _RoundExecutionResult:
     attacker_log: List[Dict[str, Any]]
     best_attacker_payload: Dict[str, Any]
     predictive_updates: Dict[str, Dict[str, Any]]
+    archive_eligible: bool
+    archive_skip_reason: str
 
 
 def _deserialize_attacker_payload(payload: Optional[Dict[str, Any]]) -> Optional[GFSLGenome]:
@@ -6867,6 +7278,10 @@ def _run_round_from_snapshot(
             provider_mhz=config.provider_mhz,
             max_test_time_seconds=config.max_test_time_seconds,
         )
+        selection_cycle_fraction_used = 1.0
+        selection_key_variants_used = int(selection_key_variants)
+        selection_complexity_used = "hard"
+        effective_selection_scenarios = list(selection_scenarios)
 
         top_candidates = [
             genome for genome in defender_evolver.population
@@ -6906,11 +7321,17 @@ def _run_round_from_snapshot(
                 except Exception:
                     continue
 
+        requested_panel_size = int(len(attacker_panel))
+        active_attacker_panel: List[GFSLGenome] = []
+        if attacker_panel:
+            active_attacker_panel.append(attacker_panel[0])
+        panel_progressive_stop_reason = ""
+
         panel_scores: Dict[int, List[float]] = {id(candidate): [] for candidate in top_candidates}
         panel_advantages: Dict[int, List[float]] = {id(candidate): [] for candidate in top_candidates}
         panel_primary_metrics: Dict[int, List[Dict[str, Any]]] = {}
 
-        for panel_index, panel_attacker in enumerate(attacker_panel):
+        for panel_index, panel_attacker in enumerate(active_attacker_panel):
             candidate_pending = list(enumerate(top_candidates))
             _evaluate_pending_parallel(
                 pending=candidate_pending,
@@ -6964,6 +7385,63 @@ def _run_round_from_snapshot(
             return ranked
 
         ranked_candidates = _rank_from_panel_scores()
+
+        def _is_panel_timeout_collapse(
+            ranked: Sequence[Tuple[float, GFSLGenome, float, float, float]],
+        ) -> bool:
+            return bool(
+                ranked
+                and (
+                    max(float(item[2]) for item in ranked)
+                    <= (float(_timeout_cut_score(role="defender")) + 1e-9)
+                    or max(float(item[3]) for item in ranked)
+                    <= (float(_timeout_cut_score(role="defender")) + 1e-9)
+                )
+            )
+
+        if len(attacker_panel) > 1:
+            for panel_attacker in attacker_panel[1:]:
+                if _is_panel_timeout_collapse(ranked_candidates):
+                    panel_progressive_stop_reason = "timeout-collapse-before-expand"
+                    break
+                candidate_pending = list(enumerate(top_candidates))
+                _evaluate_pending_parallel(
+                    pending=candidate_pending,
+                    backend=resource_plan.parallel_backend,
+                    workers=resource_plan.parallel_workers,
+                    executor=shared_executor,
+                    worker_fn=_defender_eval_worker,
+                    build_task=lambda g, atk=panel_attacker: (
+                        g,
+                        effective_selection_scenarios,
+                        atk,
+                        "full",
+                    ),
+                    attr_name="_pcpl_metrics",
+                    store_metrics=True,
+                )
+                for candidate in top_candidates:
+                    score = float(candidate.fitness or -float("inf"))
+                    metrics = getattr(candidate, "_pcpl_metrics", [])
+                    panel_scores[id(candidate)].append(score)
+                    panel_advantages[id(candidate)].append(
+                        _mean_metric(metrics, "attacker_advantage_score")
+                    )
+                active_attacker_panel.append(panel_attacker)
+                ranked_candidates = _rank_from_panel_scores()
+                if _is_panel_timeout_collapse(ranked_candidates):
+                    # Roll back the just-added attacker slice and keep the last stable panel.
+                    for candidate in top_candidates:
+                        if panel_scores[id(candidate)]:
+                            panel_scores[id(candidate)].pop()
+                        if panel_advantages[id(candidate)]:
+                            panel_advantages[id(candidate)].pop()
+                    if active_attacker_panel:
+                        active_attacker_panel.pop()
+                    ranked_candidates = _rank_from_panel_scores()
+                    panel_progressive_stop_reason = "timeout-collapse-on-expand"
+                    break
+
         timeout_cut = float(_timeout_cut_score(role="defender"))
         direct_eval_timeout = _stage_eval_timeout_seconds(role="defender", stage="full")
 
@@ -6971,6 +7449,8 @@ def _run_round_from_snapshot(
             defender: GFSLGenome,
             *,
             attacker: Optional[GFSLGenome],
+            scenarios_override: Optional[Sequence[ScenarioConfig]] = None,
+            timeout_override: Optional[float] = None,
         ) -> Tuple[float, Sequence[Any]]:
             ensure_genome_io(defender)
             if attacker is not None:
@@ -6981,12 +7461,22 @@ def _run_round_from_snapshot(
             )
             if over_budget:
                 return float(cut_score), []
+            eval_scenarios = (
+                list(scenarios_override)
+                if scenarios_override is not None
+                else list(effective_selection_scenarios)
+            )
+            eval_timeout = (
+                float(timeout_override)
+                if timeout_override is not None
+                else float(direct_eval_timeout)
+            )
             try:
                 return _evaluate_with_timeout(
-                    selection_scenarios,
+                    eval_scenarios,
                     defender,
                     attacker=attacker,
-                    timeout_seconds=direct_eval_timeout,
+                    timeout_seconds=eval_timeout,
                 )
             except TimeoutError:
                 return timeout_cut, []
@@ -6995,22 +7485,54 @@ def _run_round_from_snapshot(
 
         panel_timeout_recheck = bool(
             ranked_candidates
-            and max(float(item[2]) for item in ranked_candidates) <= (timeout_cut + 1e-9)
+            and (
+                max(float(item[2]) for item in ranked_candidates) <= (timeout_cut + 1e-9)
+                or max(float(item[3]) for item in ranked_candidates) <= (timeout_cut + 1e-9)
+            )
         )
+        selection_timeout_rescue_used = False
         if panel_timeout_recheck:
             print(
                 "[pcpl-evolvo] round={round:04d} defender panel timeout collapse detected; reranking candidates with direct evaluation.".format(
                     round=int(round_index),
                 )
             )
+            selection_timeout_rescue_used = True
+            selection_cycle_fraction_used = float(SELECTION_RESCUE_CYCLE_FRACTION)
+            selection_key_variants_used = max(
+                int(KEY_VARIANT_FLOOR),
+                min(int(selection_key_variants), int(SELECTION_RESCUE_KEY_VARIANTS)),
+            )
+            selection_complexity_used = "mid"
+            effective_selection_scenarios = _build_stage_scenarios(
+                scenarios,
+                cycle_fraction=float(selection_cycle_fraction_used),
+                key_variant_count=int(selection_key_variants_used),
+                complexity=str(selection_complexity_used),
+                device_mhz=config.device_mhz,
+                provider_mhz=config.provider_mhz,
+                max_test_time_seconds=config.max_test_time_seconds,
+            )
+            direct_eval_timeout = max(
+                float(direct_eval_timeout) * float(SELECTION_RESCUE_TIMEOUT_MULTIPLIER),
+                float(SELECTION_RESCUE_MIN_TIMEOUT_SECONDS),
+            )
+            rescue_panel: List[GFSLGenome] = []
+            if active_attacker_panel:
+                rescue_panel = [active_attacker_panel[0]]
+            else:
+                rescue_panel = [best_attacker]
+            active_attacker_panel = list(rescue_panel)
             panel_scores = {id(candidate): [] for candidate in top_candidates}
             panel_advantages = {id(candidate): [] for candidate in top_candidates}
             panel_primary_metrics = {}
-            for panel_index, panel_attacker in enumerate(attacker_panel):
+            for panel_index, panel_attacker in enumerate(active_attacker_panel):
                 for candidate in top_candidates:
                     score, candidate_metrics = _evaluate_defender_direct(
                         candidate,
                         attacker=panel_attacker,
+                        scenarios_override=effective_selection_scenarios,
+                        timeout_override=direct_eval_timeout,
                     )
                     panel_scores[id(candidate)].append(float(score))
                     panel_advantages[id(candidate)].append(
@@ -7030,6 +7552,45 @@ def _run_round_from_snapshot(
             if math.isfinite(float(selected_eval_score))
             else float(selected_panel_base_score)
         )
+        selected_metrics_rows = _metrics_rows(selected_metrics)
+        metrics_present = bool(selected_metrics_rows)
+        if not metrics_present:
+            selection_timeout_rescue_used = True
+            selection_cycle_fraction_used = min(
+                float(selection_cycle_fraction_used),
+                float(SELECTION_RESCUE_CYCLE_FRACTION),
+            )
+            selection_key_variants_used = max(
+                int(KEY_VARIANT_FLOOR),
+                min(int(selection_key_variants_used), int(SELECTION_RESCUE_KEY_VARIANTS)),
+            )
+            selection_complexity_used = "quick"
+            effective_selection_scenarios = _build_stage_scenarios(
+                scenarios,
+                cycle_fraction=float(max(0.45, selection_cycle_fraction_used - 0.10)),
+                key_variant_count=int(selection_key_variants_used),
+                complexity=str(selection_complexity_used),
+                device_mhz=config.device_mhz,
+                provider_mhz=config.provider_mhz,
+                max_test_time_seconds=config.max_test_time_seconds,
+            )
+            direct_eval_timeout = max(
+                float(direct_eval_timeout),
+                float(SELECTION_RESCUE_MIN_TIMEOUT_SECONDS),
+            )
+            selected_eval_score, selected_metrics = _evaluate_defender_direct(
+                selected_defender,
+                attacker=best_attacker,
+                scenarios_override=effective_selection_scenarios,
+                timeout_override=direct_eval_timeout,
+            )
+            selected_score = (
+                float(selected_eval_score)
+                if math.isfinite(float(selected_eval_score))
+                else float(selected_panel_base_score)
+            )
+            selected_metrics_rows = _metrics_rows(selected_metrics)
+            metrics_present = bool(selected_metrics_rows)
 
         reference_defender = build_reference_defender_genome()
         ensure_genome_io(reference_defender)
@@ -7042,6 +7603,9 @@ def _run_round_from_snapshot(
         defender_signature = selected_defender.get_signature()
         attacker_signature = best_attacker.get_signature()
         reference_signature = reference_defender.get_signature()
+        reference_metrics_rows = _metrics_rows(reference_metrics)
+        archive_eligible = bool(metrics_present)
+        archive_skip_reason = "" if archive_eligible else "missing-defender-metrics"
 
         defender_record = {
             "role": "defender",
@@ -7051,10 +7615,13 @@ def _run_round_from_snapshot(
             "robust_score": float(selected_robust_score),
             "panel_worst_score": float(selected_panel_worst_score),
             "panel_worst_attacker_adv": float(selected_panel_worst_adv),
-            "panel_size": int(len(attacker_panel)),
+            "panel_size": int(len(active_attacker_panel)),
             "signature": defender_signature,
             "canonical_signature": _canonical_signature(selected_defender),
-            "metrics": _metrics_rows(selected_metrics),
+            "metrics": selected_metrics_rows,
+            "evaluation_status": (
+                EVAL_STATUS_VALID if bool(metrics_present) else EVAL_STATUS_TIMEOUT_CUT
+            ),
             "genome": _serialize_genome(selected_defender, role="defender"),
         }
         attacker_record = {
@@ -7064,7 +7631,10 @@ def _run_round_from_snapshot(
             "score": float(attack_adv),
             "signature": attacker_signature,
             "canonical_signature": _canonical_signature(best_attacker),
-            "metrics": _metrics_rows(selected_metrics),
+            "metrics": selected_metrics_rows,
+            "evaluation_status": (
+                EVAL_STATUS_VALID if bool(metrics_present) else EVAL_STATUS_TIMEOUT_CUT
+            ),
             "genome": _serialize_genome(best_attacker, role="attacker"),
         }
 
@@ -7113,13 +7683,22 @@ def _run_round_from_snapshot(
                 "attacker": _aggregate_native_counter_rows(attacker_native_rows),
             },
             "selection_panel": {
-                "attacker_panel_size": int(len(attacker_panel)),
+                "attacker_panel_size": int(len(active_attacker_panel)),
+                "attacker_panel_requested_size": int(requested_panel_size),
                 "attacker_panel_penalty": float(panel_penalty),
                 "timeout_recheck": bool(panel_timeout_recheck),
+                "timeout_rescue_used": bool(selection_timeout_rescue_used),
+                "progressive_stop_reason": str(panel_progressive_stop_reason),
+                "selection_cycle_fraction": float(selection_cycle_fraction_used),
+                "selection_key_variants": int(selection_key_variants_used),
+                "selection_complexity": str(selection_complexity_used),
                 "defender_robust_score": float(selected_robust_score),
                 "defender_panel_worst_score": float(selected_panel_worst_score),
                 "defender_panel_worst_attacker_adv": float(selected_panel_worst_adv),
                 "anti_attacker_slice": int(anti_slice_keep),
+                "metrics_present": bool(metrics_present),
+                "archive_eligible": bool(archive_eligible),
+                "archive_skip_reason": str(archive_skip_reason),
             },
             "defender_stop_reason": (
                 str(defender_log[-1].get("stop_reason", ""))
@@ -7131,7 +7710,9 @@ def _run_round_from_snapshot(
                 if attacker_log
                 else ""
             ),
-            "metrics": _metrics_rows(selected_metrics),
+            "metrics": selected_metrics_rows,
+            "archive_eligible": bool(archive_eligible),
+            "archive_skip_reason": str(archive_skip_reason),
             "predictive_profile": {
                 "defender": defender_profile,
                 "attacker": attacker_profile,
@@ -7145,7 +7726,7 @@ def _run_round_from_snapshot(
                 "signature": reference_signature,
                 "canonical_signature": _canonical_signature(reference_defender),
                 "score_delta": float(selected_score - reference_score),
-                "metrics": _metrics_rows(reference_metrics),
+                "metrics": reference_metrics_rows,
             },
         }
         round_report = _build_round_report(
@@ -7187,6 +7768,8 @@ def _run_round_from_snapshot(
                 "defender_supervised": defender_supervised,
                 "attacker_supervised": attacker_supervised,
             },
+            archive_eligible=bool(archive_eligible),
+            archive_skip_reason=str(archive_skip_reason),
         )
     finally:
         _shutdown_shared_executor(shared_executor)
@@ -7509,36 +8092,44 @@ def run_continuous_experiment(
             round_dir = rounds_dir / f"round-{round_index:04d}"
             round_dir.mkdir(parents=True, exist_ok=True)
 
-            archive["defender_elites"] = _insert_elite(
-                archive.get("defender_elites", []),
-                result.defender_record,
-                limit=config.archive_limit,
-            )
-            archive["attacker_elites"] = _insert_elite(
-                archive.get("attacker_elites", []),
-                result.attacker_record,
-                limit=config.archive_limit,
-            )
-            anti_entries = archive.get("defender_anti_attacker_elites", [])
-            if not isinstance(anti_entries, list):
-                anti_entries = []
-            for anti_record_raw in result.anti_records:
-                anti_record = dict(anti_record_raw)
-                anti_limit = max(
-                    8,
-                    int(
-                        anti_record.pop(
-                            "_limit",
-                            max(8, int(math.ceil(float(config.archive_limit) * 0.5))),
-                        )
-                    ),
+            if bool(result.archive_eligible):
+                archive["defender_elites"] = _insert_elite(
+                    archive.get("defender_elites", []),
+                    result.defender_record,
+                    limit=config.archive_limit,
                 )
-                anti_entries = _insert_elite(
-                    anti_entries,
-                    anti_record,
-                    limit=anti_limit,
+                archive["attacker_elites"] = _insert_elite(
+                    archive.get("attacker_elites", []),
+                    result.attacker_record,
+                    limit=config.archive_limit,
                 )
-            archive["defender_anti_attacker_elites"] = anti_entries
+                anti_entries = archive.get("defender_anti_attacker_elites", [])
+                if not isinstance(anti_entries, list):
+                    anti_entries = []
+                for anti_record_raw in result.anti_records:
+                    anti_record = dict(anti_record_raw)
+                    anti_limit = max(
+                        8,
+                        int(
+                            anti_record.pop(
+                                "_limit",
+                                max(8, int(math.ceil(float(config.archive_limit) * 0.5))),
+                            )
+                        ),
+                    )
+                    anti_entries = _insert_elite(
+                        anti_entries,
+                        anti_record,
+                        limit=anti_limit,
+                    )
+                archive["defender_anti_attacker_elites"] = anti_entries
+            else:
+                print(
+                    "[pcpl-evolvo] round={round:04d} archive promotion skipped ({reason}).".format(
+                        round=int(round_index),
+                        reason=str(result.archive_skip_reason or "unspecified"),
+                    )
+                )
 
             predictive_profile = archive.setdefault("predictive_profile", {})
             if not isinstance(predictive_profile, dict):
@@ -7568,9 +8159,10 @@ def run_continuous_experiment(
             )
             (round_dir / "round-report.md").write_text(result.round_report, encoding="utf-8")
 
-            next_attacker = _deserialize_attacker_payload(result.best_attacker_payload)
-            if next_attacker is not None:
-                current_attacker = next_attacker
+            if bool(result.archive_eligible):
+                next_attacker = _deserialize_attacker_payload(result.best_attacker_payload)
+                if next_attacker is not None:
+                    current_attacker = next_attacker
             last_defender_score = float(result.defender_score)
             last_attacker_score = float(result.attacker_score)
             last_defender_signature = str(result.defender_signature)

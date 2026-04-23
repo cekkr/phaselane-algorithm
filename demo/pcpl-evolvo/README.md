@@ -267,5 +267,9 @@ Notes:
 - Stage fractions/keep ratios/key-variants are auto-tuned from runtime statistics (probe false-negative rate, novelty rate, keep-throughput) and persisted in `archive.json` for following rounds.
 - In `--supervised-end-round-only` mode, the guide is now warmed once at round start and reused for proposal (no per-generation retraining).
 - Duplicate genomes are collapsed before stage execution and cached by fast evaluation signature + scenario fingerprint + opponent signature, so repeated candidates are not re-executed.
+- Evaluator outcomes are now tracked with explicit status buckets (`valid`, `valid-no-metrics`, `timeout-cut`, `complexity-cut`, `error-empty`) and surfaced in generation logs as `estatus=...`.
+- Defender sync-gate/anti-neutrality penalties are automatically skipped when full-stage timeout ratio is too high, avoiding false pressure from timeout-only batches.
+- Defender panel selection now expands attackers progressively and can fall back to a rescue selection profile (reduced complexity + longer timeout) when timeout collapse is detected.
+- Round archive promotion now requires non-empty defender metrics; timeout-only rounds are persisted for diagnostics but skipped for elite insertion.
 - Process evaluation dispatch uses chunked batch workers to reduce per-genome IPC/pickling overhead in `process` backend.
 - For `--profile full`, startup tuning is automatically leaner and generation-time budgeted (target ~3s) without extra flags.
