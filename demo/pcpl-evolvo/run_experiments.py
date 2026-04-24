@@ -41,6 +41,13 @@ except Exception:
 from pcpl_evolvo.experiment import ExperimentConfig, run_experiment
 
 DEFAULT_FITNESS_SCHEMA_VERSION = "auto"
+EXPERIMENT_SUITE_CHOICES = ("single", "precision")
+PRECISION_TRACK_CHOICES = (
+    "baseline",
+    "supervisor",
+    "lane-pressure",
+    "evaluability",
+)
 
 _KOMPUTE_SELFTEST_SHADER_SOURCE = """#version 450
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
@@ -718,10 +725,34 @@ def _parse_hidden_layers_spec(value: Any) -> List[int]:
     return parsed[:5]
 
 
-def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, Any]]:
-    mode = str(getattr(args, "mode", "")).lower()
-    base = {
-        "strategy": "base",
+def _parse_precision_tracks_spec(value: Any) -> List[str]:
+    if value is None:
+        return list(PRECISION_TRACK_CHOICES)
+    text = str(value).strip()
+    if not text or text.lower() in {"all", "default", "auto"}:
+        return list(PRECISION_TRACK_CHOICES)
+    parsed: List[str] = []
+    seen = set()
+    for raw_item in text.split(","):
+        item = str(raw_item).strip().lower()
+        if not item:
+            continue
+        if item not in PRECISION_TRACK_CHOICES:
+            allowed = ", ".join(PRECISION_TRACK_CHOICES)
+            raise ValueError(
+                f"Unknown precision track `{raw_item}`. Allowed: {allowed}"
+            )
+        if item in seen:
+            continue
+        seen.add(item)
+        parsed.append(item)
+    if not parsed:
+        return list(PRECISION_TRACK_CHOICES)
+    return parsed
+
+
+def _base_strategy_profile(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
         "parent_pool_ratio": float(args.parent_pool_ratio),
         "stagnation_patience": int(args.stagnation_patience),
         "mutation_floor": float(args.mutation_floor),
@@ -744,6 +775,130 @@ def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, An
         "attacker_panel_penalty": float(args.attacker_panel_penalty),
         "target_generation_seconds": float(args.target_generation_seconds),
         "max_eval_cache_entries": int(args.max_eval_cache_entries),
+        "statistical_predictive": bool(args.statistical_predictive),
+        "auto_statistical_tuning": bool(args.auto_statistical_tuning),
+        "parallel_backend": str(args.parallel_backend),
+        "round_parallelism": int(args.round_parallelism),
+        "minimum_parallel_rounds": int(args.minimum_parallel_rounds),
+        "device_mhz": float(args.device_mhz),
+        "provider_mhz": float(args.provider_mhz),
+        "max_test_time_seconds": float(args.max_test_seconds),
+        "debug_eval_timeout_seconds": float(args.debug_eval_timeout_seconds),
+        "debug_eval_log_interval_seconds": float(args.debug_eval_log_interval_seconds),
+    }
+
+
+def _precision_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    base = _base_strategy_profile(args)
+    baseline = {
+        **base,
+        "strategy": "baseline",
+        "description": (
+            "Resolved user configuration kept intact as the reference precision lane."
+        ),
+    }
+    supervisor = {
+        **base,
+        "strategy": "supervisor",
+        "description": (
+            "Long-horizon supervision lane: stronger sync pressure, longer timing horizon, "
+            "and more attacker coupling."
+        ),
+        "key_variants": max(6, int(base["key_variants"])),
+        "sync_loss_gate_percentile": _clamp_float(
+            min(float(base["sync_loss_gate_percentile"]), 0.52),
+            0.0,
+            1.0,
+        ),
+        "sync_loss_gate_penalty": max(0.14, float(base["sync_loss_gate_penalty"])),
+        "sync_loss_gate_flat_boost": max(
+            0.10,
+            float(base["sync_loss_gate_flat_boost"]),
+        ),
+        "attacker_panel_size": max(4, int(base["attacker_panel_size"])),
+        "attacker_panel_penalty": max(0.18, float(base["attacker_panel_penalty"])),
+        "target_generation_seconds": max(
+            3.2,
+            float(base["target_generation_seconds"]),
+        ),
+        "max_eval_cache_entries": max(
+            int(base["max_eval_cache_entries"]),
+            int(round(float(base["max_eval_cache_entries"]) * 1.20)),
+        ),
+        "max_test_time_seconds": max(30.0, float(base["max_test_time_seconds"])),
+    }
+    lane_pressure = {
+        **base,
+        "strategy": "lane-pressure",
+        "description": (
+            "Lane/route inference lane: larger attacker panels and more key variants to "
+            "stress schedule predictability rather than only token guessing."
+        ),
+        "key_variants": max(6, int(base["key_variants"])),
+        "novelty_bonus": max(0.16, float(base["novelty_bonus"])),
+        "predictive_penalty": max(0.10, float(base["predictive_penalty"])),
+        "sync_loss_gate_percentile": _clamp_float(
+            min(float(base["sync_loss_gate_percentile"]), 0.58),
+            0.0,
+            1.0,
+        ),
+        "sync_loss_gate_penalty": max(0.12, float(base["sync_loss_gate_penalty"])),
+        "attacker_panel_size": max(5, int(base["attacker_panel_size"])),
+        "attacker_panel_penalty": max(0.22, float(base["attacker_panel_penalty"])),
+        "max_test_time_seconds": max(15.0, float(base["max_test_time_seconds"])),
+    }
+    evaluability = {
+        **base,
+        "strategy": "evaluability",
+        "description": (
+            "Evaluability audit lane: disables predictive shortcuts and reduces blind "
+            "parallel cut paths so final metrics are more trustworthy."
+        ),
+        "statistical_predictive": False,
+        "auto_statistical_tuning": False,
+        "parallel_backend": "thread",
+        "round_parallelism": 1,
+        "minimum_parallel_rounds": 1,
+        "target_generation_seconds": max(
+            3.0,
+            float(base["target_generation_seconds"]),
+        ),
+        "max_eval_cache_entries": max(
+            int(base["max_eval_cache_entries"]),
+            int(round(float(base["max_eval_cache_entries"]) * 1.15)),
+        ),
+        "debug_eval_timeout_seconds": max(
+            60.0,
+            float(base["debug_eval_timeout_seconds"]),
+        ),
+        "debug_eval_log_interval_seconds": max(
+            15.0,
+            float(base["debug_eval_log_interval_seconds"]),
+        ),
+    }
+    return [baseline, supervisor, lane_pressure, evaluability]
+
+
+def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    if str(getattr(args, "experiment_suite", "single")).strip().lower() == "precision":
+        allowed = {
+            str(item).strip().lower()
+            for item in getattr(args, "precision_tracks", PRECISION_TRACK_CHOICES)
+        }
+        profiles = [
+            profile
+            for profile in _precision_strategy_profiles(args)
+            if str(profile.get("strategy", "")).strip().lower() in allowed
+        ]
+        if not profiles:
+            raise RuntimeError("Precision suite selected but no tracks were enabled")
+        return profiles
+
+    mode = str(getattr(args, "mode", "")).lower()
+    base = {
+        **_base_strategy_profile(args),
+        "strategy": "base",
+        "description": "Resolved runner defaults as-is.",
     }
     if mode != "paper":
         return [base]
@@ -816,20 +971,31 @@ def _combo_label(combo: Dict[str, Any]) -> str:
 
 def _build_continuous_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
     """Generate a finite exhaustive parameter grid for continuous sweeps."""
-    populations = _param_choices(args.population_size, minimum=4, high_factor=1.5)
-    generations = _param_choices(args.generations, minimum=1, high_factor=1.6)
-    instructions = _param_choices(args.initial_instructions, minimum=3, high_factor=1.5)
-    attacker_populations = _param_choices(
-        args.attacker_population_size,
-        minimum=3,
-        high_factor=1.5,
+    precision_suite = (
+        str(getattr(args, "experiment_suite", "single")).strip().lower() == "precision"
     )
-    attacker_generations = _param_choices(
-        args.attacker_generations,
-        minimum=1,
-        high_factor=1.6,
-    )
-    elites = _param_choices(args.elite_pool, minimum=4, high_factor=1.4)
+    if precision_suite:
+        populations = [_safe_int(args.population_size, minimum=4)]
+        generations = [_safe_int(args.generations, minimum=1)]
+        instructions = [_safe_int(args.initial_instructions, minimum=3)]
+        attacker_populations = [_safe_int(args.attacker_population_size, minimum=3)]
+        attacker_generations = [_safe_int(args.attacker_generations, minimum=1)]
+        elites = [_safe_int(args.elite_pool, minimum=4)]
+    else:
+        populations = _param_choices(args.population_size, minimum=4, high_factor=1.5)
+        generations = _param_choices(args.generations, minimum=1, high_factor=1.6)
+        instructions = _param_choices(args.initial_instructions, minimum=3, high_factor=1.5)
+        attacker_populations = _param_choices(
+            args.attacker_population_size,
+            minimum=3,
+            high_factor=1.5,
+        )
+        attacker_generations = _param_choices(
+            args.attacker_generations,
+            minimum=1,
+            high_factor=1.6,
+        )
+        elites = _param_choices(args.elite_pool, minimum=4, high_factor=1.4)
     strategies = _continuous_strategy_profiles(args)
 
     combos: List[Dict[str, Any]] = []
@@ -875,6 +1041,50 @@ def _build_continuous_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "attacker_panel_penalty": float(strategy["attacker_panel_penalty"]),
                     "target_generation_seconds": float(strategy["target_generation_seconds"]),
                     "max_eval_cache_entries": int(strategy["max_eval_cache_entries"]),
+                    "statistical_predictive": bool(
+                        strategy.get("statistical_predictive", args.statistical_predictive)
+                    ),
+                    "auto_statistical_tuning": bool(
+                        strategy.get(
+                            "auto_statistical_tuning",
+                            args.auto_statistical_tuning,
+                        )
+                    ),
+                    "parallel_backend": str(
+                        strategy.get("parallel_backend", args.parallel_backend)
+                    ),
+                    "round_parallelism": int(
+                        strategy.get("round_parallelism", args.round_parallelism)
+                    ),
+                    "minimum_parallel_rounds": int(
+                        strategy.get(
+                            "minimum_parallel_rounds",
+                            args.minimum_parallel_rounds,
+                        )
+                    ),
+                    "device_mhz": float(strategy.get("device_mhz", args.device_mhz)),
+                    "provider_mhz": float(
+                        strategy.get("provider_mhz", args.provider_mhz)
+                    ),
+                    "max_test_time_seconds": float(
+                        strategy.get(
+                            "max_test_time_seconds",
+                            args.max_test_seconds,
+                        )
+                    ),
+                    "debug_eval_timeout_seconds": float(
+                        strategy.get(
+                            "debug_eval_timeout_seconds",
+                            args.debug_eval_timeout_seconds,
+                        )
+                    ),
+                    "debug_eval_log_interval_seconds": float(
+                        strategy.get(
+                            "debug_eval_log_interval_seconds",
+                            args.debug_eval_log_interval_seconds,
+                        )
+                    ),
+                    "description": str(strategy.get("description", "")),
                 }
             )
 
@@ -921,6 +1131,16 @@ def _build_experiment_config(
     attacker_panel_penalty: Optional[float] = None,
     target_generation_seconds: Optional[float] = None,
     max_eval_cache_entries: Optional[int] = None,
+    parallel_backend: Optional[str] = None,
+    round_parallelism: Optional[int] = None,
+    minimum_parallel_rounds: Optional[int] = None,
+    statistical_predictive: Optional[bool] = None,
+    auto_statistical_tuning: Optional[bool] = None,
+    device_mhz: Optional[float] = None,
+    provider_mhz: Optional[float] = None,
+    max_test_time_seconds: Optional[float] = None,
+    debug_eval_timeout_seconds: Optional[float] = None,
+    debug_eval_log_interval_seconds: Optional[float] = None,
 ) -> ExperimentConfig:
     return ExperimentConfig(
         out_dir=out_dir,
@@ -936,9 +1156,21 @@ def _build_experiment_config(
         archive_limit=archive_limit,
         resume=resume,
         parallel_workers=workers,
-        parallel_backend=args.parallel_backend,
-        round_parallelism=int(args.round_parallelism),
-        minimum_parallel_rounds=int(args.minimum_parallel_rounds),
+        parallel_backend=(
+            str(args.parallel_backend)
+            if parallel_backend is None
+            else str(parallel_backend)
+        ),
+        round_parallelism=(
+            int(args.round_parallelism)
+            if round_parallelism is None
+            else int(round_parallelism)
+        ),
+        minimum_parallel_rounds=(
+            int(args.minimum_parallel_rounds)
+            if minimum_parallel_rounds is None
+            else int(minimum_parallel_rounds)
+        ),
         max_cpu_utilization=float(args.max_cpu_utilization),
         max_gpu_utilization=float(args.max_gpu_utilization),
         round_state_sync=str(args.round_state_sync),
@@ -973,7 +1205,11 @@ def _build_experiment_config(
         mutation_floor=args.mutation_floor if mutation_floor is None else float(mutation_floor),
         mutation_ceiling=args.mutation_ceiling if mutation_ceiling is None else float(mutation_ceiling),
         mutation_step=args.mutation_step if mutation_step is None else float(mutation_step),
-        statistical_predictive=bool(args.statistical_predictive),
+        statistical_predictive=(
+            bool(args.statistical_predictive)
+            if statistical_predictive is None
+            else bool(statistical_predictive)
+        ),
         quick_cycle_fraction=args.quick_cycle_fraction if quick_cycle_fraction is None else float(quick_cycle_fraction),
         mid_cycle_fraction=args.mid_cycle_fraction if mid_cycle_fraction is None else float(mid_cycle_fraction),
         quick_keep_ratio=args.quick_keep_ratio if quick_keep_ratio is None else float(quick_keep_ratio),
@@ -1021,7 +1257,11 @@ def _build_experiment_config(
             if attacker_panel_penalty is None
             else float(attacker_panel_penalty)
         ),
-        auto_statistical_tuning=bool(args.auto_statistical_tuning),
+        auto_statistical_tuning=(
+            bool(args.auto_statistical_tuning)
+            if auto_statistical_tuning is None
+            else bool(auto_statistical_tuning)
+        ),
         target_generation_seconds=(
             args.target_generation_seconds
             if target_generation_seconds is None
@@ -1032,11 +1272,99 @@ def _build_experiment_config(
             if max_eval_cache_entries is None
             else int(max_eval_cache_entries)
         ),
-        device_mhz=args.device_mhz,
-        provider_mhz=args.provider_mhz,
-        max_test_time_seconds=args.max_test_seconds,
-        debug_eval_timeout_seconds=float(args.debug_eval_timeout_seconds),
-        debug_eval_log_interval_seconds=float(args.debug_eval_log_interval_seconds),
+        device_mhz=(
+            float(args.device_mhz) if device_mhz is None else float(device_mhz)
+        ),
+        provider_mhz=(
+            float(args.provider_mhz)
+            if provider_mhz is None
+            else float(provider_mhz)
+        ),
+        max_test_time_seconds=(
+            float(args.max_test_seconds)
+            if max_test_time_seconds is None
+            else float(max_test_time_seconds)
+        ),
+        debug_eval_timeout_seconds=(
+            float(args.debug_eval_timeout_seconds)
+            if debug_eval_timeout_seconds is None
+            else float(debug_eval_timeout_seconds)
+        ),
+        debug_eval_log_interval_seconds=(
+            float(args.debug_eval_log_interval_seconds)
+            if debug_eval_log_interval_seconds is None
+            else float(debug_eval_log_interval_seconds)
+        ),
+    )
+
+
+def _build_experiment_config_from_args(
+    args: argparse.Namespace,
+    *,
+    out_dir: Path,
+    seed: int,
+    resume: bool,
+    workers: int,
+    overrides: Optional[Dict[str, Any]] = None,
+) -> ExperimentConfig:
+    values = dict(overrides or {})
+    return _build_experiment_config(
+        args,
+        out_dir=out_dir,
+        seed=int(values.get("seed", seed)),
+        population_size=int(values.get("population_size", args.population_size)),
+        generations=int(values.get("generations", args.generations)),
+        initial_instructions=int(
+            values.get("initial_instructions", args.initial_instructions)
+        ),
+        rounds=int(values.get("rounds", args.rounds)),
+        attacker_population_size=int(
+            values.get(
+                "attacker_population_size",
+                args.attacker_population_size,
+            )
+        ),
+        attacker_generations=int(
+            values.get("attacker_generations", args.attacker_generations)
+        ),
+        elite_pool=int(values.get("elite_pool", args.elite_pool)),
+        archive_limit=int(values.get("archive_limit", args.archive_limit)),
+        resume=resume,
+        workers=int(values.get("workers", workers)),
+        parent_pool_ratio=values.get("parent_pool_ratio"),
+        stagnation_patience=values.get("stagnation_patience"),
+        mutation_floor=values.get("mutation_floor"),
+        mutation_ceiling=values.get("mutation_ceiling"),
+        mutation_step=values.get("mutation_step"),
+        quick_cycle_fraction=values.get("quick_cycle_fraction"),
+        mid_cycle_fraction=values.get("mid_cycle_fraction"),
+        quick_keep_ratio=values.get("quick_keep_ratio"),
+        mid_keep_ratio=values.get("mid_keep_ratio"),
+        key_variants=values.get("key_variants"),
+        novelty_bonus=values.get("novelty_bonus"),
+        predictive_penalty=values.get("predictive_penalty"),
+        sync_loss_gate_percentile=values.get("sync_loss_gate_percentile"),
+        sync_loss_gate_penalty=values.get("sync_loss_gate_penalty"),
+        sync_loss_gate_flat_boost=values.get("sync_loss_gate_flat_boost"),
+        anti_neutrality_window=values.get("anti_neutrality_window"),
+        anti_neutrality_penalty=values.get("anti_neutrality_penalty"),
+        anti_neutrality_bonus=values.get("anti_neutrality_bonus"),
+        attacker_panel_size=values.get("attacker_panel_size"),
+        attacker_panel_penalty=values.get("attacker_panel_penalty"),
+        target_generation_seconds=values.get("target_generation_seconds"),
+        max_eval_cache_entries=values.get("max_eval_cache_entries"),
+        parallel_backend=values.get("parallel_backend"),
+        round_parallelism=values.get("round_parallelism"),
+        minimum_parallel_rounds=values.get("minimum_parallel_rounds"),
+        statistical_predictive=values.get("statistical_predictive"),
+        auto_statistical_tuning=values.get("auto_statistical_tuning"),
+        device_mhz=values.get("device_mhz"),
+        provider_mhz=values.get("provider_mhz"),
+        max_test_time_seconds=values.get("max_test_time_seconds"),
+        debug_eval_timeout_seconds=values.get("debug_eval_timeout_seconds"),
+        debug_eval_log_interval_seconds=values.get(
+            "debug_eval_log_interval_seconds"
+        ),
     )
 
 
@@ -1552,6 +1880,16 @@ def _print_effective_config(resolved: Dict[str, Any]) -> None:
                 rep_ref=str(resolved.get("replicate_reference", "best")),
             )
         )
+    if str(resolved.get("experiment_suite", "single")) != "single":
+        print(
+            "[pcpl-evolvo] experiment suite: {suite} tracks={tracks}".format(
+                suite=str(resolved.get("experiment_suite", "single")),
+                tracks=",".join(
+                    str(item) for item in resolved.get("precision_tracks", [])
+                )
+                or "default",
+            )
+        )
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -1716,6 +2054,129 @@ def _print_summary(summary: Dict[str, Any]) -> None:
         print(f"[pcpl-evolvo] conclusions={summary['conclusion_path']}")
     if "run_metadata_path" in summary:
         print(f"[pcpl-evolvo] run_metadata={summary['run_metadata_path']}")
+
+
+def _run_noncontinuous_campaign(
+    args: argparse.Namespace,
+    *,
+    out_dir: Path,
+    base_meta: Dict[str, Any],
+    config_overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if int(args.replicates) == 1:
+        config = _build_experiment_config_from_args(
+            args,
+            out_dir=out_dir,
+            seed=int(args.seed),
+            resume=bool(args.resume),
+            workers=int(args.workers),
+            overrides=config_overrides,
+        )
+        summary = _run_once(config, meta=base_meta)
+        _print_summary(summary)
+        return {"kind": "single", "summary": summary}
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    replicate_summaries: List[Dict[str, Any]] = []
+    base_seed = int(args.seed)
+    seed_step = int(args.replicate_seed_step)
+    print(
+        "[pcpl-evolvo] replicate campaign: n={n} base_seed={seed} step={step} root={root}".format(
+            n=int(args.replicates),
+            seed=base_seed,
+            step=seed_step,
+            root=out_dir,
+        )
+    )
+    for rep in range(int(args.replicates)):
+        rep_seed = base_seed + (rep * seed_step)
+        rep_out_dir = (out_dir / f"rep-{rep:03d}").resolve()
+        config = _build_experiment_config_from_args(
+            args,
+            out_dir=rep_out_dir,
+            seed=rep_seed,
+            resume=False,
+            workers=int(args.workers),
+            overrides=config_overrides,
+        )
+        rep_meta = dict(base_meta)
+        rep_meta["replicate_index"] = rep
+        rep_meta["replicate_seed"] = rep_seed
+        rep_meta["replicate_count"] = int(args.replicates)
+        summary = _run_once(config, meta=rep_meta)
+        _print_summary(summary)
+        replicate_summaries.append(summary)
+
+    best_scores = [float(item["best_score"]) for item in replicate_summaries]
+    attacker_scores = [
+        float(item["best_attacker_score"]) for item in replicate_summaries
+    ]
+    round_counts = [
+        int(item.get("rounds_completed", 0)) for item in replicate_summaries
+    ]
+    ref_idx = _select_replicate_reference_index(
+        replicate_summaries,
+        policy=str(args.replicate_reference),
+    )
+    ref_summary = replicate_summaries[ref_idx]
+    campaign_summary: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(),
+        "analysis_tag": str(args.analysis_tag or ""),
+        "fitness_schema_version": str(args.fitness_schema_version),
+        "mode": str(args.mode),
+        "profile": str(args.profile),
+        "replicate_count": int(args.replicates),
+        "base_seed": base_seed,
+        "seed_step": seed_step,
+        "reference_policy": str(args.replicate_reference),
+        "reference_replicate_index": int(ref_idx),
+        "reference_out_dir": str(ref_summary.get("out_dir", "")),
+        "reference_best_score": float(
+            ref_summary.get("best_score", float("-inf"))
+        ),
+        "best_score_mean": sum(best_scores) / float(max(1, len(best_scores))),
+        "best_score_min": min(best_scores) if best_scores else None,
+        "best_score_max": max(best_scores) if best_scores else None,
+        "best_attacker_score_mean": sum(attacker_scores)
+        / float(max(1, len(attacker_scores))),
+        "rounds_completed_mean": sum(round_counts)
+        / float(max(1, len(round_counts))),
+        "runs": [
+            {
+                "out_dir": item.get("out_dir"),
+                "best_score": item.get("best_score"),
+                "best_attacker_score": item.get("best_attacker_score"),
+                "rounds_completed": item.get("rounds_completed"),
+                "archive_path": item.get("archive_path"),
+                "report_path": item.get("report_path"),
+                "run_metadata_path": item.get("run_metadata_path"),
+            }
+            for item in replicate_summaries
+        ],
+    }
+    campaign_path = out_dir / "replicates-summary.json"
+    _write_json(campaign_path, campaign_summary)
+    reference_path = out_dir / "reference-run.json"
+    _write_json(
+        reference_path,
+        {
+            "timestamp": datetime.now().isoformat(),
+            "analysis_tag": str(args.analysis_tag or ""),
+            "fitness_schema_version": str(args.fitness_schema_version),
+            "policy": str(args.replicate_reference),
+            "replicate_index": int(ref_idx),
+            "summary": ref_summary,
+        },
+    )
+    print(f"[pcpl-evolvo] replicates_summary={campaign_path}")
+    print(f"[pcpl-evolvo] replicate_reference={reference_path}")
+    return {
+        "kind": "replicates",
+        "campaign_summary": campaign_summary,
+        "reference_summary": ref_summary,
+        "campaign_path": str(campaign_path),
+        "reference_path": str(reference_path),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -2304,6 +2765,25 @@ def parse_args() -> argparse.Namespace:
         help="Optional label stored in run metadata for later conclusion aggregation.",
     )
     parser.add_argument(
+        "--experiment-suite",
+        choices=EXPERIMENT_SUITE_CHOICES,
+        default="single",
+        help=(
+            "Runner orchestration style: `single` keeps current behavior; "
+            "`precision` launches targeted tracks that reduce blind shortcuts and "
+            "separate baseline, supervision, lane-pressure, and evaluability lanes."
+        ),
+    )
+    parser.add_argument(
+        "--precision-tracks",
+        type=str,
+        default=",".join(PRECISION_TRACK_CHOICES),
+        help=(
+            "Comma-separated track subset used when --experiment-suite precision. "
+            f"Supported: {', '.join(PRECISION_TRACK_CHOICES)}."
+        ),
+    )
+    parser.add_argument(
         "--fitness-schema-version",
         type=str,
         default=DEFAULT_FITNESS_SCHEMA_VERSION,
@@ -2365,6 +2845,7 @@ def main() -> None:
         mode=str(args.mode),
         profile=str(args.profile),
     )
+    args.precision_tracks = _parse_precision_tracks_spec(args.precision_tracks)
     if int(args.replicate_seed_step) <= 0:
         raise ValueError("--replicate-seed-step must be > 0")
     if int(args.supervised_epochs) < 0:
@@ -2403,7 +2884,19 @@ def main() -> None:
     resolved["analysis_tag"] = str(args.analysis_tag or "")
     resolved["replicates"] = int(args.replicates)
     resolved["replicate_reference"] = str(args.replicate_reference)
-    if args.continuous and str(args.mode).lower() == "paper" and not rounds_explicit:
+    resolved["experiment_suite"] = str(args.experiment_suite)
+    resolved["precision_tracks"] = list(args.precision_tracks)
+    if (
+        args.continuous
+        and str(args.experiment_suite).lower() == "precision"
+        and not rounds_explicit
+    ):
+        args.rounds = 1
+        resolved["rounds"] = 1
+        print(
+            "[pcpl-evolvo] precision continuous default: using rounds=1 per iteration for targeted cadence (set --rounds to override)."
+        )
+    elif args.continuous and str(args.mode).lower() == "paper" and not rounds_explicit:
         # In continuous paper sweeps, prioritize cadence across many combos/strategies.
         args.rounds = 1
         resolved["rounds"] = 1
@@ -2437,121 +2930,131 @@ def main() -> None:
             "continuous": False,
             "launcher": "run_experiments.py",
         }
-
-        if int(args.replicates) == 1:
-            config = _build_experiment_config(
-                args,
-                out_dir=out_dir,
-                seed=args.seed,
-                population_size=args.population_size,
-                generations=args.generations,
-                initial_instructions=args.initial_instructions,
-                rounds=args.rounds,
-                attacker_population_size=args.attacker_population_size,
-                attacker_generations=args.attacker_generations,
-                elite_pool=args.elite_pool,
-                archive_limit=args.archive_limit,
-                resume=bool(args.resume),
-                workers=args.workers,
+        if str(args.experiment_suite).lower() == "precision":
+            out_dir.mkdir(parents=True, exist_ok=True)
+            precision_profiles = [
+                profile
+                for profile in _precision_strategy_profiles(args)
+                if str(profile.get("strategy", "")) in set(args.precision_tracks)
+            ]
+            if not precision_profiles:
+                raise RuntimeError("Precision suite selected but no tracks were enabled")
+            print(
+                "[pcpl-evolvo] precision suite: tracks={tracks} root={root}".format(
+                    tracks=",".join(
+                        str(profile.get("strategy", "")) for profile in precision_profiles
+                    ),
+                    root=out_dir,
+                )
             )
-
-            summary = _run_once(config, meta=base_meta)
-            _print_summary(summary)
-            return
-
-        out_dir.mkdir(parents=True, exist_ok=True)
-        replicate_summaries: List[Dict[str, Any]] = []
-        base_seed = int(args.seed)
-        seed_step = int(args.replicate_seed_step)
-        print(
-            "[pcpl-evolvo] replicate campaign: n={n} base_seed={seed} step={step} root={root}".format(
-                n=int(args.replicates),
-                seed=base_seed,
-                step=seed_step,
-                root=out_dir,
-            )
-        )
-        for rep in range(int(args.replicates)):
-            rep_seed = base_seed + (rep * seed_step)
-            rep_out_dir = (out_dir / f"rep-{rep:03d}").resolve()
-            config = _build_experiment_config(
-                args,
-                out_dir=rep_out_dir,
-                seed=rep_seed,
-                population_size=args.population_size,
-                generations=args.generations,
-                initial_instructions=args.initial_instructions,
-                rounds=args.rounds,
-                attacker_population_size=args.attacker_population_size,
-                attacker_generations=args.attacker_generations,
-                elite_pool=args.elite_pool,
-                archive_limit=args.archive_limit,
-                resume=False,
-                workers=args.workers,
-            )
-            rep_meta = dict(base_meta)
-            rep_meta["replicate_index"] = rep
-            rep_meta["replicate_seed"] = rep_seed
-            rep_meta["replicate_count"] = int(args.replicates)
-            summary = _run_once(config, meta=rep_meta)
-            _print_summary(summary)
-            replicate_summaries.append(summary)
-
-        best_scores = [float(item["best_score"]) for item in replicate_summaries]
-        attacker_scores = [float(item["best_attacker_score"]) for item in replicate_summaries]
-        round_counts = [int(item.get("rounds_completed", 0)) for item in replicate_summaries]
-        ref_idx = _select_replicate_reference_index(
-            replicate_summaries,
-            policy=str(args.replicate_reference),
-        )
-        ref_summary = replicate_summaries[ref_idx]
-        campaign_summary: Dict[str, Any] = {
-            "timestamp": datetime.now().isoformat(),
-            "analysis_tag": str(args.analysis_tag or ""),
-            "fitness_schema_version": str(args.fitness_schema_version),
-            "mode": str(args.mode),
-            "profile": str(args.profile),
-            "replicate_count": int(args.replicates),
-            "base_seed": base_seed,
-            "seed_step": seed_step,
-            "reference_policy": str(args.replicate_reference),
-            "reference_replicate_index": int(ref_idx),
-            "reference_out_dir": str(ref_summary.get("out_dir", "")),
-            "reference_best_score": float(ref_summary.get("best_score", float("-inf"))),
-            "best_score_mean": sum(best_scores) / float(max(1, len(best_scores))),
-            "best_score_min": min(best_scores) if best_scores else None,
-            "best_score_max": max(best_scores) if best_scores else None,
-            "best_attacker_score_mean": sum(attacker_scores) / float(max(1, len(attacker_scores))),
-            "rounds_completed_mean": sum(round_counts) / float(max(1, len(round_counts))),
-            "runs": [
-                {
-                    "out_dir": item.get("out_dir"),
-                    "best_score": item.get("best_score"),
-                    "best_attacker_score": item.get("best_attacker_score"),
-                    "rounds_completed": item.get("rounds_completed"),
-                    "archive_path": item.get("archive_path"),
-                    "report_path": item.get("report_path"),
-                    "run_metadata_path": item.get("run_metadata_path"),
-                }
-                for item in replicate_summaries
-            ],
-        }
-        campaign_path = out_dir / "replicates-summary.json"
-        _write_json(campaign_path, campaign_summary)
-        reference_path = out_dir / "reference-run.json"
-        _write_json(
-            reference_path,
-            {
+            suite_results: List[Dict[str, Any]] = []
+            for profile in precision_profiles:
+                track_name = str(profile.get("strategy", "baseline"))
+                track_dir = (out_dir / track_name).resolve()
+                print(
+                    "[pcpl-evolvo] precision track={track} out_dir={out} desc={desc}".format(
+                        track=track_name,
+                        out=track_dir,
+                        desc=str(profile.get("description", "")).strip() or "n/a",
+                    )
+                )
+                track_meta = dict(base_meta)
+                track_meta["experiment_suite"] = "precision"
+                track_meta["suite_track"] = track_name
+                track_meta["suite_track_description"] = str(
+                    profile.get("description", "")
+                )
+                effective_tag = str(args.analysis_tag or "").strip()
+                track_meta["effective_analysis_tag"] = (
+                    f"{effective_tag}:{track_name}" if effective_tag else track_name
+                )
+                campaign_result = _run_noncontinuous_campaign(
+                    args,
+                    out_dir=track_dir,
+                    base_meta=track_meta,
+                    config_overrides=profile,
+                )
+                if campaign_result["kind"] == "single":
+                    summary = campaign_result["summary"]
+                    suite_results.append(
+                        {
+                            "track": track_name,
+                            "description": str(profile.get("description", "")),
+                            "kind": "single",
+                            "best_score": float(summary.get("best_score", float("-inf"))),
+                            "best_attacker_score": float(
+                                summary.get("best_attacker_score", float("-inf"))
+                            ),
+                            "rounds_completed": int(summary.get("rounds_completed", 0)),
+                            "out_dir": str(track_dir),
+                            "report_path": summary.get("report_path"),
+                            "archive_path": summary.get("archive_path"),
+                            "run_metadata_path": summary.get("run_metadata_path"),
+                            "overrides": {
+                                str(k): _normalize_json(v)
+                                for k, v in profile.items()
+                                if str(k) not in {"strategy", "description"}
+                            },
+                        }
+                    )
+                else:
+                    campaign_summary = campaign_result["campaign_summary"]
+                    reference_summary = campaign_result["reference_summary"]
+                    suite_results.append(
+                        {
+                            "track": track_name,
+                            "description": str(profile.get("description", "")),
+                            "kind": "replicates",
+                            "reference_best_score": float(
+                                campaign_summary.get(
+                                    "reference_best_score",
+                                    float("-inf"),
+                                )
+                            ),
+                            "best_score_mean": float(
+                                campaign_summary.get("best_score_mean", float("-inf"))
+                            ),
+                            "best_attacker_score_mean": float(
+                                campaign_summary.get(
+                                    "best_attacker_score_mean",
+                                    float("-inf"),
+                                )
+                            ),
+                            "rounds_completed_mean": float(
+                                campaign_summary.get(
+                                    "rounds_completed_mean",
+                                    0.0,
+                                )
+                            ),
+                            "out_dir": str(track_dir),
+                            "campaign_path": campaign_result.get("campaign_path"),
+                            "reference_path": campaign_result.get("reference_path"),
+                            "reference_out_dir": reference_summary.get("out_dir"),
+                            "overrides": {
+                                str(k): _normalize_json(v)
+                                for k, v in profile.items()
+                                if str(k) not in {"strategy", "description"}
+                            },
+                        }
+                    )
+            suite_summary = {
                 "timestamp": datetime.now().isoformat(),
                 "analysis_tag": str(args.analysis_tag or ""),
                 "fitness_schema_version": str(args.fitness_schema_version),
-                "policy": str(args.replicate_reference),
-                "replicate_index": int(ref_idx),
-                "summary": ref_summary,
-            },
+                "mode": str(args.mode),
+                "profile": str(args.profile),
+                "experiment_suite": "precision",
+                "tracks": suite_results,
+            }
+            suite_path = out_dir / "precision-suite-summary.json"
+            _write_json(suite_path, suite_summary)
+            print(f"[pcpl-evolvo] precision_suite_summary={suite_path}")
+            return
+        _run_noncontinuous_campaign(
+            args,
+            out_dir=out_dir,
+            base_meta=base_meta,
         )
-        print(f"[pcpl-evolvo] replicates_summary={campaign_path}")
-        print(f"[pcpl-evolvo] replicate_reference={reference_path}")
         return
 
     if args.no_resume:
@@ -2638,42 +3141,16 @@ def main() -> None:
 
                         iteration_index = total_iterations + len(pending)
                         run_seed = args.seed + (iteration_index * 7_919) + next_slot
-                        config = _build_experiment_config(
+                        config = _build_experiment_config_from_args(
                             args,
                             out_dir=combo_dir,
                             seed=run_seed,
-                            population_size=combo["population_size"],
-                            generations=combo["generations"],
-                            initial_instructions=combo["initial_instructions"],
-                            rounds=max(1, args.rounds),
-                            attacker_population_size=combo["attacker_population_size"],
-                            attacker_generations=combo["attacker_generations"],
-                            elite_pool=combo["elite_pool"],
-                            archive_limit=combo["archive_limit"],
                             resume=True,
                             workers=workers_per_lane,
-                            parent_pool_ratio=combo.get("parent_pool_ratio"),
-                            stagnation_patience=combo.get("stagnation_patience"),
-                            mutation_floor=combo.get("mutation_floor"),
-                            mutation_ceiling=combo.get("mutation_ceiling"),
-                            mutation_step=combo.get("mutation_step"),
-                            quick_cycle_fraction=combo.get("quick_cycle_fraction"),
-                            mid_cycle_fraction=combo.get("mid_cycle_fraction"),
-                            quick_keep_ratio=combo.get("quick_keep_ratio"),
-                            mid_keep_ratio=combo.get("mid_keep_ratio"),
-                            key_variants=combo.get("key_variants"),
-                            novelty_bonus=combo.get("novelty_bonus"),
-                            predictive_penalty=combo.get("predictive_penalty"),
-                            sync_loss_gate_percentile=combo.get("sync_loss_gate_percentile"),
-                            sync_loss_gate_penalty=combo.get("sync_loss_gate_penalty"),
-                            sync_loss_gate_flat_boost=combo.get("sync_loss_gate_flat_boost"),
-                            anti_neutrality_window=combo.get("anti_neutrality_window"),
-                            anti_neutrality_penalty=combo.get("anti_neutrality_penalty"),
-                            anti_neutrality_bonus=combo.get("anti_neutrality_bonus"),
-                            attacker_panel_size=combo.get("attacker_panel_size"),
-                            attacker_panel_penalty=combo.get("attacker_panel_penalty"),
-                            target_generation_seconds=combo.get("target_generation_seconds"),
-                            max_eval_cache_entries=combo.get("max_eval_cache_entries"),
+                            overrides={
+                                **combo,
+                                "rounds": max(1, int(args.rounds)),
+                            },
                         )
 
                         print(
@@ -2698,6 +3175,7 @@ def main() -> None:
                             "replicate_reference_policy": "single",
                             "strategy": str(combo.get("strategy", "base")),
                             "combo_label": combo_name,
+                            "combo_description": str(combo.get("description", "")),
                             "continuous": True,
                             "launcher": "run_experiments.py",
                         }
