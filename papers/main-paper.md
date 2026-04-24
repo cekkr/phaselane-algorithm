@@ -970,22 +970,26 @@ Additional multi-configuration outputs (other compound modes and seeds) are inte
 ### 8.5 Evolutionary interpretation (qualitative)
 In this work, evolutionary campaigns are interpreted as automated design-space exploration: they search for high-performing circuit/algorithm candidates, then support qualitative conclusions from score differences. They do not redefine protocol semantics and do not replace correctness arguments.
 
-Across long co-evolution campaigns, invariant metrics tend to saturate early (principle/permutation consistency and basic security constraints), while residual pressure concentrates on synchronization robustness and horizon-level drift control. In practical terms, later generations often show many genotype changes with small score movement unless the objective explicitly exposes synchronization gradients.
+The current long run (`20260423-080945-full`, rounds `0000..0024` currently available) reveals a concrete defender family rather than a vague score trend. The highest-scoring valid defenders keep the same ten-output PCPL scaffold (`active`, `kernel`, `state_mix`, `exp_mix`, `hash_rounds`, `bouquet_spread`, `state_churn`, `lane_salt`, `token_scramble`, `phase_jitter`), while the evolved variation is concentrated in a very short prelude of list/constant instructions. In other words, search is repeatedly selecting the same arithmetic PCPL spine and only retuning the scalar biases that feed it.
 
-This motivates a phase-control-oriented interpretation of search quality: weak progress is usually a gradient-design issue, not a raw compute issue. When projected sync-loss remains high, simple cost improvements can dominate selection even if long-horizon behavior is still suboptimal.
+The strongest practical motif is sparse bouquet activation. The best defenders in the current run reach `cost_score = 0.89` with `device_compound_ratio = provider_compound_ratio = 0.20`; with `compound_count = 5`, this means they are effectively using about one active compound per bouquet on average. The next stable family sits at a `0.40` ratio, or about two active compounds. This is a design conclusion, not merely a cost statistic: the practical PCPL circuit appears to prefer a large hidden bouquet inventory with a small active subset per cycle.
 
-The QFT/linear-rank/compare-$x$ terms remain important for protocol alignment and scientific reporting. However, under fixed scenario families they may become near-constant and therefore behave mainly as compliance checks. Their strongest optimization value appears when paired with scenario diversity that reintroduces discrimination.
+The attacker side converges to an even simpler family: a linear public-phase predictor. Token-success stays at zero in the valid rounds, while the small non-zero attacker scores come from slight lane-prediction gains above baseline. So the current empirical attack surface is better described as route/lane inference from public structure than as token inversion.
+
+The same run clarifies the unresolved weakness. Principle/permutation correctness and basic security saturate early, but `horizon_sync_score` remains near zero even in the best valid rounds. This means PCPL token correctness is easy to preserve, while long-horizon drift control is not. The right architectural reading is that the hot token core and the supervisory resynchronization logic should be treated as related but distinct layers.
+
+Finally, the run shows the present limit of the search process itself: all 25 currently available rounds keep the generation-0 defender as the round winner, and 9 rounds fail final metric production after `timeout-collapse-before-expand`. So the evolutionary campaign is presently better at identifying robust circuit families and obvious failure families than at inventing steadily stronger controllers within each round.
 
 ### 8.6 Practical circuit/algorithm changes derived from the search
-The evolutionary evidence supports five concrete changes in how candidate circuits are scored and selected:
+The current evidence suggests five concrete changes, some at circuit architecture level and some at search level:
 
-1. Add an explicit **phase-error control term** (bounded error level, recovery quality, oscillation penalty) instead of relying only on coarse sync aggregates.
-2. Apply a **long-horizon sync gate** at full evaluation stage: candidates with high projected sync-loss are penalized by a dynamic percentile threshold, tightened during flat-score windows.
-3. Use **attacker-panel-coupled defender ranking**: defender selection should optimize robust performance against multiple strong attackers, not only against a single current opponent.
-4. Introduce **anti-neutrality pressure** through repeated-phenotype fingerprints: repeated metric states receive a penalty, while measurable sync/horizon progress is rewarded.
-5. Add a **control-flow richness term** that rewards effective compare/branch structure near drift-management targets, so evolution can discover explicit recovery logic rather than only arithmetic mixing.
+1. Implement PCPL as a **two-layer circuit**: a small feed-forward token core for per-cycle work, plus a slower supervisory resync/controller layer for drift handling and mode switching.
+2. Treat **sparse bouquet activation** as a first-class mechanism. The best defenders repeatedly win by evaluating about 1-2 active compounds out of 5 rather than the whole bouquet.
+3. Keep **branch logic near mode boundaries** rather than inside the hot token path. The successful circuits mostly bias and select; they do not rely on rich per-cycle branching.
+4. Focus adversarial evaluation on **lane/route inference** as well as token guessing. In the current run, attacker gains come from schedule correlation, not from token recovery.
+5. Hard-gate archive promotion and final ranking on **full-scenario evaluability**. Candidates that survive progressive selection but fail final metric generation are not usable PCPL circuits and should not shape the archive.
 
-These changes do not alter PCPL protocol semantics. They only improve the search lens used to discover stronger algorithmic/circuit instantiations.
+These changes do not alter PCPL semantics. They refine how the protocol should be implemented in practice and how evolutionary search should be constrained so it discovers circuits that are both semantically meaningful and operationally evaluable.
 
 ## 9. Discussion and limitations
 - Parameter choice matters; $P, Q, R, M$ must be prime and pairwise coprime.
@@ -993,16 +997,19 @@ These changes do not alter PCPL protocol semantics. They only improve the search
 - The security of the scheme relies on the strength of $H(\cdot)$ and the secrecy of bouquets, not on the hardness of factoring revealed integers.
 - The public period $\mathrm{lcm}(P,Q,R,x)$ is visible (and QFT-recoverable), so period size should be chosen large enough for the deployment horizon.
 - For testing, primes and compound bases can be generated from a seeded stream to avoid arbitrary constants. [6][7]
+- Current co-evolution evidence suggests that the most practical defender family is a sparse selector over a fixed arithmetic PCPL core, not a dense universal controller.
 - Long-horizon synchronization remains the dominant practical weakness in current evolutionary studies: resynchronization can recover state, but projected drift-loss can still dominate the residual error budget.
+- Current attacker evidence is stronger on lane inference than on token inversion: attackers exploit public schedule correlation, while token-success stays at zero in the valid rounds studied here.
 - Practical optimization should prioritize phase-error regulation, horizon-sync gating, and attacker-coupled defender robustness before further cost compression.
 - Empirical score values are not absolute physical constants; they depend on the chosen objective set and weights. For this reason, cross-run comparisons should include explicit objective-version metadata.
 - Some auxiliary terms (for example QFT/linear-rank/compare-$x$) can become near-constant under fixed scenario families; when this happens, they validate constraints but provide limited evolutionary gradient.
 - Plateau control matters: prolonged repeated phenotypes should be treated as a search-pathology signal and countered with anti-neutrality mechanisms.
+- Some co-evolution rounds can survive progressive selection yet fail final metric production under the real evaluation budget; archive acceptance therefore needs hard evaluability gates.
 - Evolutionary search is heuristic optimization, not a formal proof technique; correctness remains grounded in the protocol construction and invariants.
 - This paper was developed and formatted with the help of OpenAI models.
 
 ## 10. Conclusion
-PCPL provides a deterministic, no-handshake token protocol with exact 1-of-$x$ matching and a device-only chaining mechanism. Combined with symmetric continuous tokenizer devices, it supports both provider validation and peer-to-peer isolation with dynamic, evolving secrets. The simulation results support the core invariants and indicate a concrete optimization program: improve long-horizon synchronization via phase-error-aware control, attacker-coupled selection, and anti-neutrality search pressure, while preserving the already stable correctness and security envelope.
+PCPL provides a deterministic, no-handshake token protocol with exact 1-of-$x$ matching and a device-only chaining mechanism. Combined with symmetric continuous tokenizer devices, it supports both provider validation and peer-to-peer isolation with dynamic, evolving secrets. The current simulation and co-evolution evidence supports a more precise implementation reading: the most practical PCPL circuits are sparse, feed-forward arithmetic token cores with small bias terms, while the main remaining challenge is not token correctness but long-horizon synchronization supervision and resistance to lane-prediction leakage. The protocol therefore looks strongest when implemented as a compact hot-path tokenizer coupled to an explicit supervisory resync/control layer, while evolutionary search is used to identify robust circuit families and failure families rather than to stand in for the protocol's correctness argument.
 
 ## References
 1. [NIST FIPS 180-4 (Update 1), *Secure Hash Standard (SHS)*](https://csrc.nist.gov/pubs/fips/180-4/upd1/final)
