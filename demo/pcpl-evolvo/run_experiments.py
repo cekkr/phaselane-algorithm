@@ -8,6 +8,7 @@ import concurrent.futures
 import dataclasses
 import itertools
 import json
+import math
 import multiprocessing
 import os
 import random
@@ -38,7 +39,11 @@ try:
 except Exception:
     pass
 
-from pcpl_evolvo.experiment import ExperimentConfig, run_experiment
+from pcpl_evolvo.experiment import (
+    ExperimentConfig,
+    materialize_existing_run_views,
+    run_experiment,
+)
 
 DEFAULT_FITNESS_SCHEMA_VERSION = "auto"
 EXPERIMENT_SUITE_CHOICES = ("single", "precision")
@@ -2217,6 +2222,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--summarize-run",
+        type=str,
+        default="",
+        help=(
+            "Regenerate leaderboards, best snapshots, conclusions, and evidence-summary.json "
+            "for an existing run directory, then exit without running evolution."
+        ),
+    )
+    parser.add_argument(
         "--profile",
         choices=("fast", "full"),
         default=DEFAULT_PROFILE,
@@ -2836,6 +2850,34 @@ def main() -> None:
         success = _run_kompute_self_test()
         if not success:
             raise SystemExit(2)
+        return
+    if str(args.summarize_run or "").strip():
+        summary = materialize_existing_run_views(Path(args.summarize_run))
+        print("[pcpl-evolvo] summarized existing run")
+        print(f"[pcpl-evolvo] out_dir={summary['out_dir']}")
+        print(
+            "[pcpl-evolvo] rounds completed={completed} valid={valid} skipped={skipped}".format(
+                completed=int(summary.get("rounds_completed", 0)),
+                valid=int(summary.get("valid_rounds", 0)),
+                skipped=int(summary.get("skipped_rounds", 0)),
+            )
+        )
+        if math.isfinite(float(summary.get("best_score", float("-inf")))):
+            print(f"[pcpl-evolvo] best_score={float(summary['best_score']):.6f}")
+        if math.isfinite(float(summary.get("best_attacker_score", float("-inf")))):
+            print(
+                f"[pcpl-evolvo] best_attacker_score={float(summary['best_attacker_score']):.6f}"
+            )
+        if summary.get("score_delta_vs_reference") is not None:
+            print(
+                "[pcpl-evolvo] delta_vs_reference={delta:+.6f}".format(
+                    delta=float(summary["score_delta_vs_reference"]),
+                )
+            )
+        print(f"[pcpl-evolvo] conclusions={summary['conclusion_path']}")
+        print(f"[pcpl-evolvo] evidence={summary['evidence_summary_path']}")
+        print(f"[pcpl-evolvo] index={summary['index_path']}")
+        print(f"[pcpl-evolvo] materialized_summary={summary['materialized_summary_path']}")
         return
 
     resolved = _resolve_runtime_config(args)

@@ -4825,6 +4825,481 @@ def _metric_mean_from_rows(metrics_rows: Sequence[Dict[str, Any]], key: str, def
     return float(sum(values) / float(max(1, len(values))))
 
 
+def _round_results_path_candidates(
+    *,
+    out_dir: Path,
+    round_summary: Dict[str, Any],
+) -> List[Path]:
+    candidates: List[Path] = []
+    raw_round_dir = round_summary.get("round_dir")
+    if raw_round_dir:
+        try:
+            candidates.append(Path(str(raw_round_dir)) / "round-results.json")
+        except Exception:
+            pass
+    try:
+        round_index = int(round_summary.get("round", -1))
+    except Exception:
+        round_index = -1
+    if round_index >= 0:
+        candidates.append(out_dir / "rounds" / f"round-{round_index:04d}" / "round-results.json")
+
+    unique: List[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _load_round_results_payload(
+    *,
+    out_dir: Path,
+    round_summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    for path in _round_results_path_candidates(out_dir=out_dir, round_summary=round_summary):
+        try:
+            if not path.exists():
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            continue
+    return {}
+
+
+def _metric_values_from_round_records(
+    records: Sequence[Dict[str, Any]],
+    key: str,
+) -> List[float]:
+    values: List[float] = []
+    for record in records:
+        metrics_rows = record.get("metrics", [])
+        if not isinstance(metrics_rows, list) or not metrics_rows:
+            continue
+        values.append(_metric_mean_from_rows(metrics_rows, key, default=0.0))
+    return values
+
+
+def _metric_summary_from_round_records(
+    records: Sequence[Dict[str, Any]],
+    key: str,
+) -> Dict[str, Optional[float]]:
+    values = _metric_values_from_round_records(records, key)
+    if not values:
+        return {"mean": None, "min": None, "max": None}
+    return {
+        "mean": float(sum(values) / float(max(1, len(values)))),
+        "min": float(min(values)),
+        "max": float(max(values)),
+    }
+
+
+def _count_text_values(values: Sequence[str]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for raw_value in values:
+        value = str(raw_value or "").strip() or "<empty>"
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (-int(item[1]), str(item[0]))))
+
+
+def _generation_zero_survived(defender_log: Sequence[Dict[str, Any]], stop_reason: str) -> bool:
+    if len(defender_log) >= 2:
+        try:
+            first = float(defender_log[0].get("best_score", -float("inf")))
+            last = float(defender_log[-1].get("best_score", -float("inf")))
+            return math.isfinite(first) and math.isfinite(last) and abs(first - last) <= 1e-12
+        except Exception:
+            return False
+    return str(stop_reason or "").strip() == "identical-generations"
+
+
+def _archive_round_evidence_records(
+    *,
+    out_dir: Path,
+    archive: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    rounds_payload = archive.get("rounds", [])
+    if not isinstance(rounds_payload, list):
+        return records
+
+    for compact_raw in rounds_payload:
+        if not isinstance(compact_raw, dict):
+            continue
+        compact = dict(compact_raw)
+        full = _load_round_results_payload(out_dir=out_dir, round_summary=compact)
+        round_payload = full if full else compact
+        try:
+            round_index = int(round_payload.get("round", compact.get("round", -1)))
+        except Exception:
+            round_index = -1
+
+        selection_panel = round_payload.get("selection_panel", compact.get("selection_panel", {}))
+        if not isinstance(selection_panel, dict):
+            selection_panel = {}
+        reference_anchor = round_payload.get("reference_anchor", compact.get("reference_anchor", {}))
+        if not isinstance(reference_anchor, dict):
+            reference_anchor = {}
+        metrics_rows = round_payload.get("metrics", [])
+        if not isinstance(metrics_rows, list):
+            metrics_rows = []
+        metrics_rows = [row for row in metrics_rows if isinstance(row, dict)]
+        defender_log = round_payload.get("defender_log", [])
+        if not isinstance(defender_log, list):
+            defender_log = []
+        defender_log_rows = [row for row in defender_log if isinstance(row, dict)]
+
+        archive_skip_reason = str(
+            round_payload.get(
+                "archive_skip_reason",
+                compact.get("archive_skip_reason", ""),
+            )
+            or ""
+        )
+        defender_stop_reason = str(
+            round_payload.get(
+                "defender_stop_reason",
+                compact.get("defender_stop_reason", ""),
+            )
+            or ""
+        )
+        metrics_present = bool(
+            metrics_rows
+            or selection_panel.get("metrics_present", False)
+            or round_payload.get("archive_eligible", compact.get("archive_eligible", False))
+        )
+        records.append(
+            {
+                "round": round_index,
+                "timestamp": str(round_payload.get("timestamp", compact.get("timestamp", ""))),
+                "defender_score": float(
+                    round_payload.get(
+                        "defender_score",
+                        compact.get("defender_score", 0.0),
+                    )
+                    or 0.0
+                ),
+                "defender_signature": str(
+                    round_payload.get(
+                        "defender_signature",
+                        compact.get("defender_signature", ""),
+                    )
+                    or ""
+                ),
+                "attacker_score": float(
+                    round_payload.get(
+                        "attacker_score",
+                        compact.get("attacker_score", 0.0),
+                    )
+                    or 0.0
+                ),
+                "attacker_signature": str(
+                    round_payload.get(
+                        "attacker_signature",
+                        compact.get("attacker_signature", ""),
+                    )
+                    or ""
+                ),
+                "metrics": metrics_rows,
+                "metrics_present": bool(metrics_present and metrics_rows),
+                "archive_eligible": bool(
+                    round_payload.get(
+                        "archive_eligible",
+                        compact.get("archive_eligible", False),
+                    )
+                ),
+                "archive_skip_reason": archive_skip_reason,
+                "progressive_stop_reason": str(
+                    selection_panel.get("progressive_stop_reason", "") or ""
+                ),
+                "timeout_recheck": bool(selection_panel.get("timeout_recheck", False)),
+                "timeout_rescue_used": bool(selection_panel.get("timeout_rescue_used", False)),
+                "defender_stop_reason": defender_stop_reason,
+                "generation_zero_survived": _generation_zero_survived(
+                    defender_log_rows,
+                    defender_stop_reason,
+                ),
+                "selection_panel": selection_panel,
+                "reference_score": (
+                    float(reference_anchor.get("score"))
+                    if reference_anchor.get("score") is not None
+                    else None
+                ),
+                "reference_signature": str(reference_anchor.get("signature", "") or ""),
+                "score_delta_vs_reference": (
+                    float(reference_anchor.get("score_delta"))
+                    if reference_anchor.get("score_delta") is not None
+                    else None
+                ),
+            }
+        )
+
+    records.sort(key=lambda item: int(item.get("round", -1)))
+    return records
+
+
+def _trailing_unevaluable_count(records: Sequence[Dict[str, Any]]) -> int:
+    count = 0
+    for record in reversed(list(records)):
+        if bool(record.get("metrics_present", False)):
+            break
+        count += 1
+    return count
+
+
+def _compound_ratio_buckets(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        metrics_rows = record.get("metrics", [])
+        if not isinstance(metrics_rows, list) or not metrics_rows:
+            continue
+        ratio = _metric_mean_from_rows(metrics_rows, "device_compound_ratio", default=0.0)
+        key = f"{ratio:.4f}"
+        bucket = buckets.setdefault(
+            key,
+            {
+                "ratio": float(ratio),
+                "rounds": [],
+                "count": 0,
+                "_score_total": 0.0,
+            },
+        )
+        bucket["rounds"].append(int(record.get("round", -1)))
+        bucket["count"] = int(bucket["count"]) + 1
+        bucket["_score_total"] = float(bucket["_score_total"]) + float(record.get("defender_score", 0.0))
+
+    output: List[Dict[str, Any]] = []
+    for bucket in buckets.values():
+        count = max(1, int(bucket.get("count", 0)))
+        output.append(
+            {
+                "ratio": float(bucket.get("ratio", 0.0)),
+                "count": int(bucket.get("count", 0)),
+                "rounds": list(bucket.get("rounds", [])),
+                "mean_defender_score": float(bucket.get("_score_total", 0.0)) / float(count),
+            }
+        )
+    output.sort(key=lambda item: (float(item["ratio"]), -float(item["mean_defender_score"])))
+    return output
+
+
+def _archive_evidence_summary(
+    *,
+    out_dir: Path,
+    archive: Dict[str, Any],
+) -> Dict[str, Any]:
+    records = _archive_round_evidence_records(out_dir=out_dir, archive=archive)
+    valid_records = [record for record in records if bool(record.get("metrics_present", False))]
+    skipped_records = [record for record in records if not bool(record.get("metrics_present", False))]
+    metric_keys = (
+        "total_score",
+        "principle_score",
+        "sync_score",
+        "security_score",
+        "cost_score",
+        "runtime_score",
+        "stability_score",
+        "operation_cost_score",
+        "projected_sync_loss_rate",
+        "horizon_sync_score",
+        "qft_score",
+        "linear_rank_score",
+        "compare_x_score",
+        "phase_error_control_score",
+        "control_flow_score",
+        "attacker_advantage_score",
+        "attacker_lane_success_rate",
+        "attacker_token_success_rate",
+        "device_compound_ratio",
+        "provider_compound_ratio",
+    )
+    metrics = {
+        key: _metric_summary_from_round_records(valid_records, key)
+        for key in metric_keys
+    }
+    best_valid_defender = (
+        max(valid_records, key=lambda item: float(item.get("defender_score", -float("inf"))))
+        if valid_records
+        else None
+    )
+    attacker_pool = valid_records if valid_records else records
+    best_attacker = (
+        max(attacker_pool, key=lambda item: float(item.get("attacker_score", -float("inf"))))
+        if attacker_pool
+        else None
+    )
+    skipped_reasons = _count_text_values(
+        [str(record.get("archive_skip_reason", "")) for record in skipped_records]
+    )
+    progressive_stop_reasons = _count_text_values(
+        [
+            str(record.get("progressive_stop_reason", ""))
+            for record in records
+            if str(record.get("progressive_stop_reason", "")).strip()
+        ]
+    )
+    first_timestamp = str(records[0].get("timestamp", "")) if records else ""
+    last_timestamp = str(records[-1].get("timestamp", "")) if records else ""
+
+    return {
+        "rounds_completed": int(len(records)),
+        "valid_rounds": int(len(valid_records)),
+        "skipped_rounds": int(len(skipped_records)),
+        "valid_round_ids": [int(record.get("round", -1)) for record in valid_records],
+        "skipped_round_ids": [int(record.get("round", -1)) for record in skipped_records],
+        "valid_rate": (
+            float(len(valid_records)) / float(max(1, len(records)))
+            if records
+            else 0.0
+        ),
+        "first_timestamp": first_timestamp,
+        "last_timestamp": last_timestamp,
+        "archive_updated_at": archive.get("updated_at"),
+        "skip_reasons": skipped_reasons,
+        "progressive_stop_reasons": progressive_stop_reasons,
+        "timeout_recheck_count": int(
+            sum(1 for record in records if bool(record.get("timeout_recheck", False)))
+        ),
+        "timeout_rescue_used_count": int(
+            sum(1 for record in records if bool(record.get("timeout_rescue_used", False)))
+        ),
+        "generation_zero_survived_count": int(
+            sum(1 for record in records if bool(record.get("generation_zero_survived", False)))
+        ),
+        "trailing_unevaluable_rounds": int(_trailing_unevaluable_count(records)),
+        "metrics": metrics,
+        "compound_ratio_buckets": _compound_ratio_buckets(valid_records),
+        "best_valid_defender": dict(best_valid_defender) if best_valid_defender else None,
+        "best_attacker": dict(best_attacker) if best_attacker else None,
+    }
+
+
+def _format_optional_float(value: Any, precision: int = 6) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        number = float(value)
+    except Exception:
+        return "n/a"
+    if not math.isfinite(number):
+        return "n/a"
+    return f"{number:.{precision}f}"
+
+
+def _append_evidence_summary_markdown(
+    lines: List[str],
+    evidence: Dict[str, Any],
+) -> None:
+    rounds_completed = int(evidence.get("rounds_completed", 0))
+    if rounds_completed <= 0:
+        return
+    valid_rounds = int(evidence.get("valid_rounds", 0))
+    skipped_rounds = int(evidence.get("skipped_rounds", 0))
+    lines.append("## Run Evidence Summary")
+    lines.append(
+        "- rounds: completed=`{completed}`, valid=`{valid}`, skipped=`{skipped}`, valid_rate=`{rate:.3f}`".format(
+            completed=rounds_completed,
+            valid=valid_rounds,
+            skipped=skipped_rounds,
+            rate=float(evidence.get("valid_rate", 0.0)),
+        )
+    )
+    lines.append(
+        "- evaluability: timeout_recheck=`{recheck}`, timeout_rescue_used=`{rescue}`, generation0_survived=`{plateau}/{total}`, trailing_unevaluable=`{trailing}`".format(
+            recheck=int(evidence.get("timeout_recheck_count", 0)),
+            rescue=int(evidence.get("timeout_rescue_used_count", 0)),
+            plateau=int(evidence.get("generation_zero_survived_count", 0)),
+            total=rounds_completed,
+            trailing=int(evidence.get("trailing_unevaluable_rounds", 0)),
+        )
+    )
+    skip_reasons = evidence.get("skip_reasons", {})
+    if isinstance(skip_reasons, dict) and skip_reasons:
+        lines.append(
+            "- skip reasons: "
+            + ", ".join(f"`{key}`={value}" for key, value in skip_reasons.items())
+        )
+    progressive_reasons = evidence.get("progressive_stop_reasons", {})
+    if isinstance(progressive_reasons, dict) and progressive_reasons:
+        lines.append(
+            "- progressive stop reasons: "
+            + ", ".join(f"`{key}`={value}" for key, value in progressive_reasons.items())
+        )
+
+    best_valid = evidence.get("best_valid_defender")
+    if isinstance(best_valid, dict):
+        delta = best_valid.get("score_delta_vs_reference")
+        delta_text = (
+            f", delta_vs_reference=`{_format_optional_float(delta, 6)}`"
+            if delta is not None
+            else ""
+        )
+        lines.append(
+            "- best valid defender: round=`{round}`, score=`{score}`{delta}".format(
+                round=int(best_valid.get("round", -1)),
+                score=_format_optional_float(best_valid.get("defender_score"), 8),
+                delta=delta_text,
+            )
+        )
+    best_attacker = evidence.get("best_attacker")
+    if isinstance(best_attacker, dict):
+        lines.append(
+            "- best attacker: round=`{round}`, score=`{score}`".format(
+                round=int(best_attacker.get("round", -1)),
+                score=_format_optional_float(best_attacker.get("attacker_score"), 8),
+            )
+        )
+
+    metrics = evidence.get("metrics", {})
+    if isinstance(metrics, dict) and valid_rounds > 0:
+        def _mean_text(key: str, precision: int = 4) -> str:
+            payload = metrics.get(key, {})
+            if not isinstance(payload, dict):
+                return "n/a"
+            return _format_optional_float(payload.get("mean"), precision)
+
+        lines.append(
+            "- valid-round means: principle=`{principle}`, security=`{security}`, sync=`{sync}`, horizon=`{horizon}`, projected_sync_loss=`{loss}`, lane_success=`{lane}`, token_success=`{token}`".format(
+                principle=_mean_text("principle_score", 4),
+                security=_mean_text("security_score", 4),
+                sync=_mean_text("sync_score", 4),
+                horizon=_mean_text("horizon_sync_score", 6),
+                loss=_mean_text("projected_sync_loss_rate", 4),
+                lane=_mean_text("attacker_lane_success_rate", 4),
+                token=_mean_text("attacker_token_success_rate", 4),
+            )
+        )
+
+    buckets = evidence.get("compound_ratio_buckets", [])
+    if isinstance(buckets, list) and buckets:
+        lines.append("")
+        lines.append("### Sparse Activation Buckets")
+        lines.append("")
+        lines.append("| device compound ratio | rounds | mean defender score |")
+        lines.append("| ---: | --- | ---: |")
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+            round_ids = bucket.get("rounds", [])
+            if isinstance(round_ids, list):
+                rounds_text = ", ".join(f"`{int(item):04d}`" for item in round_ids)
+            else:
+                rounds_text = ""
+            lines.append(
+                "| {ratio:.4f} | {rounds} | {score:.6f} |".format(
+                    ratio=float(bucket.get("ratio", 0.0)),
+                    rounds=rounds_text,
+                    score=float(bucket.get("mean_defender_score", 0.0)),
+                )
+            )
+    lines.append("")
+
+
 def _baseline_row_by_name(
     baseline_rows: Sequence[Dict[str, Any]],
     *,
@@ -5057,6 +5532,13 @@ def _write_view_outputs(
         f"- executor backend: `{_normalize_executor_backend(config.executor_backend)}`"
     )
     conclusion_lines.append("")
+    evidence_summary = _archive_evidence_summary(out_dir=out_dir, archive=archive)
+    evidence_path = summaries_dir / "evidence-summary.json"
+    evidence_path.write_text(
+        json.dumps(evidence_summary, indent=2),
+        encoding="utf-8",
+    )
+    _append_evidence_summary_markdown(conclusion_lines, evidence_summary)
     reference_baseline = _baseline_row_by_name(baseline_rows, name="reference-full")
     reference_metrics_rows: Sequence[Dict[str, Any]] = []
     if reference_baseline is not None:
@@ -5166,6 +5648,7 @@ def _write_view_outputs(
     return {
         "index_path": str(index_path),
         "conclusion_path": str(conclusion_path),
+        "evidence_summary_path": str(evidence_path),
         "defender_leaderboard_path": str(leaderboards_dir / "defender-top10.md"),
         "attacker_leaderboard_path": str(leaderboards_dir / "attacker-top10.md"),
         **best_paths,
@@ -8065,6 +8548,17 @@ def run_continuous_experiment(
             except Exception:
                 pass
             try:
+                partial_view_paths = _write_view_outputs(
+                    out_dir=out_dir,
+                    config=config,
+                    resource_plan=round_resource_plan,
+                    archive=archive,
+                    baseline_rows=baseline_rows,
+                )
+                partial_summary["views"] = partial_view_paths
+            except Exception:
+                pass
+            try:
                 (out_dir / "results.json").write_text(
                     json.dumps(partial_summary, indent=2),
                     encoding="utf-8",
@@ -8290,6 +8784,54 @@ def run_continuous_experiment(
         attacker_supervised = predictive_profile.get("attacker_supervised", {})
         if not isinstance(attacker_supervised, dict):
             attacker_supervised = {}
+        best_defender_entries = archive.get("defender_elites", [])[:1]
+        best_attacker_entries = archive.get("attacker_elites", [])[:1]
+        best_defender_entry = best_defender_entries[0] if best_defender_entries else {}
+        best_attacker_entry = best_attacker_entries[0] if best_attacker_entries else {}
+        run_evidence_summary = _archive_evidence_summary(out_dir=out_dir, archive=archive)
+        best_valid_payload = run_evidence_summary.get("best_valid_defender", {})
+        if not isinstance(best_valid_payload, dict):
+            best_valid_payload = {}
+        best_defender_score = float(
+            best_defender_entry.get(
+                "score",
+                best_valid_payload.get("defender_score", last_defender_score),
+            )
+        )
+        best_defender_signature = str(
+            best_defender_entry.get(
+                "signature",
+                best_valid_payload.get("defender_signature", last_defender_signature),
+            )
+            or ""
+        )
+        best_attacker_score = float(
+            best_attacker_entry.get("score", last_attacker_score)
+        )
+        best_attacker_signature = str(
+            best_attacker_entry.get("signature", last_attacker_signature) or ""
+        )
+        best_reference_score = (
+            float(best_valid_payload.get("reference_score"))
+            if best_valid_payload.get("reference_score") is not None
+            else (
+                float(last_reference_score)
+                if math.isfinite(float(last_reference_score))
+                else None
+            )
+        )
+        best_reference_signature = str(
+            best_valid_payload.get("reference_signature", last_reference_signature) or ""
+        )
+        best_delta_vs_reference = (
+            float(best_valid_payload.get("score_delta_vs_reference"))
+            if best_valid_payload.get("score_delta_vs_reference") is not None
+            else (
+                float(best_defender_score - float(best_reference_score))
+                if best_reference_score is not None
+                else None
+            )
+        )
 
         final_summary = {
             "config": {
@@ -8304,9 +8846,10 @@ def run_continuous_experiment(
             },
             "baselines": baseline_rows,
             "rounds_completed": len(archive.get("rounds", [])),
-            "best_defender": archive.get("defender_elites", [])[:1],
+            "best_defender": best_defender_entries,
             "best_defender_anti_attacker": archive.get("defender_anti_attacker_elites", [])[:1],
-            "best_attacker": archive.get("attacker_elites", [])[:1],
+            "best_attacker": best_attacker_entries,
+            "evidence_summary": run_evidence_summary,
             "predictive_profile": predictive_profile,
             "last_round": {
                 "score": last_defender_score,
@@ -8351,8 +8894,9 @@ def run_continuous_experiment(
         report_lines.append("")
         report_lines.append(f"- profile: `{config.profile}`")
         report_lines.append(f"- rounds completed: `{len(archive.get('rounds', []))}`")
-        report_lines.append(f"- best defender score: `{last_defender_score:.6f}`")
-        report_lines.append(f"- best attacker score: `{last_attacker_score:.6f}`")
+        report_lines.append(f"- best defender score: `{best_defender_score:.6f}`")
+        report_lines.append(f"- best attacker score: `{best_attacker_score:.6f}`")
+        report_lines.append(f"- latest defender score: `{last_defender_score:.6f}`")
         report_lines.append(
             "- anti-attacker defender elites: `{count}`".format(
                 count=len(archive.get("defender_anti_attacker_elites", [])),
@@ -8552,7 +9096,6 @@ def run_continuous_experiment(
                 )
             )
 
-        best_defender_entry = archive.get("defender_elites", [])[:1]
         reference_row = _baseline_row_by_name(baseline_rows, name="reference-full")
         latest_round_summary = archive.get("rounds", [])[-1] if archive.get("rounds") else {}
         latest_reference_metrics_rows: Optional[Sequence[Dict[str, Any]]] = None
@@ -8562,11 +9105,11 @@ def run_continuous_experiment(
                 metrics_rows = anchor_payload.get("metrics", [])
                 if isinstance(metrics_rows, list) and metrics_rows:
                     latest_reference_metrics_rows = metrics_rows
-        if best_defender_entry:
+        if best_defender_entries:
             report_lines.append("")
             report_lines.append("## Paper Priorities")
             findings = _pcpl_improvement_findings(
-                metrics_rows=list(best_defender_entry[0].get("metrics", [])),
+                metrics_rows=list(best_defender_entries[0].get("metrics", [])),
                 reference_metrics_rows=(
                     latest_reference_metrics_rows
                     if latest_reference_metrics_rows is not None
@@ -8596,18 +9139,19 @@ def run_continuous_experiment(
             "results_json": str(results_json),
             "report_path": str(report_path),
             "archive_path": str(archive_path),
-            "best_score": last_defender_score,
-            "best_signature": last_defender_signature,
-            "best_attacker_score": last_attacker_score,
-            "best_attacker_signature": last_attacker_signature,
-            "reference_score": (
-                float(last_reference_score)
-                if math.isfinite(float(last_reference_score))
-                else None
-            ),
+            "best_score": best_defender_score,
+            "best_signature": best_defender_signature,
+            "best_attacker_score": best_attacker_score,
+            "best_attacker_signature": best_attacker_signature,
+            "reference_score": best_reference_score,
             "reference_signature": (
-                str(last_reference_signature) if str(last_reference_signature) else None
+                str(best_reference_signature) if str(best_reference_signature) else None
             ),
+            "score_delta_vs_reference": best_delta_vs_reference,
+            "last_score": last_defender_score,
+            "last_signature": last_defender_signature,
+            "last_attacker_score": last_attacker_score,
+            "last_attacker_signature": last_attacker_signature,
             "rounds_completed": len(archive.get("rounds", [])),
             "resource_plan": {
                 **resource_plan.to_dict(),
@@ -8631,6 +9175,150 @@ def run_continuous_experiment(
                 round_executor.shutdown(wait=True, cancel_futures=True)
             except Exception:
                 pass
+
+
+def _experiment_config_from_payload(
+    payload: Dict[str, Any],
+    *,
+    out_dir: Path,
+) -> ExperimentConfig:
+    defaults = ExperimentConfig(out_dir=out_dir)
+    kwargs: Dict[str, Any] = {}
+    fields_map = getattr(ExperimentConfig, "__dataclass_fields__", {})
+    for name in fields_map:
+        if name == "out_dir":
+            kwargs[name] = out_dir
+            continue
+        value = payload.get(name, getattr(defaults, name))
+        if name == "supervised_hidden_layers":
+            if isinstance(value, (list, tuple)):
+                value = tuple(int(item) for item in value)
+            else:
+                value = tuple()
+        kwargs[name] = value
+    return ExperimentConfig(**kwargs)
+
+
+def _resource_plan_from_payload(
+    payload: Dict[str, Any],
+    *,
+    config: ExperimentConfig,
+) -> ResourcePlan:
+    raw = payload.get("per_round_resource_plan", payload)
+    if not isinstance(raw, dict):
+        raw = {}
+    defaults = _resolve_resource_plan(
+        config,
+        max(int(config.population_size), int(config.attacker_population_size)),
+    )
+    kwargs: Dict[str, Any] = {}
+    fields_map = getattr(ResourcePlan, "__dataclass_fields__", {})
+    for name in fields_map:
+        kwargs[name] = raw.get(name, getattr(defaults, name))
+    return ResourcePlan(**kwargs)
+
+
+def _baseline_rows_for_existing_run(
+    *,
+    results_payload: Dict[str, Any],
+    config: ExperimentConfig,
+) -> List[Dict[str, Any]]:
+    baselines = results_payload.get("baselines", [])
+    if isinstance(baselines, list) and baselines:
+        return [row for row in baselines if isinstance(row, dict)]
+    raw_scenarios = default_scenarios(config.profile)
+    scenarios = [
+        replace(
+            scenario,
+            device_mhz=float(config.device_mhz),
+            provider_mhz=float(config.provider_mhz),
+            max_test_time_seconds=float(config.max_test_time_seconds),
+        )
+        for scenario in raw_scenarios
+    ]
+    return _baseline_rows(scenarios)
+
+
+def materialize_existing_run_views(out_dir: Path) -> Dict[str, Any]:
+    """Regenerate leaderboards, best snapshots, and evidence summaries for an existing run."""
+    run_dir = Path(out_dir).expanduser().resolve()
+    archive_path = run_dir / "archive.json"
+    results_path = run_dir / "results.json"
+    if not archive_path.exists():
+        raise FileNotFoundError(f"Missing archive.json in {run_dir}")
+
+    archive = _compact_archive_payload(_load_archive(archive_path))
+    results_payload: Dict[str, Any] = {}
+    if results_path.exists():
+        try:
+            loaded = json.loads(results_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                results_payload = loaded
+        except Exception:
+            results_payload = {}
+
+    raw_config = results_payload.get("config", {})
+    if not isinstance(raw_config, dict):
+        raw_config = {}
+    config = _experiment_config_from_payload(raw_config, out_dir=run_dir)
+
+    raw_resources = results_payload.get("resources", {})
+    if not isinstance(raw_resources, dict):
+        raw_resources = {}
+    resource_plan = _resource_plan_from_payload(raw_resources, config=config)
+    baseline_rows = _baseline_rows_for_existing_run(
+        results_payload=results_payload,
+        config=config,
+    )
+    view_paths = _write_view_outputs(
+        out_dir=run_dir,
+        config=config,
+        resource_plan=resource_plan,
+        archive=archive,
+        baseline_rows=baseline_rows,
+    )
+    evidence_summary = _archive_evidence_summary(out_dir=run_dir, archive=archive)
+    best_defender = archive.get("defender_elites", [])[:1]
+    best_attacker = archive.get("attacker_elites", [])[:1]
+    best_valid_payload = evidence_summary.get("best_valid_defender", {})
+    if not isinstance(best_valid_payload, dict):
+        best_valid_payload = {}
+    best_score_source = best_defender[0] if best_defender else best_valid_payload
+
+    summary = {
+        "out_dir": str(run_dir),
+        "archive_path": str(archive_path),
+        "results_json": str(results_path),
+        "rounds_completed": int(evidence_summary.get("rounds_completed", 0)),
+        "valid_rounds": int(evidence_summary.get("valid_rounds", 0)),
+        "skipped_rounds": int(evidence_summary.get("skipped_rounds", 0)),
+        "best_score": float(
+            best_score_source.get(
+                "score",
+                best_valid_payload.get("defender_score", -float("inf")),
+            )
+            if best_score_source
+            else -float("inf")
+        ),
+        "best_signature": str(
+            best_score_source.get(
+                "signature",
+                best_valid_payload.get("defender_signature", ""),
+            )
+            if best_score_source
+            else ""
+        ),
+        "best_attacker_score": float(best_attacker[0].get("score", -float("inf"))) if best_attacker else -float("inf"),
+        "best_attacker_signature": str(best_attacker[0].get("signature", "")) if best_attacker else "",
+        "reference_score": best_valid_payload.get("reference_score"),
+        "score_delta_vs_reference": best_valid_payload.get("score_delta_vs_reference"),
+        "evidence_summary": evidence_summary,
+        **view_paths,
+    }
+    materialized_path = run_dir / "summaries" / "materialized-summary.json"
+    materialized_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    summary["materialized_summary_path"] = str(materialized_path)
+    return summary
 
 
 def run_experiment(

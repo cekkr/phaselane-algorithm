@@ -44,7 +44,8 @@ The engine runs round-by-round and saves:
   - `views/index.md`,
   - `leaderboards/defender-top10.md`, `leaderboards/attacker-top10.md`,
   - `best/best-defender-genome.txt`, `best/best-attacker-genome.txt`,
-  - `summaries/conclusions.md`.
+  - `summaries/conclusions.md`,
+  - `summaries/evidence-summary.json`.
 
 Subsequent runs can resume from the same `--out-dir` and continue evolving from top archived genomes.
 
@@ -184,6 +185,18 @@ python3 demo/pcpl-evolvo/run_experiments.py \
 
 Run again with the same `--out-dir` to continue from archive elites.
 
+### Regenerate conclusions for an existing run
+
+```bash
+python3 demo/pcpl-evolvo/run_experiments.py \
+  --summarize-run demo/pcpl-evolvo/runs/20260425-153845-full
+```
+
+This does not run evolution. It rebuilds leaderboards, best genome snapshots,
+`summaries/conclusions.md`, and `summaries/evidence-summary.json` from the
+existing archive and per-round artifacts. This is useful for interrupted or
+still-running jobs whose final `report.md` has not been emitted yet.
+
 ### Continuous exhaustive parameter sweep (`--continuous`)
 
 ```bash
@@ -233,6 +246,7 @@ PowerShell:
 
 - `--mode {balanced,conclusion,dynamic,explorer}` (recommended high-level tuning control from `config.py`)
 - `--list-modes`, `--print-effective-config`
+- `--summarize-run <run-dir>` (materialize conclusions/evidence for an existing run without evolving)
 - `--population-size`, `--generations`
 - `--attacker-population-size`, `--attacker-generations`
 - `--elite-pool`, `--archive-limit`
