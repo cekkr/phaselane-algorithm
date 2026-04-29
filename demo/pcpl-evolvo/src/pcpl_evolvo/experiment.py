@@ -615,6 +615,7 @@ ATTACKER_STAGE_TIMEOUT_MID_SECONDS = 6.0
 ATTACKER_STAGE_TIMEOUT_FULL_SECONDS = 9.0
 PROCESS_EVAL_TIMEOUT_GRACE_SECONDS = 2.0
 PROCESS_EVAL_WATCHDOG_POLL_SECONDS = 0.25
+ROUND_BATCH_HEARTBEAT_SECONDS = 15.0
 RUNTIME_OVERBUDGET_TOLERANCE = 1.12
 KEY_VARIANT_FLOOR = 2
 TARGET_CALIBRATION_MIN_OBSERVATIONS = 3
@@ -1637,18 +1638,23 @@ def _resolve_round_parallel_plan(
     )
 
 
-def _process_pool_context_name() -> Optional[str]:
+def _process_pool_context_name(*, prefer_spawn: bool = False) -> Optional[str]:
     if os.name == "nt":
         return None
+    override = str(os.environ.get("EVOLVO_PROCESS_POOL_START_METHOD", "")).strip().lower()
+    if override in {"spawn", "fork", "forkserver"}:
+        return override
+    if bool(prefer_spawn):
+        return "spawn"
     if platform.system().lower() == "darwin":
         # Avoid unsafe fork interactions with MPS/objc runtime on macOS.
         return "spawn"
     return "fork"
 
 
-def _process_pool_kwargs() -> Dict[str, Any]:
+def _process_pool_kwargs(*, prefer_spawn: bool = False) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {}
-    ctx_name = _process_pool_context_name()
+    ctx_name = _process_pool_context_name(prefer_spawn=prefer_spawn)
     if ctx_name is not None:
         try:
             kwargs["mp_context"] = multiprocessing.get_context(ctx_name)
@@ -1665,8 +1671,9 @@ def _create_process_pool_executor(
     max_workers: int,
     *,
     eval_executor_kwargs: Optional[Dict[str, Any]] = None,
+    prefer_spawn: bool = False,
 ) -> concurrent.futures.ProcessPoolExecutor:
-    kwargs = _process_pool_kwargs()
+    kwargs = _process_pool_kwargs(prefer_spawn=bool(prefer_spawn))
     init_kwargs = _sanitize_eval_executor_kwargs(
         eval_executor_kwargs
         if eval_executor_kwargs is not None
@@ -8440,7 +8447,8 @@ def run_continuous_experiment(
                 interval=float(config.debug_eval_log_interval_seconds),
             )
         )
-    round_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+    round_executor: Optional[concurrent.futures.Executor] = None
+    round_executor_mode = "sequential"
 
     try:
         random.seed(config.seed)
@@ -8468,12 +8476,32 @@ def run_continuous_experiment(
         total_rounds = max(1, int(config.rounds))
         lane_count = int(max(1, round_plan.lanes))
         if bool(round_plan.enabled) and lane_count > 1:
-            round_executor = concurrent.futures.ThreadPoolExecutor(max_workers=lane_count)
+            if (
+                str(round_resource_plan.parallel_backend) == "off"
+                and bool(config.kompute_allow_process_pool)
+            ):
+                # When per-round evaluators are single-worker/off, thread lanes can serialize
+                # under the GIL. Process lanes provide true host parallelism.
+                round_executor = _create_process_pool_executor(
+                    max_workers=lane_count,
+                    prefer_spawn=True,
+                )
+                round_executor_mode = "process"
+            else:
+                round_executor = concurrent.futures.ThreadPoolExecutor(max_workers=lane_count)
+                round_executor_mode = "thread"
+            print(
+                "[pcpl-evolvo] round executor mode={mode} lanes={lanes}".format(
+                    mode=round_executor_mode,
+                    lanes=int(lane_count),
+                )
+            )
 
         def _write_running_summary(
             *,
             active_batch_rounds: Optional[Sequence[int]] = None,
             batch_completed_rounds: int = 0,
+            batch_completed_indices: Optional[Sequence[int]] = None,
         ) -> None:
             partial_summary: Dict[str, Any] = {
                 "status": "running",
@@ -8486,6 +8514,7 @@ def run_continuous_experiment(
                     "executor_backend": _normalize_executor_backend(config.executor_backend),
                     "round_parallel_plan": round_plan.to_dict(),
                     "per_round_resource_plan": round_resource_plan.to_dict(),
+                    "round_executor_mode": str(round_executor_mode),
                 },
                 "rounds_completed": len(archive.get("rounds", [])),
                 "last_round": {
@@ -8542,6 +8571,11 @@ def run_continuous_experiment(
                 partial_summary["active_batch"] = {
                     "rounds": [int(item) for item in active_batch_rounds],
                     "completed_in_batch": int(max(0, batch_completed_rounds)),
+                    "completed_rounds": (
+                        sorted(int(item) for item in batch_completed_indices)
+                        if batch_completed_indices
+                        else []
+                    ),
                 }
             try:
                 _save_archive(archive_path, archive)
@@ -8569,6 +8603,40 @@ def run_continuous_experiment(
         # Persist a startup checkpoint immediately so long first batches are observable.
         _write_running_summary(active_batch_rounds=None, batch_completed_rounds=0)
 
+        def _write_pending_round_checkpoint(result: _RoundExecutionResult) -> None:
+            round_dir = rounds_dir / f"round-{int(result.round_index):04d}"
+            round_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "status": "pending-merge",
+                "round": int(result.round_index),
+                "timestamp": _utc_now_iso(),
+                "defender_score": float(result.defender_score),
+                "attacker_score": float(result.attacker_score),
+                "reference_score": float(result.reference_score),
+                "defender_signature": str(result.defender_signature),
+                "attacker_signature": str(result.attacker_signature),
+                "reference_signature": str(result.reference_signature),
+                "archive_eligible": bool(result.archive_eligible),
+                "archive_skip_reason": str(result.archive_skip_reason),
+            }
+            try:
+                (round_dir / "round-pending.json").write_text(
+                    json.dumps(payload, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+
+        def _clear_pending_round_checkpoint(round_index: int) -> None:
+            pending_path = (
+                rounds_dir / f"round-{int(round_index):04d}" / "round-pending.json"
+            )
+            try:
+                if pending_path.exists():
+                    pending_path.unlink()
+            except Exception:
+                pass
+
         def _merge_round_result(result: _RoundExecutionResult) -> None:
             nonlocal archive
             nonlocal current_attacker
@@ -8585,6 +8653,7 @@ def run_continuous_experiment(
             round_index = int(result.round_index)
             round_dir = rounds_dir / f"round-{round_index:04d}"
             round_dir.mkdir(parents=True, exist_ok=True)
+            _clear_pending_round_checkpoint(round_index)
 
             if bool(result.archive_eligible):
                 archive["defender_elites"] = _insert_elite(
@@ -8739,18 +8808,43 @@ def run_continuous_experiment(
                 ] = round_index
             batch_results: Dict[int, _RoundExecutionResult] = {}
             merged_results: List[_RoundExecutionResult] = []
+            completed_round_indices: set[int] = set()
             next_round_to_merge = int(batch_round_indices[0])
-            for future in concurrent.futures.as_completed(tuple(pending.keys())):
-                round_index = int(pending[future])
-                batch_results[round_index] = future.result()
-                while next_round_to_merge in batch_results:
-                    result = batch_results.pop(next_round_to_merge)
-                    _merge_round_result(result)
-                    merged_results.append(result)
-                    next_round_to_merge += 1
+            while pending:
+                done, _ = concurrent.futures.wait(
+                    tuple(pending.keys()),
+                    timeout=float(ROUND_BATCH_HEARTBEAT_SECONDS),
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                if done:
+                    for future in done:
+                        round_index = int(pending.pop(future))
+                        result = future.result()
+                        batch_results[round_index] = result
+                        completed_round_indices.add(round_index)
+                        _write_pending_round_checkpoint(result)
+                    while next_round_to_merge in batch_results:
+                        result = batch_results.pop(next_round_to_merge)
+                        _merge_round_result(result)
+                        merged_results.append(result)
+                        next_round_to_merge += 1
+                else:
+                    print(
+                        "[pcpl-evolvo] round-batch heartbeat pending={pending} merged={merged}/{total} completed={completed}".format(
+                            pending=int(len(pending)),
+                            merged=int(len(merged_results)),
+                            total=int(batch_size),
+                            completed=",".join(
+                                f"{int(idx):04d}"
+                                for idx in sorted(completed_round_indices)
+                            )
+                            or "none",
+                        )
+                    )
                 _write_running_summary(
                     active_batch_rounds=batch_round_indices,
                     batch_completed_rounds=len(merged_results),
+                    batch_completed_indices=sorted(completed_round_indices),
                 )
             print(
                 "[pcpl-evolvo] round-batch complete rounds={rounds}".format(
@@ -9158,6 +9252,7 @@ def run_continuous_experiment(
                 "executor_backend": _normalize_executor_backend(config.executor_backend),
                 "round_parallel_plan": round_plan.to_dict(),
                 "per_round_resource_plan": round_resource_plan.to_dict(),
+                "round_executor_mode": str(round_executor_mode),
             },
             "predictive_profile": predictive_profile,
             **view_paths,
