@@ -281,10 +281,12 @@ PowerShell:
 Notes:
 - Edit `demo/pcpl-evolvo/config.py` if you want persistent defaults instead of long CLI command lines.
 - `--continuous` now runs multiple combo lanes in parallel by default (auto-planned from available CPUs), with per-lane worker splitting so `--workers 0` exploits all cores without extra flags.
+- GPU autotuning now scales worker pressure only when recent generations show useful work quality (unique/valid evaluations with acceptable timeout rates), not just low raw GPU utilization.
 - Process workers are now reused across generations/rounds for lower spawn overhead and higher sustained CPU utilization.
 - The adaptive parent-pool + mutation schedule reduces random dispersivity and focuses search around top genomes while preserving exploration.
 - Staged statistical mode (default) now applies dynamic quick-stage budgeting under pressure (see `qskip=` in logs), so only the most novel/promising genomes proceed when populations are large.
 - Stage fractions/keep ratios/key-variants are auto-tuned from runtime statistics (probe false-negative rate, novelty rate, keep-throughput) and persisted in `archive.json` for following rounds.
+- Idle random challenger trials are now self-governed: when previous rounds show low trial injection yield or high timeout pressure, trial budgets are reduced/skipped to avoid meaningless load.
 - In `--supervised-end-round-only` mode, the guide is now warmed once at round start and reused for proposal (no per-generation retraining).
 - Duplicate genomes are collapsed before stage execution and cached by fast evaluation signature + scenario fingerprint + opponent signature, so repeated candidates are not re-executed.
 - Evaluator outcomes are now tracked with explicit status buckets (`valid`, `valid-no-metrics`, `timeout-cut`, `complexity-cut`, `error-empty`) and surfaced in generation logs as `estatus=...`.

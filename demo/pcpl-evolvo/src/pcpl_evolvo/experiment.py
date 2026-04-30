@@ -417,9 +417,108 @@ class _GpuWorkerAutotuner:
     probe_interval_seconds: float
     action_cooldown_seconds: float
     step: int = 1
+    min_useful_score_for_scale_up: float = 0.44
+    signal_max_age_seconds: float = 120.0
     last_probe_ts: float = 0.0
     last_action_ts: float = 0.0
     last_utilization: float = -1.0
+    last_signal_ts: float = 0.0
+    last_signal_source: str = "none"
+    last_useful_score: float = -1.0
+    last_timeout_ratio: float = 0.0
+    last_valid_ratio: float = 0.0
+    last_unique_ratio: float = 0.0
+    last_gpu_share: float = -1.0
+    last_random_trial_ratio: float = 0.0
+
+    def observe_generation_row(
+        self,
+        row: Dict[str, Any],
+        *,
+        source: str,
+    ) -> None:
+        eval_total = max(
+            0.0,
+            float(row.get("quick_eval", 0.0))
+            + float(row.get("mid_eval", 0.0))
+            + float(row.get("full_eval", 0.0)),
+        )
+        unique_eval = max(0.0, float(row.get("eval_unique", 0.0)))
+        unique_ratio = clamp(unique_eval / max(1.0, eval_total), 0.0, 2.0)
+
+        valid_ratio_raw = row.get("eval_valid_ratio", None)
+        if valid_ratio_raw is None:
+            total_status = max(
+                1.0,
+                float(row.get("eval_valid", 0.0))
+                + float(row.get("eval_valid_no_metrics", 0.0))
+                + float(row.get("eval_timeout_cut", 0.0))
+                + float(row.get("eval_complexity_cut", 0.0))
+                + float(row.get("eval_error_empty", 0.0)),
+            )
+            valid_ratio = clamp(float(row.get("eval_valid", 0.0)) / total_status, 0.0, 1.0)
+        else:
+            valid_ratio = clamp(float(valid_ratio_raw), 0.0, 1.0)
+
+        timeout_ratio = clamp(float(row.get("eval_timeout_ratio", 0.0)), 0.0, 1.0)
+        workers = max(1.0, float(self.current_workers))
+        full_saturation = clamp(float(row.get("full_eval", 0.0)) / workers, 0.0, 1.5)
+
+        random_trials = max(0.0, float(row.get("random_trials", 0.0)))
+        random_injected = max(0.0, float(row.get("random_injected", 0.0)))
+        random_trial_ratio = (
+            clamp(random_injected / random_trials, 0.0, 1.0)
+            if random_trials > 0.0
+            else 0.50
+        )
+        random_share = random_trials / max(
+            1.0,
+            eval_total + float(row.get("probe_samples", 0.0)) + random_trials,
+        )
+
+        gpu_share_raw = row.get("native_gpu_share", None)
+        gpu_share = -1.0
+        if gpu_share_raw is not None:
+            try:
+                gpu_share = clamp(float(gpu_share_raw), 0.0, 1.0)
+            except Exception:
+                gpu_share = -1.0
+
+        useful_score = (
+            (0.33 * clamp(unique_ratio, 0.0, 1.0))
+            + (0.26 * valid_ratio)
+            + (0.24 * clamp(full_saturation, 0.0, 1.0))
+            + (0.17 * random_trial_ratio)
+        )
+        useful_score -= 0.50 * timeout_ratio
+        useful_score -= 0.22 * max(0.0, random_share - 0.22)
+        if gpu_share >= 0.0:
+            useful_score -= 0.20 * max(0.0, 0.10 - gpu_share)
+        useful_score = clamp(useful_score, 0.0, 1.0)
+
+        self.last_signal_ts = time.perf_counter()
+        self.last_signal_source = str(source).strip() or "unknown"
+        self.last_useful_score = float(useful_score)
+        self.last_timeout_ratio = float(timeout_ratio)
+        self.last_valid_ratio = float(valid_ratio)
+        self.last_unique_ratio = float(clamp(unique_ratio, 0.0, 2.0))
+        self.last_gpu_share = float(gpu_share)
+        self.last_random_trial_ratio = float(random_trial_ratio)
+
+    def _should_allow_scale_up(self, *, now: float) -> bool:
+        if self.last_useful_score < 0.0:
+            return True
+        if (now - float(self.last_signal_ts)) > max(5.0, float(self.signal_max_age_seconds)):
+            return True
+        if self.last_timeout_ratio >= 0.35:
+            return False
+        if self.last_valid_ratio <= 0.45:
+            return False
+        if self.last_unique_ratio <= 0.60:
+            return False
+        if self.last_useful_score < float(self.min_useful_score_for_scale_up):
+            return False
+        return True
 
     def tuned_workers(self, requested_workers: int, *, backend: str) -> int:
         requested = max(1, int(requested_workers))
@@ -446,7 +545,10 @@ class _GpuWorkerAutotuner:
         )
         if cooldown_ok:
             if util < float(self.target_low_util):
-                candidate += max(1, int(self.step))
+                if self._should_allow_scale_up(now=now):
+                    candidate += max(1, int(self.step))
+                elif self.last_useful_score >= 0.0 and self.last_useful_score < 0.30:
+                    candidate -= max(1, int(self.step))
             elif util > float(self.target_high_util):
                 candidate -= max(1, int(self.step))
 
@@ -454,14 +556,27 @@ class _GpuWorkerAutotuner:
         lower = max(1, min(int(self.min_workers), upper))
         candidate = max(lower, min(upper, candidate))
         if candidate != int(self.current_workers):
+            if self.last_useful_score >= 0.0:
+                useful_label = "{score:.2f} (u={uniq:.2f} v={valid:.2f} t={timeout:.2f} g={gpu:.2f} rnd={rnd:.2f})".format(
+                    score=float(self.last_useful_score),
+                    uniq=float(self.last_unique_ratio),
+                    valid=float(self.last_valid_ratio),
+                    timeout=float(self.last_timeout_ratio),
+                    gpu=float(self.last_gpu_share),
+                    rnd=float(self.last_random_trial_ratio),
+                )
+            else:
+                useful_label = "n/a"
             print(
-                "[pcpl-evolvo][gpu-autotune] backend={backend} util={util:.1f}% workers {prev}->{curr} target={low:.1f}-{high:.1f}%".format(
+                "[pcpl-evolvo][gpu-autotune] backend={backend} util={util:.1f}% workers {prev}->{curr} target={low:.1f}-{high:.1f}% useful={useful} source={source}".format(
                     backend=self.backend,
                     util=float(util),
                     prev=int(self.current_workers),
                     curr=int(candidate),
                     low=float(self.target_low_util),
                     high=float(self.target_high_util),
+                    useful=useful_label,
+                    source=str(self.last_signal_source),
                 )
             )
             self.current_workers = int(candidate)
@@ -479,6 +594,20 @@ def _autotuned_worker_count(*, requested: int, backend: str) -> int:
     if tuner is None:
         return max(1, int(requested))
     return max(1, int(tuner.tuned_workers(int(requested), backend=backend)))
+
+
+def _notify_gpu_autotuner_from_generation_row(
+    row: Dict[str, Any],
+    *,
+    source: str,
+) -> None:
+    tuner = _GPU_WORKER_AUTOTUNER
+    if tuner is None or not bool(tuner.enabled):
+        return
+    try:
+        tuner.observe_generation_row(row=row, source=source)
+    except Exception:
+        return
 
 
 def _normalize_executor_backend(backend: str) -> str:
@@ -2410,15 +2539,15 @@ def _idle_random_trial_budget(
     _ = (elapsed_seconds, target_seconds)
 
     current_load = max(0.0, float(full_eval) + float(probe_samples))
-    desired_load = max(float(lanes) * 1.60, min(float(pending_count), float(lanes) * 2.60))
+    desired_load = max(float(lanes) * 1.30, min(float(pending_count), float(lanes) * 2.10))
     gap = int(math.ceil(desired_load - current_load))
     if gap <= 0:
         return 0
 
     if pending_count < lanes:
-        cap = max(2, int(math.ceil(float(lanes) * 1.50)))
+        cap = max(2, int(math.ceil(float(lanes) * 1.15)))
     else:
-        cap = max(2, int(math.ceil(float(lanes) * 1.75)))
+        cap = max(2, int(math.ceil(float(lanes) * 1.30)))
     cap = min(cap, max(2, pending_count * 3))
     return max(0, min(gap, cap))
 
@@ -2440,6 +2569,7 @@ def _evaluate_idle_random_trials(
     cache_key_fn,
     max_cache_entries: int,
     random_genome_fn: Callable[[], GFSLGenome],
+    previous_stats: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     stats = {
         "trial_count": 0.0,
@@ -2453,6 +2583,35 @@ def _evaluate_idle_random_trials(
         "trial_complexity_cut": 0.0,
         "trial_error_empty": 0.0,
     }
+    if isinstance(previous_stats, dict) and previous_stats:
+        prev_timeout_ratio = clamp(float(previous_stats.get("eval_timeout_ratio", 0.0)), 0.0, 1.0)
+        prev_trials = max(0.0, float(previous_stats.get("random_trials", 0.0)))
+        prev_injected = max(0.0, float(previous_stats.get("random_injected", 0.0)))
+        prev_eval_total = max(
+            0.0,
+            float(previous_stats.get("quick_eval", 0.0))
+            + float(previous_stats.get("mid_eval", 0.0))
+            + float(previous_stats.get("full_eval", 0.0)),
+        )
+        prev_probe_samples = max(0.0, float(previous_stats.get("probe_samples", 0.0)))
+        prev_trial_efficiency = (
+            prev_injected / prev_trials
+            if prev_trials > 0.0
+            else 1.0
+        )
+        prev_trial_share = prev_trials / max(
+            1.0,
+            prev_eval_total + prev_probe_samples + prev_trials,
+        )
+        if prev_timeout_ratio >= 0.38:
+            return stats
+        if (
+            prev_trials >= max(4.0, float(max(1, int(workers))))
+            and prev_trial_efficiency < 0.04
+            and prev_trial_share > 0.20
+        ):
+            return stats
+
     budget = _idle_random_trial_budget(
         workers=workers,
         pending_count=len(pending),
@@ -2461,6 +2620,21 @@ def _evaluate_idle_random_trials(
         elapsed_seconds=elapsed_seconds,
         target_seconds=target_seconds,
     )
+    if isinstance(previous_stats, dict) and previous_stats and budget > 0:
+        prev_trials = max(0.0, float(previous_stats.get("random_trials", 0.0)))
+        prev_injected = max(0.0, float(previous_stats.get("random_injected", 0.0)))
+        if prev_trials > 0.0:
+            prev_trial_efficiency = prev_injected / prev_trials
+            if prev_trial_efficiency <= 0.10:
+                budget = min(
+                    int(budget),
+                    max(1, int(math.ceil(float(max(1, int(workers))) * 0.70))),
+                )
+            if prev_trial_efficiency <= 0.03:
+                budget = min(
+                    int(budget),
+                    max(1, int(math.ceil(float(max(1, int(workers))) * 0.45))),
+                )
     if budget <= 0:
         return stats
 
@@ -6003,6 +6177,7 @@ def _run_defender_round(
             "native_final_sync_total": int(native_final_sync_total),
         }
         generation_log.append(row)
+        _notify_gpu_autotuner_from_generation_row(row, source="defender")
         print(
             "[pcpl-evolvo][defender] gen={gen:03d} score={score:.5f} objective={objective:.5f} total={total:.5f} sync={sync:.4f} hs={hs:.4f} sec={security:.4f} cost={cost:.4f} attack_adv={attack_adv:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} gate={gate}@{gthr:.3f}/{gp:.2f}/skip{gskip} neu={np}/{nr}/skip{nskip} estatus=v{ev}/vm{evm}/to{eto}/cx{ecx}/err{eer}@{etor:.2f} imm={imm} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
                 gen=gen,
@@ -6222,6 +6397,7 @@ def _run_defender_round(
                 random_genome_fn=lambda: _make_random_genome(
                     max(4, int(math.ceil(float(config.initial_instructions) * 0.85)))
                 ),
+                previous_stats=stage_stats,
             )
             local_stage["random_trials"] = float(trial_stats["trial_count"])
             local_stage["random_injected"] = float(trial_stats["trial_injected"])
@@ -6387,6 +6563,7 @@ def _run_defender_round(
                 random_genome_fn=lambda: _make_random_genome(
                     max(4, int(math.ceil(float(config.initial_instructions) * 0.85)))
                 ),
+                previous_stats=stage_stats,
             )
             local_stage["random_trials"] = float(trial_stats["trial_count"])
             local_stage["random_injected"] = float(trial_stats["trial_injected"])
@@ -6530,6 +6707,7 @@ def _run_defender_round(
                 random_genome_fn=lambda: _make_random_genome(
                     max(4, int(math.ceil(float(config.initial_instructions) * 0.85)))
                 ),
+                previous_stats=stage_stats,
             )
             local_stage["random_trials"] = float(trial_stats["trial_count"])
             local_stage["random_injected"] = float(trial_stats["trial_injected"])
@@ -6705,6 +6883,7 @@ def _run_defender_round(
             random_genome_fn=lambda: _make_random_genome(
                 max(4, int(math.ceil(float(config.initial_instructions) * 0.85)))
             ),
+            previous_stats=stage_stats,
         )
         local_stage["random_trials"] = float(trial_stats["trial_count"])
         local_stage["random_injected"] = float(trial_stats["trial_injected"])
@@ -7004,6 +7183,7 @@ def _run_attacker_round(
             "native_final_sync_total": int(native_final_sync_total),
         }
         generation_log.append(row)
+        _notify_gpu_autotuner_from_generation_row(row, source="attacker")
         print(
             "[pcpl-evolvo][attacker] gen={gen:03d} score={score:.5f} lane={lane:.4f} token={token:.4f} q={qf:.2f}/{qk:.2f} m={mf:.2f}/{mk:.2f} kv={kv} probe={probe:.2f} qt={qt:.2f} eval={stage_eval} keep={stage_keep} probes={probe_n} qskip={qskip} uniq={uniq} cache={cache} dup={dup} reb={reb} rnd={rt}/{ri} estatus=v{ev}/vm{evm}/to{eto}/cx{ecx}/err{eer}@{etor:.2f} imm={imm} ub={ub:.2f} mut={mut:.2f} t={secs:.2f}s".format(
                 gen=gen,
@@ -7201,6 +7381,7 @@ def _run_attacker_round(
                 random_genome_fn=lambda: _make_random_genome(
                     max(4, int(math.ceil(float(max(4, config.initial_instructions // 2)) * 0.95)))
                 ),
+                previous_stats=stage_stats,
             )
             local_stage["random_trials"] = float(trial_stats["trial_count"])
             local_stage["random_injected"] = float(trial_stats["trial_injected"])
@@ -7365,6 +7546,7 @@ def _run_attacker_round(
                 random_genome_fn=lambda: _make_random_genome(
                     max(4, int(math.ceil(float(max(4, config.initial_instructions // 2)) * 0.95)))
                 ),
+                previous_stats=stage_stats,
             )
             local_stage["random_trials"] = float(trial_stats["trial_count"])
             local_stage["random_injected"] = float(trial_stats["trial_injected"])
@@ -7507,6 +7689,7 @@ def _run_attacker_round(
                 random_genome_fn=lambda: _make_random_genome(
                     max(4, int(math.ceil(float(max(4, config.initial_instructions // 2)) * 0.95)))
                 ),
+                previous_stats=stage_stats,
             )
             local_stage["random_trials"] = float(trial_stats["trial_count"])
             local_stage["random_injected"] = float(trial_stats["trial_injected"])
@@ -7659,6 +7842,7 @@ def _run_attacker_round(
             random_genome_fn=lambda: _make_random_genome(
                 max(4, int(math.ceil(float(max(4, config.initial_instructions // 2)) * 0.95)))
             ),
+            previous_stats=stage_stats,
         )
         local_stage["random_trials"] = float(trial_stats["trial_count"])
         local_stage["random_injected"] = float(trial_stats["trial_injected"])
