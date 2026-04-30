@@ -8476,12 +8476,16 @@ def run_continuous_experiment(
         total_rounds = max(1, int(config.rounds))
         lane_count = int(max(1, round_plan.lanes))
         if bool(round_plan.enabled) and lane_count > 1:
-            if (
-                str(round_resource_plan.parallel_backend) == "off"
-                and bool(config.kompute_allow_process_pool)
-            ):
-                # When per-round evaluators are single-worker/off, thread lanes can serialize
-                # under the GIL. Process lanes provide true host parallelism.
+            use_process_round_executor = False
+            if bool(config.kompute_allow_process_pool):
+                if str(config.parallel_backend).strip().lower() == "process":
+                    # Explicit process preference should apply to round lanes too.
+                    use_process_round_executor = True
+                elif str(round_resource_plan.parallel_backend) == "off":
+                    # When per-round evaluators are single-worker/off, thread lanes can serialize
+                    # under the GIL. Process lanes provide true host parallelism.
+                    use_process_round_executor = True
+            if use_process_round_executor:
                 round_executor = _create_process_pool_executor(
                     max_workers=lane_count,
                     prefer_spawn=True,
