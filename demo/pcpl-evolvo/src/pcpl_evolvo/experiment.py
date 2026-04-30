@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import ctypes
 import hashlib
 import json
 import math
@@ -40,6 +41,11 @@ ensure_evolvo_importable()
 
 from evolvo import (
     DataType,
+    DEFAULT_KOMPUTE_PLAN_CACHE_ENABLE,
+    DEFAULT_KOMPUTE_PLAN_CACHE_MAX_ENTRIES,
+    DEFAULT_KOMPUTE_PLAN_DISK_CACHE_DIR,
+    DEFAULT_KOMPUTE_PLAN_DISK_CACHE_ENABLE,
+    DEFAULT_KOMPUTE_PLAN_DISK_CACHE_MAX_FILES,
     GFSLGenome,
     GFSLInstruction,
     GFSLEvolver,
@@ -85,6 +91,11 @@ class ExperimentConfig:
     kompute_native_enable_boolean_compare: bool = True
     kompute_native_enable_boolean_logic: bool = True
     kompute_native_enable_list_query: bool = True
+    kompute_plan_cache_enable: bool = bool(DEFAULT_KOMPUTE_PLAN_CACHE_ENABLE)
+    kompute_plan_cache_max_entries: int = int(DEFAULT_KOMPUTE_PLAN_CACHE_MAX_ENTRIES)
+    kompute_plan_disk_cache_enable: bool = bool(DEFAULT_KOMPUTE_PLAN_DISK_CACHE_ENABLE)
+    kompute_plan_disk_cache_dir: str = str(DEFAULT_KOMPUTE_PLAN_DISK_CACHE_DIR)
+    kompute_plan_disk_cache_max_files: int = int(DEFAULT_KOMPUTE_PLAN_DISK_CACHE_MAX_FILES)
     kompute_allow_process_pool: bool = False
     use_supervised_guide: bool = True
     supervised_end_round_only: bool = True
@@ -504,6 +515,8 @@ def _sanitize_eval_executor_kwargs(kwargs: Optional[Dict[str, Any]]) -> Dict[str
         "kompute_native_enable_boolean_compare",
         "kompute_native_enable_boolean_logic",
         "kompute_native_enable_list_query",
+        "kompute_plan_cache_enable",
+        "kompute_plan_disk_cache_enable",
     ):
         if key in raw:
             sanitized[key] = bool(raw[key])
@@ -533,6 +546,29 @@ def _sanitize_eval_executor_kwargs(kwargs: Optional[Dict[str, Any]]) -> Dict[str
         try:
             value = float(raw["kompute_max_unsupported_share"])
             sanitized["kompute_max_unsupported_share"] = max(0.0, min(1.0, value))
+        except Exception:
+            pass
+    if "kompute_plan_cache_max_entries" in raw:
+        try:
+            sanitized["kompute_plan_cache_max_entries"] = max(
+                64,
+                int(raw["kompute_plan_cache_max_entries"]),
+            )
+        except Exception:
+            pass
+    if "kompute_plan_disk_cache_max_files" in raw:
+        try:
+            sanitized["kompute_plan_disk_cache_max_files"] = max(
+                256,
+                int(raw["kompute_plan_disk_cache_max_files"]),
+            )
+        except Exception:
+            pass
+    if "kompute_plan_disk_cache_dir" in raw:
+        try:
+            cache_dir = str(raw["kompute_plan_disk_cache_dir"]).strip()
+            if cache_dir:
+                sanitized["kompute_plan_disk_cache_dir"] = cache_dir
         except Exception:
             pass
     return sanitized
@@ -592,6 +628,17 @@ def _build_eval_executor_kwargs(config: ExperimentConfig) -> Dict[str, Any]:
         ),
         "kompute_native_enable_list_query": bool(
             config.kompute_native_enable_list_query
+        ),
+        "kompute_plan_cache_enable": bool(config.kompute_plan_cache_enable),
+        "kompute_plan_cache_max_entries": max(
+            64,
+            int(config.kompute_plan_cache_max_entries),
+        ),
+        "kompute_plan_disk_cache_enable": bool(config.kompute_plan_disk_cache_enable),
+        "kompute_plan_disk_cache_dir": str(config.kompute_plan_disk_cache_dir),
+        "kompute_plan_disk_cache_max_files": max(
+            256,
+            int(config.kompute_plan_disk_cache_max_files),
         ),
     }
     if backend == "kompute-sim":
@@ -1663,7 +1710,32 @@ def _process_pool_kwargs(*, prefer_spawn: bool = False) -> Dict[str, Any]:
     return kwargs
 
 
+def _arm_child_parent_death_signal() -> None:
+    if os.name != "posix":
+        return
+    if "linux" not in platform.system().strip().lower():
+        return
+    parent_pid = int(os.getppid())
+    if parent_pid <= 1:
+        return
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    except Exception:
+        return
+    pr_set_pdeathsig = 1  # PR_SET_PDEATHSIG
+    try:
+        set_result = int(libc.prctl(pr_set_pdeathsig, int(signal.SIGTERM), 0, 0, 0))
+    except Exception:
+        return
+    if set_result != 0:
+        return
+    if int(os.getppid()) != parent_pid:
+        # Parent died before signal arming; terminate now to avoid orphan workers.
+        os.kill(os.getpid(), signal.SIGTERM)
+
+
 def _process_pool_initializer(eval_executor_kwargs: Dict[str, Any]) -> None:
+    _arm_child_parent_death_signal()
     _set_eval_executor_kwargs(eval_executor_kwargs)
 
 
@@ -7685,6 +7757,62 @@ def _deserialize_attacker_payload(payload: Optional[Dict[str, Any]]) -> Optional
         return None
 
 
+def _round_progress_path(progress_dir: Optional[str], *, round_index: int) -> Optional[Path]:
+    if not progress_dir:
+        return None
+    try:
+        round_dir = Path(str(progress_dir)) / f"round-{int(round_index):04d}"
+    except Exception:
+        return None
+    return round_dir / "round-progress.json"
+
+
+def _write_round_progress(
+    progress_dir: Optional[str],
+    *,
+    round_index: int,
+    status: str,
+    phase: str,
+    detail: str = "",
+    payload: Optional[Dict[str, Any]] = None,
+) -> None:
+    progress_path = _round_progress_path(progress_dir, round_index=round_index)
+    if progress_path is None:
+        return
+    try:
+        progress_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    body: Dict[str, Any] = {
+        "round": int(round_index),
+        "status": str(status),
+        "phase": str(phase),
+        "detail": str(detail),
+        "pid": int(os.getpid()),
+        "timestamp": _utc_now_iso(),
+    }
+    if isinstance(payload, dict) and payload:
+        body.update(payload)
+    try:
+        progress_path.write_text(json.dumps(body, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _read_round_progress(progress_dir: Optional[str], *, round_index: int) -> Optional[Dict[str, Any]]:
+    progress_path = _round_progress_path(progress_dir, round_index=round_index)
+    if progress_path is None or not progress_path.exists():
+        return None
+    try:
+        payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload["round"] = int(round_index)
+    return payload
+
+
 def _run_round_from_snapshot(
     *,
     round_index: int,
@@ -7694,6 +7822,7 @@ def _run_round_from_snapshot(
     scenarios: Sequence[ScenarioConfig],
     archive_snapshot: Dict[str, Any],
     attacker_payload: Optional[Dict[str, Any]],
+    progress_dir: Optional[str] = None,
 ) -> _RoundExecutionResult:
     local_archive = copy.deepcopy(archive_snapshot)
     current_attacker = _deserialize_attacker_payload(attacker_payload)
@@ -7703,6 +7832,13 @@ def _run_round_from_snapshot(
             resource_plan,
             eval_executor_kwargs=eval_executor_kwargs,
         )
+    _write_round_progress(
+        progress_dir,
+        round_index=int(round_index),
+        status="running",
+        phase="defender",
+        detail="starting defender evolution",
+    )
     try:
         defender_evolver, defender_log = _run_defender_round(
             config=config,
@@ -7711,6 +7847,16 @@ def _run_round_from_snapshot(
             scenarios=scenarios,
             archive=local_archive,
             attacker=current_attacker,
+        )
+        _write_round_progress(
+            progress_dir,
+            round_index=int(round_index),
+            status="running",
+            phase="attacker",
+            detail="defender evolution completed; starting attacker evolution",
+            payload={
+                "defender_generations": int(len(defender_log)),
+            },
         )
 
         preliminary_defender = defender_evolver.population[0]
@@ -7737,6 +7883,17 @@ def _run_round_from_snapshot(
             scenarios=scenarios,
             archive=local_archive,
             defender=preliminary_defender,
+        )
+        _write_round_progress(
+            progress_dir,
+            round_index=int(round_index),
+            status="running",
+            phase="selection",
+            detail="attacker evolution completed; selecting robust defender",
+            payload={
+                "defender_generations": int(len(defender_log)),
+                "attacker_generations": int(len(attacker_log)),
+            },
         )
         best_attacker = attacker_evolver.population[0]
         ensure_attacker_genome_io(best_attacker)
@@ -8234,6 +8391,18 @@ def _run_round_from_snapshot(
             reference_signature=reference_signature,
             reference_metrics=reference_metrics,
         )
+        _write_round_progress(
+            progress_dir,
+            round_index=int(round_index),
+            status="completed",
+            phase="completed",
+            detail="round computation complete; awaiting merge",
+            payload={
+                "defender_score": float(selected_score),
+                "attacker_score": float(attack_adv),
+                "reference_score": float(reference_score),
+            },
+        )
         return _RoundExecutionResult(
             round_index=int(round_index),
             defender_score=float(selected_score),
@@ -8261,6 +8430,16 @@ def _run_round_from_snapshot(
             archive_eligible=bool(archive_eligible),
             archive_skip_reason=str(archive_skip_reason),
         )
+    except Exception as exc:
+        _write_round_progress(
+            progress_dir,
+            round_index=int(round_index),
+            status="error",
+            phase="error",
+            detail=f"round worker failed: {type(exc).__name__}",
+            payload={"error": str(exc)},
+        )
+        raise
     finally:
         _shutdown_shared_executor(shared_executor)
 
@@ -8418,6 +8597,16 @@ def run_continuous_experiment(
             cpu_load=host_cpu_load_text,
         )
     )
+    if _normalize_executor_backend(config.executor_backend) in {"auto", "kompute", "kompute-sim"}:
+        print(
+            "[pcpl-evolvo] kompute plan-cache ram={ram}({entries}) disk={disk}({files}) dir={directory}".format(
+                ram=bool(eval_executor_kwargs.get("kompute_plan_cache_enable", True)),
+                entries=int(eval_executor_kwargs.get("kompute_plan_cache_max_entries", 0)),
+                disk=bool(eval_executor_kwargs.get("kompute_plan_disk_cache_enable", True)),
+                files=int(eval_executor_kwargs.get("kompute_plan_disk_cache_max_files", 0)),
+                directory=str(eval_executor_kwargs.get("kompute_plan_disk_cache_dir", "")),
+            )
+        )
     if int(round_plan.lanes) > 1 and str(round_resource_plan.parallel_backend) == "off":
         print(
             "[pcpl-evolvo] warning: round lanes are high but per-round workers resolved to 1 (backend=off). "
@@ -8572,6 +8761,14 @@ def run_continuous_experiment(
                 },
             }
             if active_batch_rounds:
+                round_progress: List[Dict[str, Any]] = []
+                for round_idx in active_batch_rounds:
+                    progress_payload = _read_round_progress(
+                        str(rounds_dir),
+                        round_index=int(round_idx),
+                    )
+                    if isinstance(progress_payload, dict):
+                        round_progress.append(progress_payload)
                 partial_summary["active_batch"] = {
                     "rounds": [int(item) for item in active_batch_rounds],
                     "completed_in_batch": int(max(0, batch_completed_rounds)),
@@ -8580,6 +8777,7 @@ def run_continuous_experiment(
                         if batch_completed_indices
                         else []
                     ),
+                    "round_progress": round_progress,
                 }
             try:
                 _save_archive(archive_path, archive)
@@ -8635,9 +8833,17 @@ def run_continuous_experiment(
             pending_path = (
                 rounds_dir / f"round-{int(round_index):04d}" / "round-pending.json"
             )
+            progress_path = (
+                rounds_dir / f"round-{int(round_index):04d}" / "round-progress.json"
+            )
             try:
                 if pending_path.exists():
                     pending_path.unlink()
+            except Exception:
+                pass
+            try:
+                if progress_path.exists():
+                    progress_path.unlink()
             except Exception:
                 pass
 
@@ -8790,6 +8996,7 @@ def run_continuous_experiment(
                     scenarios=scenario_list,
                     archive_snapshot=batch_archive_snapshot,
                     attacker_payload=attacker_payload,
+                    progress_dir=str(rounds_dir),
                 )
                 _merge_round_result(result)
                 offset += 1
@@ -8808,6 +9015,7 @@ def run_continuous_experiment(
                         scenarios=scenario_list,
                         archive_snapshot=copy.deepcopy(batch_archive_snapshot),
                         attacker_payload=copy.deepcopy(attacker_payload),
+                        progress_dir=str(rounds_dir),
                     )
                 ] = round_index
             batch_results: Dict[int, _RoundExecutionResult] = {}

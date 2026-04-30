@@ -39,6 +39,8 @@ The engine runs round-by-round and saves:
 
 - defender + attacker elites in `archive.json`,
 - per-round reports in `runs/<run>/rounds/round-XXXX/`,
+- live per-lane worker status in `runs/<run>/rounds/round-XXXX/round-progress.json`,
+- pre-merge completed lane checkpoints in `runs/<run>/rounds/round-XXXX/round-pending.json`,
 - global summary in `results.json` and `report.md`,
 - structured views:
   - `views/index.md`,
@@ -48,6 +50,8 @@ The engine runs round-by-round and saves:
   - `summaries/evidence-summary.json`.
 
 Subsequent runs can resume from the same `--out-dir` and continue evolving from top archived genomes.
+While a batch is still running, `results.json` now includes `active_batch.round_progress`
+so you can monitor round phases even before the first merged round is archived.
 
 ## Usage
 
@@ -119,6 +123,8 @@ dispatches supported scalar stages through Vulkan and transparently falls back t
 When Kompute is enabled, process-pool evaluation is auto-switched to thread mode by default
 to avoid Vulkan instability with forked workers; set `EVOLVO_KOMPUTE_ALLOW_PROCESS_POOL=1`
 only if you explicitly want to keep process workers.
+Kompute execution-profile cache settings from `evolvo` are also propagated by `pcpl-evolvo`
+(`EVOLVO_KOMPUTE_PLAN_CACHE_*` and `EVOLVO_KOMPUTE_PLAN_DISK_CACHE_*`).
 
 ### Vulkan / Kompute dependency doctor
 
