@@ -22,3 +22,10 @@ How to run:
 Next steps:
 - Add more property checks (replay window, adversarial cross-lane attempts, larger x).
 - If concrete parameter sets are chosen, document them and mirror in the demo defaults.
+
+# pcpl-evolvo notes
+- When updating main-paper.md following latest evolvo-conclusions.md report, don't quote any file that is ignored in the repo, like the pcpl-evolvo/runs: they're simply not accessible, quoting them is dispersive. When updating the two md files, be "auto conclusive" inside the effective available files in the repo after a clean clone. 
+- In main-paper.md in sections like "Latest Evolvo run: interpretation and constraints" don't write report about an execution itself (it's not conclusive, execution time etc), it's just relative and meaningless for the main paper.
+- Don't report in main-paper.md Evolvo's GFSL algorithms: translate them in general pseudo code, also seen that many GFSL variable indices have no sense without an exact context.
+- Assume that a syncro layer and a "GPS-precise timing" is available: making a syncro precise circuit is important to avoid desyncronizations or dead idles useful for attacker, but continuing to presume that may be possible without an external precise clock as reference is a waste of resource in computing a too much sensible circuit.
+- Avoid in any case to find a solution that requires handshakes after the initial one, it's a big vulnerability and liability in the basis of the research.
