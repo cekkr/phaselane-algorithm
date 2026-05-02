@@ -889,10 +889,10 @@ derived from $\eta_i(t)$. Kernel selection $\kappa_i$ then chooses a small
 native-friendly mixer over $EA,EB,EC,\Phi_t,\lambda_i$ before the `KDF` step.
 
 The blind-provider contract imposes an important restriction: every input used
-by $\Theta_i(t)$ must be public or provider-observable. A simulator can expose
-`last_token_hint` or other global history to all lane computations, but a real
-provider cannot recompute such a path unless the hint is broadcast or carried in
-the message. Therefore a production policy circuit should be constrained to:
+by $\Theta_i(t)$ must be public or provider-observable. In the current
+pcpl-evolvo setup, control hints are constrained to phase/time/lane-observable
+channels, specifically to avoid dependencies on hidden token history. Therefore
+a production policy circuit should be constrained to:
 
 - public phase values and cycle counters,
 - the provider's own lane identifier and public slot information,
@@ -1079,122 +1079,54 @@ Additional multi-configuration outputs (other compound modes and seeds) are inte
 
 ### 8.5 Latest Evolvo run: interpretation and constraints
 Evolutionary campaigns are used here as automated design-space exploration. They
-search for circuit policies that survive fixed objectives; they do not redefine
-PCPL semantics and they do not replace the correctness arguments in §6.
+search for circuit policies under fixed objectives; they do not redefine PCPL
+semantics and they do not replace correctness arguments in §6.
 
-The latest full run analyzed for this version is
-`demo/pcpl-evolvo/runs/20260430-223959-full`. The directory is still marked
-`running`, but only rounds `0000..0024` contain final `round-results.json`
-artifacts. Rounds `0025..0029` contain progress markers only, so they are
-excluded from the conclusions.
+This section is intentionally design-conclusive rather than execution-reporting.
+The repository-local conclusions support five stable constraints:
 
-Grounding facts:
+- Core PCPL invariants are easy to preserve in search (one-of-$x$, permutation,
+  and lane separation remain saturated in valid evidence rows).
+- The practical defender family is sparse and feed-forward, not branch-heavy.
+- Useful activation sits around one to two active compounds out of five; bouquet
+  inventory and active subset should be treated as separate knobs.
+- Current attacker pressure is mainly lane/route inference from public features,
+  not token inversion.
+- Long-horizon synchronization remains the unresolved engineering frontier and
+  must be handled by supervision, not by overloading the hot token path.
 
-- `25/25` completed rounds are valid; no completed round is skipped.
-- The best defender is round `0003`, score `0.48790812`, robust score
-  `0.48778643`, signature `d6d8447924aab2f1ad06eb212ee87528`.
-- The best attacker is round `0020`, score `0.01624339`, signature
-  `b5cc30b5e97a2561b070325044f3ed84`.
-- Round-mean defender score is `0.47850353`, with a narrow range
-  `0.46895106..0.48790812`.
-- Same-round reference-anchor deltas are positive on average
-  (`+0.017303`, max `+0.028941`), but the best evolved defender does not beat
-  the fixed baseline table: `reference-full = 0.5082`, `balanced = 0.5170`,
-  and `minimal-cost = 0.5326`.
+#### Circuit motif (general pseudocode)
 
-Across the `150` final scenario rows, the core PCPL checks saturate:
-one-of-$x$, block-once, permutation-valid, attack-reject, twin-sync, and
-timing-reject rates all have mean/min/max `1.0`; cross-lane collision, replay,
-and shared-device match rates all remain `0.0`. This is the strongest empirical
-claim from the run: the PCPL routing and recomputation invariants are preserved
-under the searched policies.
-
-The unresolved metrics are elsewhere:
-
-- projected sync-loss mean `0.995123`
-- horizon-sync mean `0.004877`
-- sync-score mean `0.528241`
-- runtime-score mean `0.222373`
-- control-flow-score mean `0.192910`
-
-This separates the paper's claims. PCPL's lane-selection and token-separation
-properties are stable in the simulation; long-horizon synchronization and
-hardware execution coverage remain practical circuit problems.
-
-#### Defender family
-The best defender is a short GFSL program:
+Provider-side token derivation should stay deterministic and compact:
 
 ```text
-d$24 = PCPL_PHASEMIX(d$8, d$9)
-FUNC d&0
-d!0 = PREPEND(-1.0)
-d$0 = FIFO(d!0)
-d$20 = ADD(d$0, d$1)
-d$21 = MOD(d$2, d$3)
-d$22 = MUL(d$4, d$5)
-d$23 = PCPL_HASHMIX(d$6, d$7)
-d$25 = SUB(d$10, d$6)
-d$26 = PCPL_MODHASH(d$3, d$11)
-d$28 = PCPL_HASHMIX(d$2, d$9)
-d$27 = CALL(d&0)
+for each cycle t:
+  phase <- public_phase_clock(t, P, Q, R)
+  policy <- deterministic_policy(public_inputs_only)
+  active_set <- choose_sparse_subset(bouquet, policy.active_count)
+  lane_eval <- modular_mix(active_set, phase, policy)
+  token <- hash_kdf_and_trunc(lane_eval, phase, t)
 ```
 
-The important conclusion is not the exact instruction list; it is the shape of
-the circuit. The winning family is a compact PCPL arithmetic spine with small
-bias terms and PCPL-specific mixers. It does not use rich branch logic in the
-hot path. Its mean control-flow score is only about `0.193`, while the hard
-protocol invariants remain perfect.
-
-The strongest implementation motif is sparse activation. The best two defenders
-use a device compound ratio of `0.20`, which corresponds to one active compound
-out of five in the evaluated mid-stage scenarios. The `0.40` bucket forms a
-large plateau, and the `0.60` bucket has the lowest mean defender score. In this
-objective family, bouquet size should be treated as hidden inventory, while
-active compound count should be treated as a separate per-cycle budget.
-
-There is also a contract warning. The best evolved genome uses `d$9`, which in
-the simulator is a `last_token_hint`, in two control outputs. A real blind
-provider can recompute such a path only if that previous-token hint is public,
-broadcast, or carried in the message. If tokens are delivered only to their
-active provider, future controller search must forbid non-provider-observable
-inputs in provider-side token derivation.
-
-#### Attacker family
-The strongest attackers are small public-feature predictors. The best attacker
-is:
+Attacker-side pressure in this benchmark family is better modeled as route
+inference:
 
 ```text
-d!0 = APPEND(2.0)
-d$0 = FILO(d!0)
-d$1 = FILO(d!0)
-d$40 = ADD(d$6, d$0)
-d$41 = ADD(d$7, d$1)
-d$42 = ADD(d$8, d$2)
+observe public_phase_and_schedule_features()
+predict lane_or_route_exposure()
+score by lane success and downstream attacker advantage
 ```
 
-This is lane inference, not token inversion. The strongest attacker reaches
-round-mean lane success `0.2029`, but token success is `0.0000` for that best
-attacker. Across all valid rounds, token-success mean is only `0.000045`, with
-an observed max `0.001134` in the low-bit attack benchmark. The practical
-attacker objective should therefore include route/lane prediction, not only
-token guessing.
+#### Contract and timing assumptions
 
-#### Search and execution limits
-The run is more evaluable than the previous `20260425-153845-full` evidence
-because every completed round has final metrics. It is still not a clean
-open-ended optimizer:
+Two constraints are mandatory for deployable interpretations:
 
-- timeout recheck and timeout rescue are used in `25/25` rounds
-- `timeout-collapse-before-expand` appears `20` times in progressive stopping
-- generation-0 defender survives final selection in `7/25` rounds
-- defender generation logs show mean timeout ratio `0.6831` and mean valid ratio
-  `0.0251`
-- attacker generation logs show mean timeout ratio `0.9284`
-
-Native execution is also partial, not complete. Final scenario metrics contain
-about `1,005,817` GPU dispatches and `568,974` CPU fallback dispatches, for an
-aggregate GPU dispatch share of about `0.6387`. Hardware-oriented PCPL circuits
-should therefore penalize operations that compile into frequent CPU fallback.
+- **No post-init handshake dependency.** Provider recomputation inputs must be
+  provider-observable from public phase/time channels (or explicit per-message
+  public fields), not hidden device-only hints.
+- **Precise external sync layer is assumed.** A GPS-grade time reference is
+  treated as available for cycle discipline; supervisory sync logic should build
+  on that assumption instead of replacing it with fragile ad hoc negotiation.
 
 ### 8.6 Circuit and algorithm changes derived from the search
 The latest run changes the practical PCPL design in seven ways:
@@ -1247,7 +1179,7 @@ architecture and constraints, not as final optimal circuits.
 - Practical optimization should prioritize phase-error regulation, horizon-sync gating, lane-hardening, and native execution coverage before further cost compression.
 - Empirical score values are not absolute physical constants; they depend on the chosen objective set and weights. For this reason, cross-run comparisons should include explicit objective-version metadata.
 - Some auxiliary terms (for example QFT/linear-rank/compare-$x$) can become near-constant under fixed scenario families; when this happens, they validate constraints but provide limited evolutionary gradient.
-- Plateau and timeout control matter: the latest full run has valid completed rounds, but every completed round still uses timeout rescue and the generation logs show heavy timeout pressure.
+- Plateau and timeout control matter: recent evidence still shows heavy timeout pressure and late-round evaluability collapse risk.
 - Archive acceptance needs hard gates for final-metric availability, provider-observable inputs, bounded timeout ratio, and native execution coverage.
 - Evolutionary search is heuristic optimization, not a formal proof technique; correctness remains grounded in the protocol construction and invariants.
 - This paper was developed and formatted with the help of OpenAI models.
@@ -1255,7 +1187,7 @@ architecture and constraints, not as final optimal circuits.
 ## 10. Conclusion
 PCPL provides a deterministic, no-handshake token protocol with exact 1-of-$x$ matching and a device-only chaining mechanism. Combined with symmetric continuous tokenizer devices, it supports provider validation and peer-to-peer isolation with dynamic, evolving secrets.
 
-The latest deterministic and evolutionary evidence makes the implementation direction more precise. The core token protocol is stable: permutation validity, per-block fairness, one-of-$x$ matching, replay rejection, and cross-lane separation saturate in the completed full run. The practical circuit should therefore not be a large opaque controller. It should be a sparse, feed-forward arithmetic token core coupled to a separate supervisory layer for drift, route pressure, resync windows, and hardware execution limits.
+The latest deterministic and evolutionary evidence makes the implementation direction more precise. The core token protocol is stable: permutation validity, per-block fairness, one-of-$x$ matching, replay rejection, and cross-lane separation remain saturated in valid evidence rows. The practical circuit should therefore not be a large opaque controller. It should be a sparse, feed-forward arithmetic token core coupled to a separate supervisory layer for drift, route pressure, resync windows, and hardware execution limits.
 
 The main remaining challenge is not token correctness. It is long-horizon synchronization, provider-observable control inputs, and resistance to lane-prediction leakage. Evolutionary search is useful for exposing these motifs and failure modes, but the protocol's correctness still comes from the construction: deterministic phase computation, private per-block permutation, domain-separated lane token derivation, and canonical recomputation by the intended provider.
 

@@ -61,12 +61,12 @@ This avoids passing many low-level flags on the CLI.
 Current default preset:
 
 - profile: `full`
-- mode: `conclusion`
+- mode: `random-research`
 - workers: `0` (auto, uses all available CPU cores)
 - parallel backend: `process`
-- rounds per execution: `12` (`conclusion/full`)
+- rounds per execution: `30` (`random-research/full`)
 
-This default is tuned for generating evidence suitable for conclusions/improvement work (not just quick smoke tests).
+This default is tuned for stochastic-first research (broad exploration, strong attacker pressure, strict sync gating), not only quick smoke tests.
 
 ### List preset modes
 
@@ -250,7 +250,7 @@ PowerShell:
 
 ## Main CLI options
 
-- `--mode {balanced,conclusion,dynamic,explorer}` (recommended high-level tuning control from `config.py`)
+- `--mode {balanced,conclusion,dynamic,explorer,paper,random-research}` (recommended high-level tuning control from `config.py`)
 - `--list-modes`, `--print-effective-config`
 - `--summarize-run <run-dir>` (materialize conclusions/evidence for an existing run without evolving)
 - `--population-size`, `--generations`

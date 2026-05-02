@@ -12,7 +12,7 @@ from settings import ACCELERATION_DEFAULTS
 
 
 DEFAULT_PROFILE = "full"
-DEFAULT_MODE = "paper"
+DEFAULT_MODE = "random-research"
 
 
 BASE_DEFAULTS: Dict[str, Any] = {
@@ -148,6 +148,41 @@ MODE_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "target_generation_seconds": 2.4,
         "max_eval_cache_entries": 56000,
         "supervised_end_round_only": True,
+    },
+    # Stochastic-first research mode: prioritizes exploration and anti-lane-inference pressure.
+    "random-research": {
+        "population_size": 136,
+        "generations": 60,
+        "rounds": 28,
+        "attacker_population_size": 96,
+        "attacker_generations": 20,
+        "elite_pool": 68,
+        "archive_limit": 640,
+        "parent_pool_ratio": 0.28,
+        "stagnation_patience": 1,
+        "mutation_floor": 0.34,
+        "mutation_ceiling": 0.99,
+        "mutation_step": 0.20,
+        "quick_cycle_fraction": 0.05,
+        "mid_cycle_fraction": 0.22,
+        "quick_keep_ratio": 0.46,
+        "mid_keep_ratio": 0.20,
+        "key_variants": 6,
+        "novelty_bonus": 0.24,
+        "predictive_penalty": 0.11,
+        "sync_loss_gate_percentile": 0.54,
+        "sync_loss_gate_penalty": 0.15,
+        "sync_loss_gate_flat_boost": 0.12,
+        "anti_neutrality_window": 8,
+        "anti_neutrality_penalty": 0.038,
+        "anti_neutrality_bonus": 0.020,
+        "attacker_panel_size": 5,
+        "attacker_panel_penalty": 0.24,
+        "target_generation_seconds": 2.8,
+        "max_eval_cache_entries": 68000,
+        "max_test_seconds": 16.0,
+        "use_supervised_guide": False,
+        "supervised_end_round_only": False,
     },
     # Default mode for publishing empirical conclusions.
     "conclusion": {
@@ -294,6 +329,15 @@ PROFILE_MODE_OVERRIDES: Dict[str, Dict[str, Dict[str, Any]]] = {
             "attacker_generations": 14,
             "archive_limit": 256,
         },
+        "random-research": {
+            "population_size": 88,
+            "generations": 36,
+            "rounds": 12,
+            "attacker_population_size": 64,
+            "attacker_generations": 14,
+            "elite_pool": 44,
+            "archive_limit": 320,
+        },
     },
     "full": {
         "paper": {
@@ -330,6 +374,15 @@ PROFILE_MODE_OVERRIDES: Dict[str, Dict[str, Dict[str, Any]]] = {
             "attacker_generations": 18,
             "archive_limit": 480,
         },
+        "random-research": {
+            "population_size": 144,
+            "generations": 62,
+            "rounds": 30,
+            "attacker_population_size": 104,
+            "attacker_generations": 22,
+            "elite_pool": 72,
+            "archive_limit": 720,
+        },
     },
 }
 
@@ -356,6 +409,8 @@ def mode_summary(mode: str) -> str:
         return "Balanced exploitation/exploration."
     if mode == "paper":
         return "Paper-grade default: shorter high-variance rounds, tighter fractions, and runtime auto-tuning."
+    if mode == "random-research":
+        return "Stochastic-first research: stronger mutation/novelty, wider attacker panels, stricter sync gates."
     if mode == "conclusion":
         return "Strong default for full empirical conclusions and improvement discovery."
     if mode == "dynamic":

@@ -908,9 +908,13 @@ def _build_inputs(
     last_token_hint: int,
 ) -> Dict[str, float]:
     lane_den = float(max(1, x - 1))
-    token_hint = float(last_token_hint & ((1 << 24) - 1)) / float(1 << 24)
+    _ = last_token_hint
     phi_low = float(int.from_bytes(phase.phi[:4], "big") & ((1 << 24) - 1)) / float(1 << 24)
     phase_mix = float((phase.u1 ^ phase.u2 ^ phase.u3) & ((1 << 24) - 1)) / float(1 << 24)
+    # Keep all defender inputs provider-observable (time/phase/lane only): avoid
+    # dependencies on previously emitted lane tokens that would require side channels.
+    public_lane_hint = float(((t + lane_idx + phase.u1 + phase.u2) % 251)) / 251.0
+    public_phase_hint = float(((phase.u1 ^ phase.u3 ^ t ^ lane_idx) & ((1 << 24) - 1))) / float(1 << 24)
     return {
         "d$0": float(phase.a) / float(params.P),
         "d$1": float(phase.b) / float(params.Q),
@@ -921,13 +925,13 @@ def _build_inputs(
         "d$6": float(lane_idx) / lane_den,
         "d$7": float(t % x) / lane_den,
         "d$8": float((t + lane_idx) % 97) / 97.0,
-        "d$9": token_hint,
+        "d$9": public_lane_hint,
         "d$10": float((t // max(1, x)) % 29) / 29.0,
         "d$11": 1.0,
         "d$12": phi_low,
         "d$13": phase_mix,
         "d$14": float((phase.a + phase.c + lane_idx) % 97) / 97.0,
-        "d$15": float((last_token_hint ^ int.from_bytes(phase.phi[-4:], "big")) & ((1 << 24) - 1)) / float(1 << 24),
+        "d$15": public_phase_hint,
         "d$16": float((lane_idx * (1 + (phase.b % 7))) % max(2, x + 1)) / float(max(2, x + 1)),
         "d$17": float((t + 1) % 113) / 113.0,
     }

@@ -52,6 +52,7 @@ PRECISION_TRACK_CHOICES = (
     "supervisor",
     "lane-pressure",
     "evaluability",
+    "random-research",
 )
 
 _KOMPUTE_SELFTEST_SHADER_SOURCE = """#version 450
@@ -881,7 +882,63 @@ def _precision_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, Any
             float(base["debug_eval_log_interval_seconds"]),
         ),
     }
-    return [baseline, supervisor, lane_pressure, evaluability]
+    random_research = {
+        **base,
+        "strategy": "random-research",
+        "description": (
+            "Stochastic-first lane: high novelty/mutation pressure, broader attacker panel, "
+            "and stricter sync-loss gating for random-search discovery."
+        ),
+        "parent_pool_ratio": _clamp_float(
+            min(float(base["parent_pool_ratio"]), 0.34),
+            0.20,
+            0.50,
+        ),
+        "stagnation_patience": 1,
+        "mutation_floor": _clamp_float(max(0.30, float(base["mutation_floor"])), 0.18, 0.95),
+        "mutation_ceiling": _clamp_float(max(0.96, float(base["mutation_ceiling"])), 0.72, 0.99),
+        "mutation_step": _clamp_float(max(0.16, float(base["mutation_step"])), 0.06, 0.35),
+        "quick_cycle_fraction": _clamp_float(min(float(base["quick_cycle_fraction"]), 0.10), 0.04, 0.30),
+        "mid_cycle_fraction": _clamp_float(min(float(base["mid_cycle_fraction"]), 0.34), 0.16, 0.70),
+        "quick_keep_ratio": _clamp_float(min(float(base["quick_keep_ratio"]), 0.48), 0.18, 0.72),
+        "mid_keep_ratio": _clamp_float(min(float(base["mid_keep_ratio"]), 0.20), 0.08, 0.45),
+        "key_variants": max(6, int(base["key_variants"])),
+        "novelty_bonus": max(0.22, float(base["novelty_bonus"])),
+        "predictive_penalty": max(0.11, float(base["predictive_penalty"])),
+        "sync_loss_gate_percentile": _clamp_float(
+            min(float(base["sync_loss_gate_percentile"]), 0.54),
+            0.0,
+            1.0,
+        ),
+        "sync_loss_gate_penalty": max(0.15, float(base["sync_loss_gate_penalty"])),
+        "sync_loss_gate_flat_boost": max(
+            0.11,
+            float(base["sync_loss_gate_flat_boost"]),
+        ),
+        "anti_neutrality_window": max(6, min(int(base["anti_neutrality_window"]), 9)),
+        "anti_neutrality_penalty": max(0.035, float(base["anti_neutrality_penalty"])),
+        "anti_neutrality_bonus": max(0.018, float(base["anti_neutrality_bonus"])),
+        "attacker_panel_size": max(5, int(base["attacker_panel_size"])),
+        "attacker_panel_penalty": max(0.24, float(base["attacker_panel_penalty"])),
+        "target_generation_seconds": max(
+            3.0,
+            float(base["target_generation_seconds"]),
+        ),
+        "max_eval_cache_entries": max(
+            int(base["max_eval_cache_entries"]),
+            int(round(float(base["max_eval_cache_entries"]) * 1.30)),
+        ),
+        "max_test_time_seconds": max(20.0, float(base["max_test_time_seconds"])),
+        "debug_eval_timeout_seconds": max(
+            75.0,
+            float(base["debug_eval_timeout_seconds"]),
+        ),
+        "debug_eval_log_interval_seconds": max(
+            15.0,
+            float(base["debug_eval_log_interval_seconds"]),
+        ),
+    }
+    return [baseline, supervisor, lane_pressure, evaluability, random_research]
 
 
 def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, Any]]:
@@ -905,7 +962,7 @@ def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, An
         "strategy": "base",
         "description": "Resolved runner defaults as-is.",
     }
-    if mode != "paper":
+    if mode not in {"paper", "random-research"}:
         return [base]
 
     dynamic = {
@@ -958,6 +1015,52 @@ def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, An
         "target_generation_seconds": _clamp_float(base["target_generation_seconds"] * 0.88, 0.60, 4.0),
         "max_eval_cache_entries": max(15000, int(round(base["max_eval_cache_entries"] * 1.18))),
     }
+    random_research = {
+        **base,
+        "strategy": "random-research",
+        "description": (
+            "Stochastic-first continuous lane: high novelty pressure with stricter sync/evaluability gates."
+        ),
+        "parent_pool_ratio": _clamp_float(min(base["parent_pool_ratio"], 0.32), 0.20, 0.50),
+        "stagnation_patience": 1,
+        "mutation_floor": _clamp_float(max(0.30, base["mutation_floor"]), 0.18, 0.95),
+        "mutation_ceiling": _clamp_float(max(0.96, base["mutation_ceiling"]), 0.72, 0.99),
+        "mutation_step": _clamp_float(max(0.16, base["mutation_step"]), 0.06, 0.35),
+        "quick_cycle_fraction": _clamp_float(min(base["quick_cycle_fraction"], 0.10), 0.04, 0.30),
+        "mid_cycle_fraction": _clamp_float(min(base["mid_cycle_fraction"], 0.34), 0.16, 0.70),
+        "quick_keep_ratio": _clamp_float(min(base["quick_keep_ratio"], 0.48), 0.18, 0.72),
+        "mid_keep_ratio": _clamp_float(min(base["mid_keep_ratio"], 0.20), 0.08, 0.45),
+        "key_variants": max(6, base["key_variants"]),
+        "novelty_bonus": _clamp_float(max(0.22, base["novelty_bonus"]), 0.08, 0.35),
+        "predictive_penalty": _clamp_float(max(0.11, base["predictive_penalty"]), 0.04, 0.28),
+        "sync_loss_gate_percentile": _clamp_float(min(base["sync_loss_gate_percentile"], 0.54), 0.30, 0.90),
+        "sync_loss_gate_penalty": _clamp_float(max(0.15, base["sync_loss_gate_penalty"]), 0.02, 0.40),
+        "sync_loss_gate_flat_boost": _clamp_float(max(0.11, base["sync_loss_gate_flat_boost"]), 0.00, 0.40),
+        "anti_neutrality_window": max(6, min(base["anti_neutrality_window"], 9)),
+        "anti_neutrality_penalty": _clamp_float(max(0.035, base["anti_neutrality_penalty"]), 0.00, 0.30),
+        "anti_neutrality_bonus": _clamp_float(max(0.018, base["anti_neutrality_bonus"]), 0.00, 0.20),
+        "attacker_panel_size": max(5, base["attacker_panel_size"]),
+        "attacker_panel_penalty": _clamp_float(max(0.24, base["attacker_panel_penalty"]), 0.00, 0.45),
+        "target_generation_seconds": _clamp_float(max(3.0, base["target_generation_seconds"]), 1.0, 6.0),
+        "max_eval_cache_entries": max(18000, int(round(base["max_eval_cache_entries"] * 1.30))),
+        "max_test_time_seconds": max(20.0, base["max_test_time_seconds"]),
+        "debug_eval_timeout_seconds": max(75.0, base["debug_eval_timeout_seconds"]),
+        "debug_eval_log_interval_seconds": max(15.0, base["debug_eval_log_interval_seconds"]),
+    }
+    random_research_audit = {
+        **random_research,
+        "strategy": "random-research-audit",
+        "description": (
+            "Random-search audit lane: same stochastic pressure with reduced predictive shortcuts for evaluability."
+        ),
+        "statistical_predictive": False,
+        "auto_statistical_tuning": False,
+        "parallel_backend": "thread",
+        "round_parallelism": 1,
+        "minimum_parallel_rounds": 1,
+    }
+    if mode == "random-research":
+        return [random_research, random_research_audit]
     return [dynamic, explorer]
 
 
@@ -2785,7 +2888,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Runner orchestration style: `single` keeps current behavior; "
             "`precision` launches targeted tracks that reduce blind shortcuts and "
-            "separate baseline, supervision, lane-pressure, and evaluability lanes."
+            "separate baseline, supervision, lane-pressure, evaluability, and random-research lanes."
         ),
     )
     parser.add_argument(
