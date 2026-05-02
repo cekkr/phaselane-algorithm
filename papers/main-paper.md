@@ -9,7 +9,7 @@
 Version 1.6 - 15 January 2026
 
 ## Abstract
-I present the Prime-Compound Phase-Lane Token Protocol (PCPL), a no-handshake token system where a device emits one token per cycle and exactly one provider can validate it. PCPL combines (1) a public phase clock derived from coprime residues, (2) hidden prime-compound bouquets per provider, and (3) device-only state evolution that chains all lanes. I also introduce the symmetric continuous tokenizer device model, motivated by FPGA-based dynamic hash circuits and twin circuits for peer validation. A step-by-step algorithm description, correctness properties, and a deterministic simulation trace are provided. [1][2][3][15][16]
+I present the Prime-Compound Phase-Lane Token Protocol (PCPL), a no-handshake token system where a device emits one token per cycle and exactly one provider can validate it. PCPL combines (1) a public phase clock derived from coprime residues, (2) hidden prime-compound bouquets per provider, (3) a private per-block lane permutation, and (4) device-side state evolution that chains all lanes. The latest full co-evolution run strengthens the main design reading: the protocol invariants are easy to preserve, but practical circuits should be split into a sparse feed-forward token core and an explicit supervisory synchronization layer. The evolved attackers mostly learn lane exposure from public timing features, not token material; the dominant unresolved weakness is long-horizon drift and route-hardening, not basic one-of-$x$ correctness. I also introduce the symmetric continuous tokenizer device model, motivated by FPGA-based dynamic hash circuits and twin circuits for peer validation. A step-by-step algorithm description, correctness properties, deterministic traces, and offline design-search results are provided. [1][2][3][15][16]
 
 ## 1. Symmetric continuous tokenizer devices
 PCPL runs on a “symmetric continuous tokenizer” device designed for consumer computing. The device is envisioned as a reconfigurable hardware unit (for example, an FPGA-based key) that can:
@@ -206,6 +206,7 @@ The protocol uses:
 2. A per-block permutation schedule to enforce “returns every $x$”.
 3. Hidden bouquets to derive lane-specific tokens.
 4. Device-only seed evolution that chains all lanes.
+5. A practical control split: a deterministic hot token core and a slower supervisory layer for clock drift, route pressure, and recovery.
 
 ### 4.1 User device circuit (emitter)
 The device knows the full schedule and all lane secrets, so it computes only the
@@ -273,6 +274,43 @@ which lane index is used and whether device-only state is updated.
 - **Shared per-cycle hash pipeline (device + provider):** for a given lane index $i$ and cycle $t$, compute $\Phi_t$, then $EA_i(t), EB_i(t), EC_i(t)$, then $K_i(t)$ and $T_i(t)$ using the canonical encoding and domain tags. This runs every cycle.
 - **Device-only additions:** compute $\mathrm{idx}_t$ from `perm_key`, evaluate only that lane, emit $T_{\mathrm{idx}_t}(t)$, update $W[\mathrm{idx}_t]$, and evolve $S_{t+1}$ from all $W$ and chain products. This makes every emitted token influence future cycles.
 - **Provider-only behavior:** for its fixed lane $i$, compute $T_i(t)$ every cycle and compare against any received token. Exactly 1-of-$x$ cycles match because the device selects each lane once per block. Providers do not know `perm_key` and do not maintain $S_t$ or $W[ ]$.
+
+### 4.4 Practical circuit split after co-evolution
+The offline Evolvo runs suggest that PCPL should not be implemented as one large
+branch-heavy controller. The robust family is a compact token datapath with
+sparse bouquet activation; the weak family is any design that tries to hide
+long-horizon synchronization logic inside the per-cycle token mixer.
+
+The practical architecture is therefore two-layered:
+
+- **Hot token core:** every cycle, compute phase residues, select a small active
+  subset of bouquet compounds, evaluate the modular products, derive $K_i(t)$,
+  derive $T_i(t)$, and update the device's state register. This path should be
+  deterministic, branch-light, and native-hardware friendly.
+- **Supervisory layer:** over a slower window, observe drift, missed accepts,
+  reject density, route-prediction pressure, native execution saturation, and
+  resynchronization events. This layer may change policy limits (active-count
+  bounds, jitter bounds, lane-salt epochs, recovery windows), but it should not
+  make the provider unable to recompute the current lane token.
+
+```mermaid
+%%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
+flowchart TD
+  Clock["Public epoch and phase clock"] --> Hot["Hot token core"]
+  Bouquets["Provider/lane bouquets"] --> Hot
+  Policy["Small deterministic policy vector<br/>active count, kernel, salt, jitter bounds"] --> Hot
+  Hot --> Token["T_i(t)"]
+  Hot --> State["Device state update<br/>W[i], chain products, S"]
+
+  Obs["Window observations<br/>drift, misses, rejects, lane pressure, runtime"] --> Sup["Supervisory resync/control layer"]
+  Sup --> Policy
+  Sup --> Window["resync window and mode limits"]
+  Window --> Hot
+```
+
+This split changes the implementation strategy, not the core correctness
+argument. The exact 1-of-$x$ property still comes from the block permutation;
+the token value still comes from deterministic lane recomputation.
 
 ## 5. Step-by-step algorithm
 
@@ -797,6 +835,76 @@ Notes:
   must use the **same** expansion.
 - Providers do **not** need `perm_key` and do not need to know `π_B` to validate. In practice they run the per-cycle hash pipeline continuously and compare against the current (or ±Δ window) expected token when contacted.
 
+### 5.9 Policy-controlled sparse bouquet evaluation
+
+The reference pseudocode evaluates every compound in a bouquet. That is the
+simplest specification, but it is not the only practical circuit profile. The
+latest co-evolution run repeatedly favored **sparse bouquet activation**: keep a
+larger hidden bouquet inventory, but activate only a small deterministic subset
+per cycle.
+
+Let a deterministic policy circuit produce a bounded control vector:
+
+$$
+\Theta_i(t)=\left(
+\rho_i,\kappa_i,\sigma_i,\mu_i,\eta_i,h_i,\beta_i,\chi_i,\lambda_i,\tau_i,\jmath_i
+\right).
+$$
+
+The intended meanings are:
+
+- $\rho_i$: active-ratio control
+- $\kappa_i$: token-mixing kernel selector
+- $\sigma_i$: subset stride seed
+- $\mu_i$: state-mix control
+- $\eta_i$: exponent-bias control
+- $h_i$: bounded hash-round count
+- $\beta_i$: bouquet-spread control
+- $\chi_i$: state-churn control
+- $\lambda_i$: lane-salt control
+- $\tau_i$: token-scramble control
+- $\jmath_i$: phase-jitter control
+
+For a bouquet of length $n$, define:
+
+$$
+\alpha_i(t)=\mathrm{clip}\left(\rho_i(t)\cdot(0.55+0.45\beta_i(t)),\,0,\,1\right),
+$$
+
+$$
+r_i(t)=1+\left\lfloor \alpha_i(t)(n-1)\right\rfloor.
+$$
+
+Then replace `EvalBouquet` with a deterministic subset evaluator:
+
+$$
+\mathrm{EvalSparse}(\mathcal{B},x_{\mathrm{res}},u,\Theta_i)
+=\prod_{j\in\mathcal{I}(\mathcal{B},r_i,\sigma_i,\lambda_i,\jmath_i,t)}
+C_j^{e'_j} \bmod M,
+$$
+
+where $\mathcal{I}$ is a deterministic subset of size $r_i(t)$ and
+$e'_j$ is the usual `EXP` exponent with an optional bounded exponent bias
+derived from $\eta_i(t)$. Kernel selection $\kappa_i$ then chooses a small
+native-friendly mixer over $EA,EB,EC,\Phi_t,\lambda_i$ before the `KDF` step.
+
+The blind-provider contract imposes an important restriction: every input used
+by $\Theta_i(t)$ must be public or provider-observable. A simulator can expose
+`last_token_hint` or other global history to all lane computations, but a real
+provider cannot recompute such a path unless the hint is broadcast or carried in
+the message. Therefore a production policy circuit should be constrained to:
+
+- public phase values and cycle counters,
+- the provider's own lane identifier and public slot information,
+- explicit public hints included in the token message,
+- deterministic lane-local history only when both the device and that provider
+  can derive the same value without a new handshake.
+
+It should not depend on device-only state, other providers' bouquets, or hidden
+tokens sent only to other lanes. Provider-local replay bookkeeping is still
+useful, but it belongs outside token derivation unless it is mirrored by the
+device or encoded as an explicit public hint.
+
 
 ## 6. Correctness and periodicity
 
@@ -870,6 +978,8 @@ For composite $x$ (e.g., $6=2\cdot 3$), choose $P,Q,R$ coprime with all prime fa
 - **Lane isolation:** each provider uses distinct secret bouquets, so observing one lane does not reveal others.
 - **Phase coupling:** public residues are mixed and hashed, preventing linear predictability from the CRT clock alone.
 - **Device chaining:** even stale lanes influence future state, reinforcing the requirement that “every token matters”.
+- **Route hardening:** attackers may still gain small lane-prediction advantages from public timing and phase features, so schedule decorrelation and lane-salt diversity should be tested directly.
+- **Provider-observable control:** any practical policy controller must use only inputs that the intended provider can recompute; simulator-only global history can create a false sense of validity.
 - **Quantum period-finding:** QFT can reveal the public period $\mathrm{lcm}(P,Q,R,x)$ but not the hidden bouquets or $\mathrm{perm\_key}$; use large coprimes and device-only chaining to avoid exploitable structure.
 
 ## 8. Experimental validation (deterministic simulation and offline search)
@@ -967,29 +1077,161 @@ flowchart TB
 
 Additional multi-configuration outputs (other compound modes and seeds) are intended as supplementary material.
 
-### 8.5 Evolutionary interpretation (qualitative)
-In this work, evolutionary campaigns are interpreted as automated design-space exploration: they search for high-performing circuit/algorithm candidates, then support qualitative conclusions from score differences. They do not redefine protocol semantics and do not replace correctness arguments.
+### 8.5 Latest Evolvo run: interpretation and constraints
+Evolutionary campaigns are used here as automated design-space exploration. They
+search for circuit policies that survive fixed objectives; they do not redefine
+PCPL semantics and they do not replace the correctness arguments in §6.
 
-The current long run (`20260425-153845-full`, rounds `0000..0020` currently available, with the run still marked `running`) reveals a concrete defender family rather than a vague score trend. Of the 21 completed rounds, 9 produce valid final defender metrics and 12 are skipped as `missing-defender-metrics`. The best valid defender is `round-0013` with score `0.48497968` and score delta `+0.02676134` versus the reference anchor. The highest-scoring valid defenders keep the same ten-output arithmetic PCPL output slots, usually implemented as the suffix (`ADD`, `MOD`, `MUL`, `PCPL_HASHMIX`, `PCPL_PHASEMIX`, `SUB`, `PCPL_MODHASH`, `ADD`, `PCPL_HASHMIX`, `MOD`), while the evolved variation is concentrated in a very short prelude of list/constant instructions. In other words, search is repeatedly selecting the same arithmetic PCPL spine and only retuning the scalar biases that feed it.
+The latest full run analyzed for this version is
+`demo/pcpl-evolvo/runs/20260430-223959-full`. The directory is still marked
+`running`, but only rounds `0000..0024` contain final `round-results.json`
+artifacts. Rounds `0025..0029` contain progress markers only, so they are
+excluded from the conclusions.
 
-The strongest practical motif is sparse bouquet activation. The best valid defender in the current run reaches `cost_score = 0.89` with `device_compound_ratio = provider_compound_ratio = 0.20`; with `compound_count = 5`, this means it is effectively using about one active compound per bouquet on average. The next valid families sit around `0.3333` and `0.40`, or about 1.7 to 2 active compounds out of 5, while the densest valid family in this run (`0.6533`) is the weakest valid defender. This is a design conclusion, not merely a cost statistic: the practical PCPL circuit appears to prefer a large hidden bouquet inventory with a small active subset per cycle.
+Grounding facts:
 
-The attacker side converges to an even simpler family: a linear public-phase predictor. The best attacker reaches score `0.01624339`, but token-success stays at zero in every valid round. The non-zero attacker scores come from lane-prediction gains, with valid-round `attacker_lane_success_rate` averaging `0.17391993` and reaching `0.20287698` on a round mean. So the current empirical attack surface is better described as route/lane inference from public structure than as token inversion.
+- `25/25` completed rounds are valid; no completed round is skipped.
+- The best defender is round `0003`, score `0.48790812`, robust score
+  `0.48778643`, signature `d6d8447924aab2f1ad06eb212ee87528`.
+- The best attacker is round `0020`, score `0.01624339`, signature
+  `b5cc30b5e97a2561b070325044f3ed84`.
+- Round-mean defender score is `0.47850353`, with a narrow range
+  `0.46895106..0.48790812`.
+- Same-round reference-anchor deltas are positive on average
+  (`+0.017303`, max `+0.028941`), but the best evolved defender does not beat
+  the fixed baseline table: `reference-full = 0.5082`, `balanced = 0.5170`,
+  and `minimal-cost = 0.5326`.
 
-The same run clarifies the unresolved weakness. Principle/permutation correctness, linear-rank behavior, and operation-cost score saturate at `1.0` in all valid rounds, and valid-round `security_score` averages `0.99812948`. But `horizon_sync_score` remains near zero: valid-round mean `0.00311237`, best valid-round mean `0.00604454`, with projected sync-loss averaging `0.99688763`. This means PCPL token correctness is easy to preserve, while long-horizon drift control is not. The right architectural reading is that the hot token core and the supervisory resynchronization logic should be treated as related but distinct layers.
+Across the `150` final scenario rows, the core PCPL checks saturate:
+one-of-$x$, block-once, permutation-valid, attack-reject, twin-sync, and
+timing-reject rates all have mean/min/max `1.0`; cross-lane collision, replay,
+and shared-device match rates all remain `0.0`. This is the strongest empirical
+claim from the run: the PCPL routing and recomputation invariants are preserved
+under the searched policies.
 
-Finally, the run shows the present limit of the search process itself: all 21 currently available rounds keep the generation-0 defender as the round winner, and 12 rounds fail final metric production as `missing-defender-metrics` (11 explicitly after `timeout-collapse-before-expand`). The later completed segment, `round-0014` through `round-0020`, is entirely unevaluable. So the evolutionary campaign is presently better at identifying robust circuit families and obvious failure families than at inventing steadily stronger controllers within each round.
+The unresolved metrics are elsewhere:
 
-### 8.6 Practical circuit/algorithm changes derived from the search
-The current evidence suggests five concrete changes, some at circuit architecture level and some at search level:
+- projected sync-loss mean `0.995123`
+- horizon-sync mean `0.004877`
+- sync-score mean `0.528241`
+- runtime-score mean `0.222373`
+- control-flow-score mean `0.192910`
 
-1. Implement PCPL as a **two-layer circuit**: a small feed-forward token core for per-cycle work, plus a slower supervisory resync/controller layer for drift handling and mode switching.
-2. Treat **sparse bouquet activation** as a first-class mechanism. The best valid defender evaluates about 1 active compound out of 5, and the next stable families remain around 1.7-2 active compounds rather than the whole bouquet.
-3. Keep **branch logic near mode boundaries** rather than inside the hot token path. The successful circuits mostly bias and select; they do not rely on rich per-cycle branching.
-4. Focus adversarial evaluation on **lane/route inference** as well as token guessing. In the current run, attacker gains come from schedule correlation, not from token recovery.
-5. Hard-gate archive promotion and final ranking on **full-scenario evaluability**. Candidates that survive progressive selection but fail final metric generation are not usable PCPL circuits and should not shape the archive.
+This separates the paper's claims. PCPL's lane-selection and token-separation
+properties are stable in the simulation; long-horizon synchronization and
+hardware execution coverage remain practical circuit problems.
 
-These changes do not alter PCPL semantics. They refine how the protocol should be implemented in practice and how evolutionary search should be constrained so it discovers circuits that are both semantically meaningful and operationally evaluable.
+#### Defender family
+The best defender is a short GFSL program:
+
+```text
+d$24 = PCPL_PHASEMIX(d$8, d$9)
+FUNC d&0
+d!0 = PREPEND(-1.0)
+d$0 = FIFO(d!0)
+d$20 = ADD(d$0, d$1)
+d$21 = MOD(d$2, d$3)
+d$22 = MUL(d$4, d$5)
+d$23 = PCPL_HASHMIX(d$6, d$7)
+d$25 = SUB(d$10, d$6)
+d$26 = PCPL_MODHASH(d$3, d$11)
+d$28 = PCPL_HASHMIX(d$2, d$9)
+d$27 = CALL(d&0)
+```
+
+The important conclusion is not the exact instruction list; it is the shape of
+the circuit. The winning family is a compact PCPL arithmetic spine with small
+bias terms and PCPL-specific mixers. It does not use rich branch logic in the
+hot path. Its mean control-flow score is only about `0.193`, while the hard
+protocol invariants remain perfect.
+
+The strongest implementation motif is sparse activation. The best two defenders
+use a device compound ratio of `0.20`, which corresponds to one active compound
+out of five in the evaluated mid-stage scenarios. The `0.40` bucket forms a
+large plateau, and the `0.60` bucket has the lowest mean defender score. In this
+objective family, bouquet size should be treated as hidden inventory, while
+active compound count should be treated as a separate per-cycle budget.
+
+There is also a contract warning. The best evolved genome uses `d$9`, which in
+the simulator is a `last_token_hint`, in two control outputs. A real blind
+provider can recompute such a path only if that previous-token hint is public,
+broadcast, or carried in the message. If tokens are delivered only to their
+active provider, future controller search must forbid non-provider-observable
+inputs in provider-side token derivation.
+
+#### Attacker family
+The strongest attackers are small public-feature predictors. The best attacker
+is:
+
+```text
+d!0 = APPEND(2.0)
+d$0 = FILO(d!0)
+d$1 = FILO(d!0)
+d$40 = ADD(d$6, d$0)
+d$41 = ADD(d$7, d$1)
+d$42 = ADD(d$8, d$2)
+```
+
+This is lane inference, not token inversion. The strongest attacker reaches
+round-mean lane success `0.2029`, but token success is `0.0000` for that best
+attacker. Across all valid rounds, token-success mean is only `0.000045`, with
+an observed max `0.001134` in the low-bit attack benchmark. The practical
+attacker objective should therefore include route/lane prediction, not only
+token guessing.
+
+#### Search and execution limits
+The run is more evaluable than the previous `20260425-153845-full` evidence
+because every completed round has final metrics. It is still not a clean
+open-ended optimizer:
+
+- timeout recheck and timeout rescue are used in `25/25` rounds
+- `timeout-collapse-before-expand` appears `20` times in progressive stopping
+- generation-0 defender survives final selection in `7/25` rounds
+- defender generation logs show mean timeout ratio `0.6831` and mean valid ratio
+  `0.0251`
+- attacker generation logs show mean timeout ratio `0.9284`
+
+Native execution is also partial, not complete. Final scenario metrics contain
+about `1,005,817` GPU dispatches and `568,974` CPU fallback dispatches, for an
+aggregate GPU dispatch share of about `0.6387`. Hardware-oriented PCPL circuits
+should therefore penalize operations that compile into frequent CPU fallback.
+
+### 8.6 Circuit and algorithm changes derived from the search
+The latest run changes the practical PCPL design in seven ways:
+
+1. **Use a two-layer circuit.** Keep the hot path as phase, sparse bouquet
+   products, bounded mixing, KDF, token hash, and state-register update. Put
+   drift estimation, route-pressure response, and resync windows in a slower
+   supervisory layer.
+2. **Make active compound count explicit.** A production profile should specify
+   bouquet inventory size and active subset size separately. The current useful
+   region is one to two active compounds out of five under the tested scoring
+   family.
+3. **Constrain policy inputs.** Every control input used by the provider-side
+   token derivation must be public, mirrored lane-local state, or carried in the
+   message. Search should reject candidates that rely on simulator-only global
+   history.
+4. **Keep the hot path branch-light.** The successful defenders mostly bias and
+   select; they do not discover a dense branch tree. Branching belongs at mode
+   boundaries and in the supervisory layer.
+5. **Promote lane-hardening.** Since attackers gain through route inference,
+   hardening should target lane salt diversity, schedule decorrelation,
+   phase-jitter bounds, and attacker panels specialized for lane prediction.
+6. **Report sync separately from token correctness.** A candidate with perfect
+   one-of-$x$ and zero replay can still have poor horizon sync. Future reports
+   should split `token-core correctness/efficiency` from
+   `supervisory horizon-sync recovery`.
+7. **Gate on evaluability and native coverage.** Archive promotion should
+   require final scenario metrics, bounded timeout ratio, and acceptable
+   GPU/native coverage. Score alone is not enough.
+
+Open issues remain. The current evaluator's long-horizon sync model is a useful
+pressure signal, but it is not yet a physical timing proof. QFT and linear-rank
+metrics validate important public-period and pre-hash properties, but they are
+nearly constant in this scenario family and provide little evolutionary
+gradient. Finally, the fixed `minimal-cost` baseline currently beats the evolved
+controllers, so future work should treat the evolved genomes as evidence for
+architecture and constraints, not as final optimal circuits.
 
 ## 9. Discussion and limitations
 - Parameter choice matters; $P, Q, R, M$ must be prime and pairwise coprime.
@@ -997,19 +1239,25 @@ These changes do not alter PCPL semantics. They refine how the protocol should b
 - The security of the scheme relies on the strength of $H(\cdot)$ and the secrecy of bouquets, not on the hardness of factoring revealed integers.
 - The public period $\mathrm{lcm}(P,Q,R,x)$ is visible (and QFT-recoverable), so period size should be chosen large enough for the deployment horizon.
 - For testing, primes and compound bases can be generated from a seeded stream to avoid arbitrary constants. [6][7]
-- Current co-evolution evidence suggests that the most practical defender family is a sparse selector over a fixed arithmetic PCPL core, not a dense universal controller; in the latest full run, the best valid defender uses about 1 active compound out of 5.
-- Long-horizon synchronization remains the dominant practical weakness in current evolutionary studies: resynchronization can recover state, but projected drift-loss can still dominate the residual error budget.
-- Current attacker evidence is stronger on lane inference than on token inversion: attackers exploit public schedule correlation, while token-success stays at zero in the valid rounds studied here.
-- Practical optimization should prioritize phase-error regulation, horizon-sync gating, and attacker-coupled defender robustness before further cost compression.
+- Current co-evolution evidence suggests that the most practical defender family is a sparse selector over a fixed arithmetic PCPL core, not a dense universal controller; in the latest full run, the strongest bucket uses about 1 active compound out of 5.
+- Sparse activation should not be confused with weak provisioning. The bouquet inventory can remain large; only the per-cycle active subset is small.
+- Long-horizon synchronization remains the dominant practical weakness: resynchronization logic must be specified as a supervisory circuit with explicit drift and recovery bounds.
+- Current attacker evidence is stronger on lane inference than on token inversion. Route-hardening should be evaluated directly, because attackers can gain small advantages from public timing and phase features even when token guesses fail.
+- Provider-side recomputation requires a strict input contract. Policy circuits must not depend on device-only state or on tokens sent only to other providers unless those values are explicitly made public.
+- Practical optimization should prioritize phase-error regulation, horizon-sync gating, lane-hardening, and native execution coverage before further cost compression.
 - Empirical score values are not absolute physical constants; they depend on the chosen objective set and weights. For this reason, cross-run comparisons should include explicit objective-version metadata.
 - Some auxiliary terms (for example QFT/linear-rank/compare-$x$) can become near-constant under fixed scenario families; when this happens, they validate constraints but provide limited evolutionary gradient.
-- Plateau control matters: prolonged repeated phenotypes should be treated as a search-pathology signal and countered with anti-neutrality mechanisms.
-- Some co-evolution rounds can survive progressive selection yet fail final metric production under the real evaluation budget; in the latest full run, 12 of 21 completed rounds are skipped as `missing-defender-metrics`, so archive acceptance needs hard evaluability gates.
+- Plateau and timeout control matter: the latest full run has valid completed rounds, but every completed round still uses timeout rescue and the generation logs show heavy timeout pressure.
+- Archive acceptance needs hard gates for final-metric availability, provider-observable inputs, bounded timeout ratio, and native execution coverage.
 - Evolutionary search is heuristic optimization, not a formal proof technique; correctness remains grounded in the protocol construction and invariants.
 - This paper was developed and formatted with the help of OpenAI models.
 
 ## 10. Conclusion
-PCPL provides a deterministic, no-handshake token protocol with exact 1-of-$x$ matching and a device-only chaining mechanism. Combined with symmetric continuous tokenizer devices, it supports both provider validation and peer-to-peer isolation with dynamic, evolving secrets. The current simulation and co-evolution evidence supports a more precise implementation reading: the most practical PCPL circuits are sparse, feed-forward arithmetic token cores with small bias terms, while the main remaining challenge is not token correctness but long-horizon synchronization supervision and resistance to lane-prediction leakage. The protocol therefore looks strongest when implemented as a compact hot-path tokenizer coupled to an explicit supervisory resync/control layer, while evolutionary search is used to identify robust circuit families and failure families rather than to stand in for the protocol's correctness argument.
+PCPL provides a deterministic, no-handshake token protocol with exact 1-of-$x$ matching and a device-only chaining mechanism. Combined with symmetric continuous tokenizer devices, it supports provider validation and peer-to-peer isolation with dynamic, evolving secrets.
+
+The latest deterministic and evolutionary evidence makes the implementation direction more precise. The core token protocol is stable: permutation validity, per-block fairness, one-of-$x$ matching, replay rejection, and cross-lane separation saturate in the completed full run. The practical circuit should therefore not be a large opaque controller. It should be a sparse, feed-forward arithmetic token core coupled to a separate supervisory layer for drift, route pressure, resync windows, and hardware execution limits.
+
+The main remaining challenge is not token correctness. It is long-horizon synchronization, provider-observable control inputs, and resistance to lane-prediction leakage. Evolutionary search is useful for exposing these motifs and failure modes, but the protocol's correctness still comes from the construction: deterministic phase computation, private per-block permutation, domain-separated lane token derivation, and canonical recomputation by the intended provider.
 
 ## References
 1. [NIST FIPS 180-4 (Update 1), *Secure Hash Standard (SHS)*](https://csrc.nist.gov/pubs/fips/180-4/upd1/final)
