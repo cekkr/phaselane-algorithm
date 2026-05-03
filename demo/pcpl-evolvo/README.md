@@ -68,6 +68,8 @@ Current default preset:
 
 This default is tuned for stochastic-first research (broad exploration, strong attacker pressure, strict sync gating), not only quick smoke tests.
 
+When `--out-dir` is omitted, the runner now auto-resumes from the latest compatible run directory (unless `--no-resume` is set).
+
 ### List preset modes
 
 ```bash

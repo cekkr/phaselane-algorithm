@@ -2016,6 +2016,269 @@ def _normalize_json(value: Any) -> Any:
     return value
 
 
+def _read_json_dict(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _extract_explicit_cli_options(argv: List[str]) -> set[str]:
+    explicit: set[str] = set()
+    for token in argv:
+        if token == "--":
+            break
+        if not token.startswith("--"):
+            continue
+        if token == "--":
+            break
+        key = token.split("=", 1)[0].strip()
+        if key:
+            explicit.add(key)
+    return explicit
+
+
+def _option_explicit(explicit_options: set[str], *option_names: str) -> bool:
+    return any(str(option).strip() in explicit_options for option in option_names)
+
+
+def _run_dir_activity_ts(run_dir: Path) -> float:
+    ts = 0.0
+    for name in (".launcher-last.json", "results.json", "archive.json", "run-metadata.json"):
+        path = run_dir / name
+        try:
+            if path.exists():
+                ts = max(ts, float(path.stat().st_mtime))
+        except Exception:
+            continue
+    return ts
+
+
+def _check_run_dir_compatibility(run_dir: Path) -> Tuple[bool, str]:
+    if not run_dir.is_dir():
+        return False, "not-a-directory"
+    archive_path = run_dir / "archive.json"
+    results_path = run_dir / "results.json"
+    if not archive_path.exists():
+        return False, "missing-archive-json"
+    if not results_path.exists():
+        return False, "missing-results-json"
+    results_payload = _read_json_dict(results_path)
+    if not isinstance(results_payload, dict):
+        return False, "invalid-results-json"
+    config_payload = results_payload.get("config")
+    if not isinstance(config_payload, dict):
+        return False, "missing-results-config"
+    required_keys = (
+        "profile",
+        "population_size",
+        "generations",
+        "rounds",
+        "attacker_population_size",
+        "attacker_generations",
+        "elite_pool",
+        "archive_limit",
+    )
+    missing = [key for key in required_keys if key not in config_payload]
+    if missing:
+        return False, f"missing-config-keys:{','.join(missing)}"
+    return True, "ok"
+
+
+def _latest_compatible_run_dir(runs_root: Path) -> Tuple[Optional[Path], str]:
+    if not runs_root.is_dir():
+        return None, "runs-root-missing"
+    candidates: List[Path] = []
+    for entry in runs_root.iterdir():
+        if not entry.is_dir():
+            continue
+        ok, _reason = _check_run_dir_compatibility(entry)
+        if ok:
+            candidates.append(entry.resolve())
+    if not candidates:
+        return None, "no-compatible-run-found"
+    candidates.sort(key=_run_dir_activity_ts, reverse=True)
+    return candidates[0], "ok"
+
+
+def _read_archive_round_count(run_dir: Path) -> int:
+    payload = _read_json_dict(run_dir / "archive.json")
+    if not isinstance(payload, dict):
+        return 0
+    rounds_payload = payload.get("rounds", [])
+    if not isinstance(rounds_payload, list):
+        return 0
+    return int(len(rounds_payload))
+
+
+def _resolved_from_experiment_config_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    resolved: Dict[str, Any] = {}
+    if not isinstance(payload, dict):
+        return resolved
+    direct_keys = (
+        "seed",
+        "population_size",
+        "generations",
+        "initial_instructions",
+        "rounds",
+        "attacker_population_size",
+        "attacker_generations",
+        "elite_pool",
+        "archive_limit",
+        "parallel_backend",
+        "round_parallelism",
+        "minimum_parallel_rounds",
+        "max_cpu_utilization",
+        "max_gpu_utilization",
+        "round_state_sync",
+        "executor_backend",
+        "kompute_runtime_mode",
+        "kompute_warn_on_fallback",
+        "kompute_fail_hard",
+        "kompute_keep_vram_state",
+        "kompute_min_native_stage_count",
+        "kompute_min_native_stage_share",
+        "kompute_max_unsupported_count",
+        "kompute_max_unsupported_share",
+        "kompute_force_cpu_on_partial_coverage",
+        "kompute_native_enable_decimal",
+        "kompute_native_enable_boolean_compare",
+        "kompute_native_enable_boolean_logic",
+        "kompute_native_enable_list_query",
+        "kompute_allow_process_pool",
+        "parent_pool_ratio",
+        "stagnation_patience",
+        "mutation_floor",
+        "mutation_ceiling",
+        "mutation_step",
+        "statistical_predictive",
+        "quick_cycle_fraction",
+        "mid_cycle_fraction",
+        "quick_keep_ratio",
+        "mid_keep_ratio",
+        "novelty_bonus",
+        "predictive_penalty",
+        "sync_loss_gate_percentile",
+        "sync_loss_gate_penalty",
+        "sync_loss_gate_flat_boost",
+        "anti_neutrality_window",
+        "anti_neutrality_penalty",
+        "anti_neutrality_bonus",
+        "attacker_panel_size",
+        "attacker_panel_penalty",
+        "auto_statistical_tuning",
+        "target_generation_seconds",
+        "max_eval_cache_entries",
+        "device_mhz",
+        "provider_mhz",
+        "profile",
+        "resume",
+        "use_supervised_guide",
+        "supervised_end_round_only",
+        "supervised_hidden_layers",
+        "supervised_epochs",
+        "supervised_candidate_pool",
+        "supervised_capacity_auto_tune",
+        "debug_eval_timeout_seconds",
+        "debug_eval_log_interval_seconds",
+    )
+    for key in direct_keys:
+        if key in payload:
+            resolved[key] = payload.get(key)
+    if "parallel_workers" in payload:
+        resolved["workers"] = payload.get("parallel_workers")
+    if "preferred_device" in payload:
+        resolved["device"] = payload.get("preferred_device")
+    if "key_variant_count" in payload:
+        resolved["key_variants"] = payload.get("key_variant_count")
+    if "max_test_time_seconds" in payload:
+        resolved["max_test_seconds"] = payload.get("max_test_time_seconds")
+    return resolved
+
+
+def _load_previous_resolved_config(run_dir: Path) -> Dict[str, Any]:
+    launcher_state = _read_json_dict(run_dir / ".launcher-last.json")
+    if isinstance(launcher_state, dict):
+        payload = launcher_state.get("resolved_config")
+        if isinstance(payload, dict) and payload:
+            return dict(payload)
+
+    run_meta = _read_json_dict(run_dir / "run-metadata.json")
+    if isinstance(run_meta, dict):
+        launcher_meta = run_meta.get("launcher_meta")
+        if isinstance(launcher_meta, dict):
+            payload = launcher_meta.get("resolved_config")
+            if isinstance(payload, dict) and payload:
+                return dict(payload)
+        exp_cfg = run_meta.get("experiment_config")
+        if isinstance(exp_cfg, dict):
+            converted = _resolved_from_experiment_config_payload(exp_cfg)
+            if converted:
+                return converted
+
+    results_payload = _read_json_dict(run_dir / "results.json")
+    if isinstance(results_payload, dict):
+        cfg_payload = results_payload.get("config")
+        if isinstance(cfg_payload, dict):
+            converted = _resolved_from_experiment_config_payload(cfg_payload)
+            if converted:
+                return converted
+    return {}
+
+
+def _explicit_options_for_resolved_key(key: str) -> set[str]:
+    exceptions: Dict[str, set[str]] = {
+        "resume": {"--no-resume"},
+        "use_supervised_guide": {"--no-supervised-guide"},
+        "supervised_end_round_only": {
+            "--supervised-end-round-only",
+            "--no-supervised-end-round-only",
+        },
+        "supervised_capacity_auto_tune": {
+            "--supervised-capacity-auto-tune",
+            "--no-supervised-capacity-auto-tune",
+        },
+        "statistical_predictive": {"--no-statistical-predictive"},
+        "auto_statistical_tuning": {"--no-auto-statistical-tuning"},
+    }
+    if key in exceptions:
+        return set(exceptions[key])
+    return {f"--{str(key).replace('_', '-')}"}
+
+
+def _overlay_resolved_with_previous_defaults(
+    *,
+    current: Dict[str, Any],
+    previous: Dict[str, Any],
+    explicit_options: set[str],
+) -> Dict[str, Any]:
+    merged = dict(current)
+    for key, value in previous.items():
+        if key not in merged:
+            continue
+        required_tokens = _explicit_options_for_resolved_key(str(key))
+        if required_tokens and _option_explicit(explicit_options, *sorted(required_tokens)):
+            continue
+        merged[key] = value
+    return merged
+
+
+def _read_previous_launcher_state(run_dir: Path) -> Dict[str, Any]:
+    payload = _read_json_dict(run_dir / ".launcher-last.json")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_launcher_state(run_dir: Path, payload: Dict[str, Any]) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / ".launcher-last.json").write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+    )
+
+
 def _git_revision() -> str:
     try:
         output = subprocess.check_output(
@@ -2394,15 +2657,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-resume",
         action="store_true",
-        help="Do not load previous archive state from --out-dir.",
+        help=(
+            "Disable auto-resume behavior. By default (when --out-dir is omitted), "
+            "the latest compatible run under demo/pcpl-evolvo/runs is reused."
+        ),
     )
     parser.add_argument(
         "--out-dir",
         type=str,
         default="",
         help=(
-            "Output directory. Default: "
-            "demo/pcpl-evolvo/runs/<timestamp>-<profile>"
+            "Output directory. When omitted, auto-resume reuses the latest "
+            "compatible run (unless --no-resume is set); otherwise a new "
+            "timestamped directory is created."
         ),
     )
     parser.add_argument(
@@ -2936,8 +3203,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    raw_cli_argv = list(sys.argv[1:])
+    explicit_options = _extract_explicit_cli_options(raw_cli_argv)
     args = parse_args()
-    rounds_explicit = args.rounds is not None
+    rounds_explicit = _option_explicit(explicit_options, "--rounds")
     if args.list_modes:
         print("[pcpl-evolvo] available modes:")
         for name in available_modes():
@@ -2983,7 +3252,129 @@ def main() -> None:
         print(f"[pcpl-evolvo] materialized_summary={summary['materialized_summary_path']}")
         return
 
+    auto_resume_context: Optional[Dict[str, Any]] = None
+    should_attempt_auto_resume = (
+        (not bool(args.no_resume))
+        and (not bool(args.continuous))
+        and int(args.replicates) == 1
+        and str(args.experiment_suite).strip().lower() == "single"
+        and (not _option_explicit(explicit_options, "--out-dir"))
+    )
+    if should_attempt_auto_resume:
+        latest_run_dir, latest_reason = _latest_compatible_run_dir(PROJECT_DIR / "runs")
+        if latest_run_dir is not None:
+            previous_resolved = _load_previous_resolved_config(latest_run_dir)
+            previous_launcher_state = _read_previous_launcher_state(latest_run_dir)
+            if isinstance(previous_resolved, dict) and previous_resolved:
+                if (
+                    not _option_explicit(explicit_options, "--experiment-suite")
+                    and "experiment_suite" in previous_resolved
+                ):
+                    args.experiment_suite = str(previous_resolved.get("experiment_suite"))
+                if (
+                    not _option_explicit(explicit_options, "--precision-tracks")
+                    and "precision_tracks" in previous_resolved
+                ):
+                    prev_tracks = previous_resolved.get("precision_tracks")
+                    if isinstance(prev_tracks, (list, tuple)):
+                        args.precision_tracks = ",".join(str(item) for item in prev_tracks)
+                    elif prev_tracks is not None:
+                        args.precision_tracks = str(prev_tracks)
+                if (
+                    not _option_explicit(explicit_options, "--replicates")
+                    and "replicates" in previous_resolved
+                ):
+                    try:
+                        args.replicates = int(previous_resolved.get("replicates"))
+                    except Exception:
+                        pass
+                if (
+                    not _option_explicit(explicit_options, "--replicate-seed-step")
+                    and "replicate_seed_step" in previous_resolved
+                ):
+                    try:
+                        args.replicate_seed_step = int(
+                            previous_resolved.get("replicate_seed_step")
+                        )
+                    except Exception:
+                        pass
+                if (
+                    not _option_explicit(explicit_options, "--replicate-reference")
+                    and "replicate_reference" in previous_resolved
+                ):
+                    args.replicate_reference = str(
+                        previous_resolved.get("replicate_reference")
+                    )
+                if (
+                    not _option_explicit(explicit_options, "--analysis-tag")
+                    and "analysis_tag" in previous_resolved
+                ):
+                    args.analysis_tag = str(previous_resolved.get("analysis_tag") or "")
+                if (
+                    not _option_explicit(explicit_options, "--fitness-schema-version")
+                    and "fitness_schema_version" in previous_resolved
+                ):
+                    args.fitness_schema_version = str(
+                        previous_resolved.get("fitness_schema_version")
+                    )
+            current_archive_rounds = _read_archive_round_count(latest_run_dir)
+            remaining_rounds: Optional[int] = None
+            target_rounds_completed: Optional[int] = None
+            if isinstance(previous_launcher_state, dict):
+                target_raw = previous_launcher_state.get("target_rounds_completed")
+                if isinstance(target_raw, (int, float)):
+                    target_rounds_completed = max(0, int(target_raw))
+                    if current_archive_rounds < target_rounds_completed:
+                        remaining_rounds = max(
+                            1,
+                            int(target_rounds_completed - current_archive_rounds),
+                        )
+            args.out_dir = str(latest_run_dir)
+            auto_resume_context = {
+                "run_dir": latest_run_dir,
+                "previous_resolved": previous_resolved,
+                "previous_launcher_state": previous_launcher_state,
+                "archive_rounds": int(current_archive_rounds),
+                "target_rounds_completed": target_rounds_completed,
+                "remaining_rounds": remaining_rounds,
+            }
+            print(f"[pcpl-evolvo] auto-resume selected out_dir={latest_run_dir}")
+            if remaining_rounds is not None:
+                print(
+                    "[pcpl-evolvo] auto-resume incomplete session detected: archive_rounds={current} target_rounds={target} remaining={remaining}".format(
+                        current=int(current_archive_rounds),
+                        target=int(target_rounds_completed or 0),
+                        remaining=int(remaining_rounds),
+                    )
+                )
+        elif latest_reason not in {"runs-root-missing", "no-compatible-run-found"}:
+            print(f"[pcpl-evolvo] auto-resume skipped: {latest_reason}")
+
     resolved = _resolve_runtime_config(args)
+    if auto_resume_context is not None:
+        previous_resolved = auto_resume_context.get("previous_resolved", {})
+        if isinstance(previous_resolved, dict) and previous_resolved:
+            resolved = _overlay_resolved_with_previous_defaults(
+                current=resolved,
+                previous=previous_resolved,
+                explicit_options=explicit_options,
+            )
+            print(
+                "[pcpl-evolvo] auto-resume reused previous settings for non-explicit options."
+            )
+        remaining_rounds = auto_resume_context.get("remaining_rounds")
+        if remaining_rounds is not None and not rounds_explicit:
+            resolved["rounds"] = max(1, int(remaining_rounds))
+            print(
+                "[pcpl-evolvo] auto-resume rounds override: running remaining rounds={remaining}".format(
+                    remaining=int(remaining_rounds),
+                )
+            )
+        # Auto-resume semantics: continue from archive unless explicitly disabled.
+        resolved["resume"] = True
+        resolved["mode_summary"] = mode_summary(str(resolved.get("mode", args.mode)))
+    args.mode = str(resolved.get("mode", args.mode))
+    args.profile = str(resolved.get("profile", args.profile))
     _apply_runtime_config(args, resolved)
     args.fitness_schema_version = _resolve_fitness_schema_version(
         requested=str(args.fitness_schema_version),
@@ -3028,6 +3419,7 @@ def main() -> None:
     resolved["fitness_schema_version"] = str(args.fitness_schema_version)
     resolved["analysis_tag"] = str(args.analysis_tag or "")
     resolved["replicates"] = int(args.replicates)
+    resolved["replicate_seed_step"] = int(args.replicate_seed_step)
     resolved["replicate_reference"] = str(args.replicate_reference)
     resolved["experiment_suite"] = str(args.experiment_suite)
     resolved["precision_tracks"] = list(args.precision_tracks)
@@ -3060,6 +3452,33 @@ def main() -> None:
     else:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         out_dir = (PROJECT_DIR / "runs" / f"{stamp}-{args.profile}").resolve()
+
+    launcher_state_tracking_enabled = (
+        (not bool(args.continuous))
+        and int(args.replicates) == 1
+        and str(args.experiment_suite).strip().lower() == "single"
+    )
+    launcher_state_running_payload: Optional[Dict[str, Any]] = None
+    if launcher_state_tracking_enabled:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        archive_rounds_at_start = (
+            _read_archive_round_count(out_dir) if bool(args.resume) else 0
+        )
+        requested_rounds = max(1, int(args.rounds))
+        launcher_state_running_payload = {
+            "timestamp": datetime.now().isoformat(),
+            "status": "running",
+            "launcher": "run_experiments.py",
+            "argv": list(raw_cli_argv),
+            "explicit_options": sorted(explicit_options),
+            "out_dir": str(out_dir),
+            "resume": bool(args.resume),
+            "resolved_config": _normalize_json(resolved),
+            "archive_rounds_at_start": int(archive_rounds_at_start),
+            "rounds_requested": int(requested_rounds),
+            "target_rounds_completed": int(archive_rounds_at_start + requested_rounds),
+        }
+        _write_launcher_state(out_dir, launcher_state_running_payload)
 
     if not args.continuous:
         if int(args.replicates) < 1:
@@ -3195,11 +3614,36 @@ def main() -> None:
             _write_json(suite_path, suite_summary)
             print(f"[pcpl-evolvo] precision_suite_summary={suite_path}")
             return
-        _run_noncontinuous_campaign(
+        campaign_result = _run_noncontinuous_campaign(
             args,
             out_dir=out_dir,
             base_meta=base_meta,
         )
+        if (
+            launcher_state_tracking_enabled
+            and isinstance(launcher_state_running_payload, dict)
+            and campaign_result.get("kind") == "single"
+        ):
+            summary_payload = campaign_result.get("summary", {})
+            if not isinstance(summary_payload, dict):
+                summary_payload = {}
+            completed_payload = dict(launcher_state_running_payload)
+            completed_payload["status"] = "completed"
+            completed_payload["completed_at"] = datetime.now().isoformat()
+            completed_payload["rounds_completed_end"] = int(
+                summary_payload.get("rounds_completed", 0)
+            )
+            completed_payload["last_score"] = (
+                float(summary_payload.get("last_score"))
+                if summary_payload.get("last_score") is not None
+                else None
+            )
+            completed_payload["best_score"] = (
+                float(summary_payload.get("best_score"))
+                if summary_payload.get("best_score") is not None
+                else None
+            )
+            _write_launcher_state(out_dir, completed_payload)
         return
 
     if args.no_resume:
