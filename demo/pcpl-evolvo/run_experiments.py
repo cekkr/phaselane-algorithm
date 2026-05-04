@@ -49,11 +49,35 @@ DEFAULT_FITNESS_SCHEMA_VERSION = "auto"
 EXPERIMENT_SUITE_CHOICES = ("single", "precision")
 PRECISION_TRACK_CHOICES = (
     "baseline",
+    "sparse-circuit",
+    "route-hardening",
+    "sync-horizon",
+    "backend-audit",
     "supervisor",
     "lane-pressure",
     "evaluability",
     "random-research",
 )
+DEFAULT_PRECISION_TRACKS = (
+    "baseline",
+    "sparse-circuit",
+    "route-hardening",
+    "sync-horizon",
+    "backend-audit",
+    "random-research",
+)
+PRECISION_TRACK_ALIASES = {
+    "sparse": "sparse-circuit",
+    "circuit": "sparse-circuit",
+    "minimal-cost": "sparse-circuit",
+    "route": "route-hardening",
+    "lane": "route-hardening",
+    "lane-hardening": "route-hardening",
+    "sync": "sync-horizon",
+    "horizon": "sync-horizon",
+    "backend": "backend-audit",
+    "audit": "backend-audit",
+}
 
 _KOMPUTE_SELFTEST_SHADER_SOURCE = """#version 450
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
@@ -733,9 +757,11 @@ def _parse_hidden_layers_spec(value: Any) -> List[int]:
 
 def _parse_precision_tracks_spec(value: Any) -> List[str]:
     if value is None:
-        return list(PRECISION_TRACK_CHOICES)
+        return list(DEFAULT_PRECISION_TRACKS)
     text = str(value).strip()
-    if not text or text.lower() in {"all", "default", "auto"}:
+    if not text or text.lower() in {"default", "auto"}:
+        return list(DEFAULT_PRECISION_TRACKS)
+    if text.lower() == "all":
         return list(PRECISION_TRACK_CHOICES)
     parsed: List[str] = []
     seen = set()
@@ -743,6 +769,7 @@ def _parse_precision_tracks_spec(value: Any) -> List[str]:
         item = str(raw_item).strip().lower()
         if not item:
             continue
+        item = PRECISION_TRACK_ALIASES.get(item, item)
         if item not in PRECISION_TRACK_CHOICES:
             allowed = ", ".join(PRECISION_TRACK_CHOICES)
             raise ValueError(
@@ -753,12 +780,19 @@ def _parse_precision_tracks_spec(value: Any) -> List[str]:
         seen.add(item)
         parsed.append(item)
     if not parsed:
-        return list(PRECISION_TRACK_CHOICES)
+        return list(DEFAULT_PRECISION_TRACKS)
     return parsed
 
 
 def _base_strategy_profile(args: argparse.Namespace) -> Dict[str, Any]:
     return {
+        "population_size": int(args.population_size),
+        "generations": int(args.generations),
+        "initial_instructions": int(args.initial_instructions),
+        "attacker_population_size": int(args.attacker_population_size),
+        "attacker_generations": int(args.attacker_generations),
+        "elite_pool": int(args.elite_pool),
+        "archive_limit": int(args.archive_limit),
         "parent_pool_ratio": float(args.parent_pool_ratio),
         "stagnation_patience": int(args.stagnation_patience),
         "mutation_floor": float(args.mutation_floor),
@@ -801,6 +835,156 @@ def _precision_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, Any
         "strategy": "baseline",
         "description": (
             "Resolved user configuration kept intact as the reference precision lane."
+        ),
+    }
+    sparse_circuit = {
+        **base,
+        "strategy": "sparse-circuit",
+        "description": (
+            "Sparse hot-core discovery lane: compact programs, high novelty, and low "
+            "runtime budget pressure to challenge the minimal-cost baseline."
+        ),
+        "population_size": max(int(base["population_size"]), 128),
+        "generations": max(int(base["generations"]), 66),
+        "initial_instructions": max(8, min(int(base["initial_instructions"]), 12)),
+        "attacker_population_size": max(int(base["attacker_population_size"]), 80),
+        "attacker_generations": max(int(base["attacker_generations"]), 18),
+        "elite_pool": max(int(base["elite_pool"]), 64),
+        "archive_limit": max(int(base["archive_limit"]), 640),
+        "parent_pool_ratio": _clamp_float(
+            min(float(base["parent_pool_ratio"]), 0.30),
+            0.18,
+            0.42,
+        ),
+        "stagnation_patience": 1,
+        "mutation_floor": _clamp_float(max(0.30, float(base["mutation_floor"])), 0.18, 0.92),
+        "mutation_ceiling": _clamp_float(max(0.98, float(base["mutation_ceiling"])), 0.72, 0.99),
+        "mutation_step": _clamp_float(max(0.18, float(base["mutation_step"])), 0.06, 0.32),
+        "quick_cycle_fraction": _clamp_float(min(float(base["quick_cycle_fraction"]), 0.06), 0.04, 0.20),
+        "mid_cycle_fraction": _clamp_float(min(float(base["mid_cycle_fraction"]), 0.20), 0.14, 0.42),
+        "quick_keep_ratio": _clamp_float(min(float(base["quick_keep_ratio"]), 0.40), 0.16, 0.60),
+        "mid_keep_ratio": _clamp_float(min(float(base["mid_keep_ratio"]), 0.16), 0.08, 0.34),
+        "key_variants": max(6, int(base["key_variants"])),
+        "novelty_bonus": max(0.24, float(base["novelty_bonus"])),
+        "predictive_penalty": max(0.12, float(base["predictive_penalty"])),
+        "sync_loss_gate_percentile": _clamp_float(
+            min(float(base["sync_loss_gate_percentile"]), 0.56),
+            0.0,
+            1.0,
+        ),
+        "sync_loss_gate_penalty": max(0.12, float(base["sync_loss_gate_penalty"])),
+        "sync_loss_gate_flat_boost": max(0.10, float(base["sync_loss_gate_flat_boost"])),
+        "anti_neutrality_window": max(6, min(int(base["anti_neutrality_window"]), 8)),
+        "anti_neutrality_penalty": max(0.040, float(base["anti_neutrality_penalty"])),
+        "anti_neutrality_bonus": max(0.024, float(base["anti_neutrality_bonus"])),
+        "attacker_panel_size": max(4, int(base["attacker_panel_size"])),
+        "attacker_panel_penalty": max(0.20, float(base["attacker_panel_penalty"])),
+        "target_generation_seconds": max(3.0, float(base["target_generation_seconds"])),
+        "max_eval_cache_entries": max(
+            int(base["max_eval_cache_entries"]),
+            int(round(float(base["max_eval_cache_entries"]) * 1.35)),
+        ),
+        "max_test_time_seconds": max(18.0, float(base["max_test_time_seconds"])),
+    }
+    route_hardening = {
+        **base,
+        "strategy": "route-hardening",
+        "description": (
+            "Route/lane hardening lane: stronger attacker populations, larger panels, "
+            "and higher key diversity to discover lane-inference weaknesses."
+        ),
+        "population_size": max(int(base["population_size"]), 120),
+        "generations": max(int(base["generations"]), 58),
+        "attacker_population_size": max(int(base["attacker_population_size"]), 128),
+        "attacker_generations": max(int(base["attacker_generations"]), 30),
+        "elite_pool": max(int(base["elite_pool"]), 64),
+        "archive_limit": max(int(base["archive_limit"]), 720),
+        "key_variants": max(8, int(base["key_variants"])),
+        "novelty_bonus": max(0.20, float(base["novelty_bonus"])),
+        "predictive_penalty": max(0.13, float(base["predictive_penalty"])),
+        "sync_loss_gate_percentile": _clamp_float(
+            min(float(base["sync_loss_gate_percentile"]), 0.58),
+            0.0,
+            1.0,
+        ),
+        "sync_loss_gate_penalty": max(0.12, float(base["sync_loss_gate_penalty"])),
+        "anti_neutrality_window": max(6, min(int(base["anti_neutrality_window"]), 9)),
+        "anti_neutrality_penalty": max(0.036, float(base["anti_neutrality_penalty"])),
+        "anti_neutrality_bonus": max(0.020, float(base["anti_neutrality_bonus"])),
+        "attacker_panel_size": max(7, int(base["attacker_panel_size"])),
+        "attacker_panel_penalty": max(0.30, float(base["attacker_panel_penalty"])),
+        "target_generation_seconds": max(3.4, float(base["target_generation_seconds"])),
+        "max_eval_cache_entries": max(
+            int(base["max_eval_cache_entries"]),
+            int(round(float(base["max_eval_cache_entries"]) * 1.45)),
+        ),
+        "max_test_time_seconds": max(22.0, float(base["max_test_time_seconds"])),
+    }
+    sync_horizon = {
+        **base,
+        "strategy": "sync-horizon",
+        "description": (
+            "Long-horizon sync lane: extended timing projection, strict sync-loss "
+            "gates, and slower generations to search supervisory circuit pressure."
+        ),
+        "population_size": max(int(base["population_size"]), 120),
+        "generations": max(int(base["generations"]), 64),
+        "attacker_population_size": max(int(base["attacker_population_size"]), 96),
+        "attacker_generations": max(int(base["attacker_generations"]), 22),
+        "elite_pool": max(int(base["elite_pool"]), 64),
+        "archive_limit": max(int(base["archive_limit"]), 640),
+        "key_variants": max(8, int(base["key_variants"])),
+        "sync_loss_gate_percentile": _clamp_float(
+            min(float(base["sync_loss_gate_percentile"]), 0.48),
+            0.0,
+            1.0,
+        ),
+        "sync_loss_gate_penalty": max(0.20, float(base["sync_loss_gate_penalty"])),
+        "sync_loss_gate_flat_boost": max(0.16, float(base["sync_loss_gate_flat_boost"])),
+        "anti_neutrality_window": max(6, min(int(base["anti_neutrality_window"]), 8)),
+        "anti_neutrality_penalty": max(0.040, float(base["anti_neutrality_penalty"])),
+        "anti_neutrality_bonus": max(0.024, float(base["anti_neutrality_bonus"])),
+        "attacker_panel_size": max(5, int(base["attacker_panel_size"])),
+        "attacker_panel_penalty": max(0.22, float(base["attacker_panel_penalty"])),
+        "target_generation_seconds": max(4.0, float(base["target_generation_seconds"])),
+        "max_eval_cache_entries": max(
+            int(base["max_eval_cache_entries"]),
+            int(round(float(base["max_eval_cache_entries"]) * 1.40)),
+        ),
+        "max_test_time_seconds": max(60.0, float(base["max_test_time_seconds"])),
+        "debug_eval_timeout_seconds": max(90.0, float(base["debug_eval_timeout_seconds"])),
+        "debug_eval_log_interval_seconds": max(
+            20.0,
+            float(base["debug_eval_log_interval_seconds"]),
+        ),
+    }
+    backend_audit = {
+        **base,
+        "strategy": "backend-audit",
+        "description": (
+            "Execution audit lane: disables predictive shortcuts, serializes round "
+            "lanes, and records watchdog heartbeats for backend/runtime truth."
+        ),
+        "population_size": max(int(base["population_size"]), 96),
+        "generations": max(int(base["generations"]), 44),
+        "attacker_population_size": max(int(base["attacker_population_size"]), 72),
+        "attacker_generations": max(int(base["attacker_generations"]), 16),
+        "elite_pool": max(int(base["elite_pool"]), 52),
+        "archive_limit": max(int(base["archive_limit"]), 480),
+        "statistical_predictive": False,
+        "auto_statistical_tuning": False,
+        "parallel_backend": "thread",
+        "round_parallelism": 1,
+        "minimum_parallel_rounds": 1,
+        "target_generation_seconds": max(4.0, float(base["target_generation_seconds"])),
+        "max_eval_cache_entries": max(
+            int(base["max_eval_cache_entries"]),
+            int(round(float(base["max_eval_cache_entries"]) * 1.25)),
+        ),
+        "debug_eval_timeout_seconds": max(90.0, float(base["debug_eval_timeout_seconds"])),
+        "debug_eval_log_interval_seconds": max(
+            20.0,
+            float(base["debug_eval_log_interval_seconds"]),
         ),
     }
     supervisor = {
@@ -938,7 +1122,17 @@ def _precision_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, Any
             float(base["debug_eval_log_interval_seconds"]),
         ),
     }
-    return [baseline, supervisor, lane_pressure, evaluability, random_research]
+    return [
+        baseline,
+        sparse_circuit,
+        route_hardening,
+        sync_horizon,
+        backend_audit,
+        supervisor,
+        lane_pressure,
+        evaluability,
+        random_research,
+    ]
 
 
 def _continuous_strategy_profiles(args: argparse.Namespace) -> List[Dict[str, Any]]:
@@ -1117,15 +1311,37 @@ def _build_continuous_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
     ):
         pop, gen, instr, apop, agen, elite = values
         for strategy in strategies:
+            strategy_pop = _safe_int(strategy.get("population_size", pop), minimum=4)
+            strategy_gen = _safe_int(strategy.get("generations", gen), minimum=1)
+            strategy_instr = _safe_int(
+                strategy.get("initial_instructions", instr),
+                minimum=3,
+            )
+            strategy_apop = _safe_int(
+                strategy.get("attacker_population_size", apop),
+                minimum=3,
+            )
+            strategy_agen = _safe_int(
+                strategy.get("attacker_generations", agen),
+                minimum=1,
+            )
+            strategy_elite = _safe_int(strategy.get("elite_pool", elite), minimum=4)
+            strategy_archive = _safe_int(
+                max(
+                    int(strategy.get("archive_limit", args.archive_limit)),
+                    max(args.archive_limit, min(strategy_pop * 6, args.archive_limit * 2)),
+                ),
+                minimum=16,
+            )
             combos.append(
                 {
-                    "population_size": pop,
-                    "generations": gen,
-                    "initial_instructions": instr,
-                    "attacker_population_size": apop,
-                    "attacker_generations": agen,
-                    "elite_pool": min(pop, elite),
-                    "archive_limit": max(args.archive_limit, min(pop * 6, args.archive_limit * 2)),
+                    "population_size": strategy_pop,
+                    "generations": strategy_gen,
+                    "initial_instructions": strategy_instr,
+                    "attacker_population_size": strategy_apop,
+                    "attacker_generations": strategy_agen,
+                    "elite_pool": min(strategy_pop, strategy_elite),
+                    "archive_limit": strategy_archive,
                     "strategy": str(strategy.get("strategy", "base")),
                     "parent_pool_ratio": float(strategy["parent_pool_ratio"]),
                     "stagnation_patience": int(strategy["stagnation_patience"]),
@@ -2427,6 +2643,341 @@ def _print_summary(summary: Dict[str, Any]) -> None:
         print(f"[pcpl-evolvo] run_metadata={summary['run_metadata_path']}")
 
 
+def _safe_float_or_none(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _metric_mean_from_evidence(
+    evidence: Dict[str, Any],
+    key: str,
+) -> Optional[float]:
+    metrics = evidence.get("metrics", {})
+    if not isinstance(metrics, dict):
+        return None
+    payload = metrics.get(key, {})
+    if not isinstance(payload, dict):
+        return None
+    return _safe_float_or_none(payload.get("mean"))
+
+
+def _baseline_score_from_results(
+    results_payload: Dict[str, Any],
+    name: str,
+) -> Optional[float]:
+    baselines = results_payload.get("baselines", [])
+    if not isinstance(baselines, list):
+        return None
+    for row in baselines:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("name", "")) == str(name):
+            return _safe_float_or_none(row.get("mean_score"))
+    return None
+
+
+def _load_summary_results(summary: Dict[str, Any]) -> Dict[str, Any]:
+    path_text = str(summary.get("results_json", "") or "").strip()
+    if not path_text:
+        return {}
+    payload = _read_json_dict(Path(path_text))
+    return payload if isinstance(payload, dict) else {}
+
+
+def _discovery_signals_from_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    results_payload = _load_summary_results(summary)
+    evidence = results_payload.get("evidence_summary", {})
+    if not isinstance(evidence, dict):
+        evidence_path = str(summary.get("evidence_summary_path", "") or "").strip()
+        evidence = _read_json_dict(Path(evidence_path)) if evidence_path else {}
+    if not isinstance(evidence, dict):
+        evidence = {}
+
+    best_score = _safe_float_or_none(summary.get("best_score"))
+    if best_score is None:
+        best_defender = results_payload.get("best_defender", [])
+        if isinstance(best_defender, list) and best_defender and isinstance(best_defender[0], dict):
+            best_score = _safe_float_or_none(best_defender[0].get("score"))
+    best_attacker_score = _safe_float_or_none(summary.get("best_attacker_score"))
+
+    reference_score = _baseline_score_from_results(results_payload, "reference-full")
+    minimal_cost_score = _baseline_score_from_results(results_payload, "minimal-cost")
+    balanced_score = _baseline_score_from_results(results_payload, "balanced")
+
+    buckets = evidence.get("compound_ratio_buckets", [])
+    if not isinstance(buckets, list):
+        buckets = []
+    valid_buckets = [bucket for bucket in buckets if isinstance(bucket, dict)]
+    best_bucket: Optional[Dict[str, Any]] = None
+    sparse_bucket: Optional[Dict[str, Any]] = None
+    if valid_buckets:
+        best_bucket = max(
+            valid_buckets,
+            key=lambda item: float(item.get("mean_defender_score", float("-inf"))),
+        )
+        sparse_candidates = [
+            item for item in valid_buckets if float(item.get("ratio", 1.0)) <= 0.4001
+        ]
+        if sparse_candidates:
+            sparse_bucket = max(
+                sparse_candidates,
+                key=lambda item: float(item.get("mean_defender_score", float("-inf"))),
+            )
+
+    def _bucket_field(bucket: Optional[Dict[str, Any]], key: str) -> Optional[float]:
+        if not isinstance(bucket, dict):
+            return None
+        return _safe_float_or_none(bucket.get(key))
+
+    signals: Dict[str, Any] = {
+        "best_score": best_score,
+        "best_attacker_score": best_attacker_score,
+        "reference_score": reference_score,
+        "balanced_score": balanced_score,
+        "minimal_cost_score": minimal_cost_score,
+        "delta_vs_reference": (
+            best_score - reference_score
+            if best_score is not None and reference_score is not None
+            else None
+        ),
+        "delta_vs_balanced": (
+            best_score - balanced_score
+            if best_score is not None and balanced_score is not None
+            else None
+        ),
+        "delta_vs_minimal_cost": (
+            best_score - minimal_cost_score
+            if best_score is not None and minimal_cost_score is not None
+            else None
+        ),
+        "beats_minimal_cost": (
+            bool(best_score > minimal_cost_score)
+            if best_score is not None and minimal_cost_score is not None
+            else False
+        ),
+        "valid_rate": _safe_float_or_none(evidence.get("valid_rate")),
+        "valid_rounds": int(evidence.get("valid_rounds", 0) or 0),
+        "skipped_rounds": int(evidence.get("skipped_rounds", 0) or 0),
+        "timeout_rescue_used_count": int(
+            evidence.get("timeout_rescue_used_count", 0) or 0
+        ),
+        "trailing_unevaluable_rounds": int(
+            evidence.get("trailing_unevaluable_rounds", 0) or 0
+        ),
+        "compound_ratio_mean": _metric_mean_from_evidence(
+            evidence,
+            "device_compound_ratio",
+        ),
+        "cost_score_mean": _metric_mean_from_evidence(evidence, "cost_score"),
+        "runtime_score_mean": _metric_mean_from_evidence(evidence, "runtime_score"),
+        "sync_score_mean": _metric_mean_from_evidence(evidence, "sync_score"),
+        "horizon_sync_mean": _metric_mean_from_evidence(
+            evidence,
+            "horizon_sync_score",
+        ),
+        "projected_sync_loss_mean": _metric_mean_from_evidence(
+            evidence,
+            "projected_sync_loss_rate",
+        ),
+        "lane_success_mean": _metric_mean_from_evidence(
+            evidence,
+            "attacker_lane_success_rate",
+        ),
+        "token_success_mean": _metric_mean_from_evidence(
+            evidence,
+            "attacker_token_success_rate",
+        ),
+        "attacker_advantage_mean": _metric_mean_from_evidence(
+            evidence,
+            "attacker_advantage_score",
+        ),
+        "best_bucket_ratio": _bucket_field(best_bucket, "ratio"),
+        "best_bucket_score": _bucket_field(best_bucket, "mean_defender_score"),
+        "sparse_bucket_ratio": _bucket_field(sparse_bucket, "ratio"),
+        "sparse_bucket_score": _bucket_field(sparse_bucket, "mean_defender_score"),
+    }
+    return signals
+
+
+def _suite_entry_score(entry: Dict[str, Any]) -> Optional[float]:
+    if str(entry.get("kind", "")) == "replicates":
+        return _safe_float_or_none(entry.get("reference_best_score"))
+    return _safe_float_or_none(entry.get("best_score"))
+
+
+def _signal_value(entry: Dict[str, Any], key: str) -> Optional[float]:
+    signals = entry.get("discovery_signals", {})
+    if not isinstance(signals, dict):
+        return None
+    return _safe_float_or_none(signals.get(key))
+
+
+def _best_track_by(
+    entries: List[Dict[str, Any]],
+    key: str,
+    *,
+    higher_is_better: bool = True,
+) -> Optional[Dict[str, Any]]:
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for entry in entries:
+        value = _signal_value(entry, key)
+        if value is None:
+            continue
+        scored.append((value, entry))
+    if not scored:
+        return None
+    return (
+        max(scored, key=lambda item: item[0])[1]
+        if higher_is_better
+        else min(scored, key=lambda item: item[0])[1]
+    )
+
+
+def _precision_suite_rankings(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    best_score_entry = None
+    score_entries = [
+        (value, entry)
+        for entry in entries
+        for value in [_suite_entry_score(entry)]
+        if value is not None
+    ]
+    if score_entries:
+        best_score_entry = max(score_entries, key=lambda item: item[0])[1]
+
+    minimal_breakthroughs = [
+        entry
+        for entry in entries
+        if bool(
+            (entry.get("discovery_signals") or {}).get(
+                "beats_minimal_cost",
+                False,
+            )
+        )
+    ]
+    sparse_entry = _best_track_by(entries, "sparse_bucket_score")
+    route_entry = _best_track_by(entries, "attacker_advantage_mean")
+    horizon_entry = _best_track_by(entries, "horizon_sync_mean")
+    sync_loss_entry = _best_track_by(
+        entries,
+        "projected_sync_loss_mean",
+        higher_is_better=False,
+    )
+    runtime_entry = _best_track_by(entries, "runtime_score_mean")
+    return {
+        "best_score_track": (
+            str(best_score_entry.get("track", "")) if best_score_entry else None
+        ),
+        "best_sparse_bucket_track": (
+            str(sparse_entry.get("track", "")) if sparse_entry else None
+        ),
+        "strongest_route_pressure_track": (
+            str(route_entry.get("track", "")) if route_entry else None
+        ),
+        "best_horizon_sync_track": (
+            str(horizon_entry.get("track", "")) if horizon_entry else None
+        ),
+        "lowest_projected_sync_loss_track": (
+            str(sync_loss_entry.get("track", "")) if sync_loss_entry else None
+        ),
+        "best_runtime_track": (
+            str(runtime_entry.get("track", "")) if runtime_entry else None
+        ),
+        "minimal_cost_breakthrough_tracks": [
+            str(entry.get("track", "")) for entry in minimal_breakthroughs
+        ],
+    }
+
+
+def _fmt_suite_value(value: Any, precision: int = 4) -> str:
+    number = _safe_float_or_none(value)
+    if number is None:
+        return "n/a"
+    return f"{number:.{precision}f}"
+
+
+def _precision_suite_markdown(suite_summary: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    lines.append("# PCPL Evolvo Precision Suite Summary")
+    lines.append("")
+    lines.append(f"- analysis tag: `{suite_summary.get('analysis_tag', '')}`")
+    lines.append(f"- fitness schema: `{suite_summary.get('fitness_schema_version', '')}`")
+    lines.append(
+        f"- mode/profile: `{suite_summary.get('mode', '')}` / "
+        f"`{suite_summary.get('profile', '')}`"
+    )
+    lines.append("")
+    rankings = suite_summary.get("discovery_rankings", {})
+    if isinstance(rankings, dict):
+        lines.append("## Discovery Signals")
+        lines.append("")
+        for key, label in (
+            ("best_score_track", "best defender score"),
+            ("best_sparse_bucket_track", "best sparse bucket"),
+            ("strongest_route_pressure_track", "strongest route pressure"),
+            ("best_horizon_sync_track", "best horizon sync"),
+            ("lowest_projected_sync_loss_track", "lowest projected sync loss"),
+            ("best_runtime_track", "best runtime headroom"),
+        ):
+            value = rankings.get(key)
+            if value:
+                lines.append(f"- {label}: `{value}`")
+        breakthrough = rankings.get("minimal_cost_breakthrough_tracks", [])
+        if isinstance(breakthrough, list) and breakthrough:
+            lines.append(
+                "- minimal-cost breakthroughs: "
+                + ", ".join(f"`{item}`" for item in breakthrough)
+            )
+        else:
+            lines.append("- minimal-cost breakthroughs: `none`")
+        lines.append("")
+
+    lines.append("## Track Stats")
+    lines.append("")
+    lines.append(
+        "| track | best | delta minimal | valid | sparse bucket | lane adv | horizon | projected loss | runtime |"
+    )
+    lines.append("| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |")
+    for entry in suite_summary.get("tracks", []):
+        if not isinstance(entry, dict):
+            continue
+        signals = entry.get("discovery_signals", {})
+        if not isinstance(signals, dict):
+            signals = {}
+        sparse_ratio = _fmt_suite_value(signals.get("sparse_bucket_ratio"), 4)
+        sparse_score = _fmt_suite_value(signals.get("sparse_bucket_score"), 6)
+        sparse_text = (
+            "n/a" if sparse_ratio == "n/a" else f"{sparse_ratio} / {sparse_score}"
+        )
+        lines.append(
+            "| {track} | {best} | {delta_min} | {valid} | {sparse} | {adv} | {horizon} | {loss} | {runtime} |".format(
+                track=str(entry.get("track", "")),
+                best=_fmt_suite_value(_suite_entry_score(entry), 6),
+                delta_min=_fmt_suite_value(signals.get("delta_vs_minimal_cost"), 6),
+                valid=_fmt_suite_value(signals.get("valid_rate"), 3),
+                sparse=sparse_text,
+                adv=_fmt_suite_value(signals.get("attacker_advantage_mean"), 4),
+                horizon=_fmt_suite_value(signals.get("horizon_sync_mean"), 6),
+                loss=_fmt_suite_value(signals.get("projected_sync_loss_mean"), 4),
+                runtime=_fmt_suite_value(signals.get("runtime_score_mean"), 4),
+            )
+        )
+    lines.append("")
+    lines.append("## Reading")
+    lines.append("")
+    lines.append(
+        "Use this table to choose the next paper-facing candidate: sparse-circuit "
+        "tracks challenge active-compound cost, route-hardening tracks expose lane "
+        "prediction pressure, sync-horizon tracks test supervisor assumptions, and "
+        "backend-audit tracks test whether final metrics survive without shortcuts."
+    )
+    return "\n".join(lines) + "\n"
+
+
 def _run_noncontinuous_campaign(
     args: argparse.Namespace,
     *,
@@ -3155,16 +3706,18 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Runner orchestration style: `single` keeps current behavior; "
             "`precision` launches targeted tracks that reduce blind shortcuts and "
-            "separate baseline, supervision, lane-pressure, evaluability, and random-research lanes."
+            "separate sparse-circuit, route-hardening, sync-horizon, backend-audit, "
+            "and random-research discovery lanes."
         ),
     )
     parser.add_argument(
         "--precision-tracks",
         type=str,
-        default=",".join(PRECISION_TRACK_CHOICES),
+        default=",".join(DEFAULT_PRECISION_TRACKS),
         help=(
             "Comma-separated track subset used when --experiment-suite precision. "
-            f"Supported: {', '.join(PRECISION_TRACK_CHOICES)}."
+            f"Default: {', '.join(DEFAULT_PRECISION_TRACKS)}. "
+            f"Supported: {', '.join(PRECISION_TRACK_CHOICES)}. Use `all` for every track."
         ),
     )
     parser.add_argument(
@@ -3540,6 +4093,7 @@ def main() -> None:
                 )
                 if campaign_result["kind"] == "single":
                     summary = campaign_result["summary"]
+                    discovery_signals = _discovery_signals_from_summary(summary)
                     suite_results.append(
                         {
                             "track": track_name,
@@ -3554,6 +4108,7 @@ def main() -> None:
                             "report_path": summary.get("report_path"),
                             "archive_path": summary.get("archive_path"),
                             "run_metadata_path": summary.get("run_metadata_path"),
+                            "discovery_signals": discovery_signals,
                             "overrides": {
                                 str(k): _normalize_json(v)
                                 for k, v in profile.items()
@@ -3564,6 +4119,9 @@ def main() -> None:
                 else:
                     campaign_summary = campaign_result["campaign_summary"]
                     reference_summary = campaign_result["reference_summary"]
+                    discovery_signals = _discovery_signals_from_summary(
+                        reference_summary
+                    )
                     suite_results.append(
                         {
                             "track": track_name,
@@ -3594,6 +4152,7 @@ def main() -> None:
                             "campaign_path": campaign_result.get("campaign_path"),
                             "reference_path": campaign_result.get("reference_path"),
                             "reference_out_dir": reference_summary.get("out_dir"),
+                            "discovery_signals": discovery_signals,
                             "overrides": {
                                 str(k): _normalize_json(v)
                                 for k, v in profile.items()
@@ -3610,9 +4169,18 @@ def main() -> None:
                 "experiment_suite": "precision",
                 "tracks": suite_results,
             }
+            suite_summary["discovery_rankings"] = _precision_suite_rankings(
+                suite_results
+            )
             suite_path = out_dir / "precision-suite-summary.json"
             _write_json(suite_path, suite_summary)
+            suite_markdown_path = out_dir / "precision-suite-summary.md"
+            suite_markdown_path.write_text(
+                _precision_suite_markdown(suite_summary),
+                encoding="utf-8",
+            )
             print(f"[pcpl-evolvo] precision_suite_summary={suite_path}")
+            print(f"[pcpl-evolvo] precision_suite_report={suite_markdown_path}")
             return
         campaign_result = _run_noncontinuous_campaign(
             args,
