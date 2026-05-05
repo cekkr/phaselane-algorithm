@@ -3469,6 +3469,9 @@ def _create_shared_executor(
 def _shutdown_shared_executor(executor: Optional[concurrent.futures.Executor]) -> None:
     if executor is None:
         return
+    if isinstance(executor, concurrent.futures.ProcessPoolExecutor):
+        _force_shutdown_process_executor(executor)
+        return
     try:
         executor.shutdown(wait=True, cancel_futures=True)
     except Exception:
@@ -8850,6 +8853,8 @@ def run_continuous_experiment(
         lane_count = int(max(1, round_plan.lanes))
         if bool(round_plan.enabled) and lane_count > 1:
             use_process_round_executor = False
+            executor_backend_mode = _normalize_executor_backend(config.executor_backend)
+            kompute_executor_enabled = executor_backend_mode in {"kompute", "kompute-sim"}
             if bool(config.kompute_allow_process_pool):
                 if str(config.parallel_backend).strip().lower() == "process":
                     # Explicit process preference should apply to round lanes too.
@@ -8858,6 +8863,13 @@ def run_continuous_experiment(
                     # When per-round evaluators are single-worker/off, thread lanes can serialize
                     # under the GIL. Process lanes provide true host parallelism.
                     use_process_round_executor = True
+            if use_process_round_executor and kompute_executor_enabled:
+                # Process lanes + Kompute can leave long-lived workers spinning at teardown.
+                # Keep lanes threaded for Kompute backends to ensure deterministic exits.
+                print(
+                    "[pcpl-evolvo] round executor override: using thread lanes for Kompute backend to avoid process teardown stalls."
+                )
+                use_process_round_executor = False
             if use_process_round_executor:
                 round_executor = _create_process_pool_executor(
                     max_workers=lane_count,
@@ -9663,7 +9675,10 @@ def run_continuous_experiment(
         )
         if round_executor is not None:
             try:
-                round_executor.shutdown(wait=True, cancel_futures=True)
+                if isinstance(round_executor, concurrent.futures.ProcessPoolExecutor):
+                    _force_shutdown_process_executor(round_executor)
+                else:
+                    round_executor.shutdown(wait=True, cancel_futures=True)
             except Exception:
                 pass
 
