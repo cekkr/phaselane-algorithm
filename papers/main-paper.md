@@ -1252,9 +1252,10 @@ The stable design constraints are:
   lane/route inference from public phase and schedule structure.
 - Sparse activation is not just a runtime trick. It is the best observed
   defender shape under the current objective family.
-- The best evolved defender improves over the reference and balanced policies,
-  but the hand `minimal-cost` policy remains a higher baseline. The evolved
-  result is therefore architectural evidence, not a final optimum.
+- Baseline ordering is objective-version dependent; the robust claim is that
+  evolved defenders have not established a stable score ceiling above the hand
+  sparse baselines. The evolved result is therefore architectural evidence, not
+  a final optimum.
 - Long-horizon synchronization is not solved by the token core. A precise
   external clock discipline and a separate supervisory layer are required.
 - Native execution feasibility is not equivalent to cryptographic correctness.
@@ -1266,7 +1267,7 @@ conclusions in a self-contained form:
 | evidence signal | paper interpretation | design consequence |
 | --- | --- | --- |
 | Principle invariants at `1.0000` | the construction preserves exact validation semantics | keep correctness proof tied to permutation and canonical recomputation |
-| Token success at `0.0000` | attackers did not recover token material in this evidence family | keep hash/KDF domain separation, but shift attacker panels toward lane inference |
+| Token success near zero (rare nonzero stress-case events) | token material recovery is not a practical attacker mode in this evidence family, but absolute-zero should not be claimed | keep hash/KDF domain separation and include low-entropy quick-scenario attacker panels |
 | Lane success around chance-like rates | route exposure is the useful adversarial pressure | add route-hardening objectives and schedule decorrelation metrics |
 | Projected sync loss at `1.0000` | long-window drift model saturates failure | do not claim the token core is a resynchronization solution |
 | Best evolved defender below `minimal-cost` | evolution confirms sparse shape but not a new score ceiling | keep minimal-cost as a benchmark to beat |
