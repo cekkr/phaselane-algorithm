@@ -46,6 +46,8 @@ from pcpl_evolvo.experiment import (
 )
 
 DEFAULT_FITNESS_SCHEMA_VERSION = "auto"
+AUTO_MAIN_PAPER_MODE = "paper"
+AUTO_MAIN_PAPER_ROUND_OBJECTIVE = 50
 EXPERIMENT_SUITE_CHOICES = ("single", "precision")
 PRECISION_TRACK_CHOICES = (
     "baseline",
@@ -2304,7 +2306,12 @@ def _check_run_dir_compatibility(run_dir: Path) -> Tuple[bool, str]:
     return True, "ok"
 
 
-def _latest_compatible_run_dir(runs_root: Path) -> Tuple[Optional[Path], str]:
+def _latest_compatible_run_dir(
+    runs_root: Path,
+    *,
+    preferred_mode: Optional[str] = None,
+    preferred_profile: Optional[str] = None,
+) -> Tuple[Optional[Path], str]:
     if not runs_root.is_dir():
         return None, "runs-root-missing"
     candidates: List[Path] = []
@@ -2317,6 +2324,29 @@ def _latest_compatible_run_dir(runs_root: Path) -> Tuple[Optional[Path], str]:
     if not candidates:
         return None, "no-compatible-run-found"
     candidates.sort(key=_run_dir_activity_ts, reverse=True)
+    preferred_mode_norm = str(preferred_mode or "").strip().lower()
+    preferred_profile_norm = str(preferred_profile or "").strip().lower()
+    if preferred_mode_norm or preferred_profile_norm:
+        filtered: List[Path] = []
+        for run_dir in candidates:
+            previous = _load_previous_resolved_config(run_dir)
+            run_mode = str(previous.get("mode", "")).strip().lower()
+            run_profile = str(previous.get("profile", "")).strip().lower()
+            mode_ok = (not preferred_mode_norm) or (run_mode == preferred_mode_norm)
+            profile_ok = (not preferred_profile_norm) or (
+                run_profile == preferred_profile_norm
+            )
+            if mode_ok and profile_ok:
+                filtered.append(run_dir)
+        if filtered:
+            return filtered[0], "ok"
+        reason_bits: List[str] = []
+        if preferred_mode_norm:
+            reason_bits.append(f"mode={preferred_mode_norm}")
+        if preferred_profile_norm:
+            reason_bits.append(f"profile={preferred_profile_norm}")
+        reason_suffix = ",".join(reason_bits) if reason_bits else "preference"
+        return None, f"no-compatible-run-found-for-{reason_suffix}"
     return candidates[0], "ok"
 
 
@@ -3111,7 +3141,9 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MODE,
         help=(
             "High-level evolution mode loaded from config.py. "
-            "Use this instead of tuning many low-level flags."
+            "Use this instead of tuning many low-level flags. "
+            "When omitted in single non-continuous runs, launcher policy defaults "
+            "to `paper` for main-paper conclusion campaigns."
         ),
     )
     parser.add_argument(
@@ -3179,7 +3211,11 @@ def parse_args() -> argparse.Namespace:
         "--rounds",
         type=int,
         default=None,
-        help="Continuous rounds to run in this invocation.",
+        help=(
+            "Continuous rounds to run in this invocation. "
+            "When omitted in single non-continuous paper-policy runs, launcher "
+            "targets 50 total rounds in the selected run directory."
+        ),
     )
     parser.add_argument(
         "--attacker-population-size",
@@ -3760,6 +3796,7 @@ def main() -> None:
     explicit_options = _extract_explicit_cli_options(raw_cli_argv)
     args = parse_args()
     rounds_explicit = _option_explicit(explicit_options, "--rounds")
+    mode_explicit = _option_explicit(explicit_options, "--mode")
     if args.list_modes:
         print("[pcpl-evolvo] available modes:")
         for name in available_modes():
@@ -3805,6 +3842,18 @@ def main() -> None:
         print(f"[pcpl-evolvo] materialized_summary={summary['materialized_summary_path']}")
         return
 
+    auto_main_paper_policy = (
+        (not bool(args.continuous))
+        and str(args.experiment_suite).strip().lower() == "single"
+        and (not mode_explicit)
+    )
+    if auto_main_paper_policy and str(args.mode).strip().lower() != AUTO_MAIN_PAPER_MODE:
+        args.mode = AUTO_MAIN_PAPER_MODE
+        print(
+            "[pcpl-evolvo] auto mode policy: defaulting to `paper` for main-paper conclusions "
+            "(set --mode to override)."
+        )
+
     auto_resume_context: Optional[Dict[str, Any]] = None
     should_attempt_auto_resume = (
         (not bool(args.no_resume))
@@ -3814,7 +3863,17 @@ def main() -> None:
         and (not _option_explicit(explicit_options, "--out-dir"))
     )
     if should_attempt_auto_resume:
-        latest_run_dir, latest_reason = _latest_compatible_run_dir(PROJECT_DIR / "runs")
+        preferred_auto_resume_mode = (
+            AUTO_MAIN_PAPER_MODE if auto_main_paper_policy else None
+        )
+        preferred_auto_resume_profile = (
+            str(args.profile) if auto_main_paper_policy else None
+        )
+        latest_run_dir, latest_reason = _latest_compatible_run_dir(
+            PROJECT_DIR / "runs",
+            preferred_mode=preferred_auto_resume_mode,
+            preferred_profile=preferred_auto_resume_profile,
+        )
         if latest_run_dir is not None:
             previous_resolved = _load_previous_resolved_config(latest_run_dir)
             previous_launcher_state = _read_previous_launcher_state(latest_run_dir)
@@ -3907,10 +3966,14 @@ def main() -> None:
     if auto_resume_context is not None:
         previous_resolved = auto_resume_context.get("previous_resolved", {})
         if isinstance(previous_resolved, dict) and previous_resolved:
+            overlay_explicit_options = explicit_options
+            if auto_main_paper_policy:
+                overlay_explicit_options = set(explicit_options)
+                overlay_explicit_options.add("--mode")
             resolved = _overlay_resolved_with_previous_defaults(
                 current=resolved,
                 previous=previous_resolved,
-                explicit_options=explicit_options,
+                explicit_options=overlay_explicit_options,
             )
             print(
                 "[pcpl-evolvo] auto-resume reused previous settings for non-explicit options."
@@ -3926,6 +3989,50 @@ def main() -> None:
         # Auto-resume semantics: continue from archive unless explicitly disabled.
         resolved["resume"] = True
         resolved["mode_summary"] = mode_summary(str(resolved.get("mode", args.mode)))
+
+    paper_objective_skip_run = False
+    if (
+        auto_main_paper_policy
+        and (not rounds_explicit)
+        and str(resolved.get("mode", args.mode)).strip().lower() == AUTO_MAIN_PAPER_MODE
+    ):
+        archive_rounds_for_objective = 0
+        if auto_resume_context is not None:
+            archive_rounds_for_objective = int(
+                auto_resume_context.get("archive_rounds", 0) or 0
+            )
+        elif str(args.out_dir or "").strip():
+            objective_out_dir = Path(str(args.out_dir)).expanduser().resolve()
+            if bool(resolved.get("resume", True)):
+                archive_rounds_for_objective = _read_archive_round_count(
+                    objective_out_dir
+                )
+        remaining_objective_rounds = int(
+            AUTO_MAIN_PAPER_ROUND_OBJECTIVE - archive_rounds_for_objective
+        )
+        if remaining_objective_rounds > 0:
+            resolved["rounds"] = max(1, remaining_objective_rounds)
+            print(
+                "[pcpl-evolvo] paper objective: target_rounds={target} archive_rounds={archive} running_remaining={remaining} "
+                "(set --rounds to override).".format(
+                    target=int(AUTO_MAIN_PAPER_ROUND_OBJECTIVE),
+                    archive=int(archive_rounds_for_objective),
+                    remaining=int(resolved["rounds"]),
+                )
+            )
+        else:
+            paper_objective_skip_run = True
+            print(
+                "[pcpl-evolvo] paper objective already satisfied: archive_rounds={archive} target_rounds={target}. "
+                "Use --rounds to force additional cycles.".format(
+                    archive=int(archive_rounds_for_objective),
+                    target=int(AUTO_MAIN_PAPER_ROUND_OBJECTIVE),
+                )
+            )
+
+    if paper_objective_skip_run:
+        return
+
     args.mode = str(resolved.get("mode", args.mode))
     args.profile = str(resolved.get("profile", args.profile))
     _apply_runtime_config(args, resolved)
