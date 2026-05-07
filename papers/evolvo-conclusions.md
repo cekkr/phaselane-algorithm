@@ -1,12 +1,12 @@
 # Evolvo Conclusions (Complete Full Run Synthesis)
 
-Date: 2026-05-06 (updated with latest dynamic-mode full evidence)
+Date: 2026-05-07 (updated with latest explorer-mode full evidence)
 
 Status: This is the canonical repository-local synthesis for paper-facing claims. It is self-contained: the paper does not need ignored runtime folders to preserve the conclusions below.
 
 ## Executive Conclusion
 
-The completed full Evolvo run strengthens the same design reading, but with better evidence quality: PCPL's hot token path should stay sparse, deterministic, and feed-forward, while long-horizon synchronization belongs in a separate GPS-disciplined supervisory layer. The protocol invariants are stable; token-recovery pressure stays near zero, with only isolated weak-profile events in low-entropy quick scenarios. The remaining risk is route/lane inference from public structure and timing, plus long-window drift behavior.
+The completed full Evolvo run strengthens the same design reading, but with better evidence quality: PCPL's hot token path should stay sparse, deterministic, and feed-forward, while long-horizon synchronization belongs in a separate GPS-disciplined supervisory layer. The protocol invariants are stable; token-recovery pressure stays near zero, with only isolated weak-profile events in low-entropy stress scenarios. The remaining risk is route/lane inference from public structure and timing, plus long-window drift behavior.
 
 The run should not be presented as automatic discovery of a final controller. Baseline ordering varies with objective/version, but the stable pattern is unchanged: evolved defenders do not establish a robust ceiling above the hand sparse baselines. The correct conclusion is narrower and stronger: the evolutionary search independently converges toward sparse activation and exposes the failure frontier that must be handled outside the per-cycle token mixer.
 
@@ -118,11 +118,11 @@ Future Evolvo work should treat evaluability as part of the objective:
 - PCPL correctness does not require dense controller logic.
 - The practical token core should be sparse, deterministic, and feed-forward.
 - One-of-$x$ matching, per-block fairness, permutation validity, replay rejection, and cross-lane separation are stable in this evidence family.
-- Token-recovery signal remains near zero overall, but conclusions should avoid absolute-zero wording and keep low-entropy quick-scenario pressure in attacker panels.
+- Token-recovery signal remains near zero overall, but conclusions should avoid absolute-zero wording and keep low-entropy stress-scenario pressure in attacker panels.
 - Long-horizon synchronization is the dominant unresolved engineering frontier.
 - Current attacker pressure is mainly lane/route inference from public timing and phase structure, not token material recovery.
 - Evolutionary search is useful for discovering circuit-family motifs and failure families; it is not yet evidence of a complete self-healing controller.
-- Relative baseline position is objective-version dependent; in the latest dynamic/full evidence, the best evolved defender remains below `reference-full`, `balanced`, and `minimal-cost`.
+- Relative baseline position is objective-version dependent; in the latest explorer/full evidence, the best evolved defender remains below `reference-full`, `balanced`, and `minimal-cost`.
 
 ## Additional Conclusion From Latest Dynamic-Mode Full Evidence
 
@@ -143,7 +143,30 @@ This addendum captures the latest dynamic/full evidence family in a self-contain
   - max `0.001157`,
   - the only nonzero event appeared in an `x8` quick base scenario under the weakest dense profile (`compound ratio 0.6667`).
 
-Additional paper-facing conclusion: the right wording is "near-zero token recovery in this evidence family," not "impossible token recovery." Keep targeted low-entropy quick-scenario attacker panels as a permanent regression check, while maintaining the sparse feed-forward core and GPS-disciplined supervisory synchronization.
+Additional paper-facing conclusion: the right wording is "near-zero token recovery in this evidence family," not "impossible token recovery." Keep targeted low-entropy stress-scenario attacker panels as a permanent regression check, while maintaining the sparse feed-forward core and GPS-disciplined supervisory synchronization.
+
+## Additional Conclusion From Latest Explorer-Mode Full Evidence
+
+This addendum captures the latest explorer/full evidence family in a self-contained way (fitness schema: `auto-explorer-full-5ad147bd8aea8067`).
+
+- Completed rounds: `16/16` valid (`0` skipped), so claims remain evaluation-backed.
+- Panel fragility is still high: timeout rescue was used in `16/16` rounds; progressive stop `timeout-collapse-before-expand` appeared in `11/16`.
+- Search plateau risk increased: generation-0 survivors were `15/16`, so most final selections stayed close to first-generation candidates.
+- Best defender score: `0.485253`; baseline means: `reference-full=0.508161`, `balanced=0.516961`, `minimal-cost=0.532565`.
+- Principle invariants remain saturated (`1.0000`) and security remains high (mean `0.998922`).
+- Long-horizon sync is still the dominant unresolved frontier (`projected_sync_loss` mean `0.994508`, `horizon_sync` mean `0.005492`).
+- Sparse activation remains the winning shape:
+  - ratio `0.2000`: mean defender score `0.485253`,
+  - ratio `0.4000`: mean defender score `0.479362`,
+  - ratio `0.5918`: mean defender score `0.476515`,
+  - ratio `0.6000`: mean defender score `0.475679`,
+  - score vs compound-ratio correlation: `-0.622`.
+- Token success is near-zero but not absolute-zero:
+  - round mean `0.000062`,
+  - max `0.000992`,
+  - the only nonzero event appeared in `x8-generated:mid:shared-low-entropy:f70` (round `0003`, dense profile near compound ratio `0.592`).
+
+Additional paper-facing conclusion: explorer mode reinforces the same architecture outcome (sparse feed-forward core plus external GPS-disciplined supervision), but it also highlights plateau sensitivity. Future runs should explicitly include anti-plateau gates and maintain low-entropy stress-scenario attacker checks as mandatory regressions.
 
 ## Recommended Next Updates
 

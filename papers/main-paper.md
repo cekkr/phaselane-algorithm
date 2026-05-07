@@ -1267,7 +1267,7 @@ conclusions in a self-contained form:
 | evidence signal | paper interpretation | design consequence |
 | --- | --- | --- |
 | Principle invariants at `1.0000` | the construction preserves exact validation semantics | keep correctness proof tied to permutation and canonical recomputation |
-| Token success near zero (rare nonzero stress-case events) | token material recovery is not a practical attacker mode in this evidence family, but absolute-zero should not be claimed | keep hash/KDF domain separation and include low-entropy quick-scenario attacker panels |
+| Token success near zero (rare nonzero stress-case events) | token material recovery is not a practical attacker mode in this evidence family, but absolute-zero should not be claimed | keep hash/KDF domain separation and include low-entropy stress-scenario attacker panels |
 | Lane success around chance-like rates | route exposure is the useful adversarial pressure | add route-hardening objectives and schedule decorrelation metrics |
 | Projected sync loss at `1.0000` | long-window drift model saturates failure | do not claim the token core is a resynchronization solution |
 | Best evolved defender below `minimal-cost` | evolution confirms sparse shape but not a new score ceiling | keep minimal-cost as a benchmark to beat |
