@@ -6,10 +6,10 @@
 
 ### (Continuous symmetric encryption starting from asymmetric keys)
 
-Version 1.7 - 4 May 2026
+Version 1.8 - 13 May 2026
 
 ## Abstract
-I present the Prime-Compound Phase-Lane Token Protocol (PCPL), a no-handshake token system where a device emits one token per cycle and exactly one provider can validate it. PCPL combines (1) a public phase clock derived from coprime residues, (2) hidden prime-compound bouquets per provider, (3) a private per-block lane permutation, and (4) device-side state evolution that chains all lanes. The latest repository-local co-evolution synthesis sharpens the practical implementation direction: the protocol invariants are stable, while deployable circuits should be split into a sparse feed-forward token core, a GPS-disciplined synchronization supervisor, a route-hardening monitor, and a native-execution audit layer. The observed attacker pressure is primarily lane/route inference from public timing structure, not token material recovery; the decisive unresolved weakness is long-horizon drift and route leakage, not the one-of-$x$ validation rule. I also introduce the symmetric continuous tokenizer device model, motivated by FPGA-based dynamic hash circuits and twin circuits for peer validation. A step-by-step algorithm description, correctness properties, deterministic traces, circuit-level guidance, and offline design-search conclusions are provided. [1][2][3][15][16]
+I present the Prime-Compound Phase-Lane Token Protocol (PCPL), a no-handshake token system where a device emits one token per cycle and exactly one provider can validate it. PCPL combines (1) a public phase clock derived from coprime residues, (2) hidden prime-compound bouquets per provider, (3) a private per-block lane permutation, and (4) device-side state evolution that chains all lanes. The latest repository-local co-evolution synthesis confirms a conservative implementation direction: the protocol invariants are stable, while deployable circuits should be split into a sparse feed-forward token core, a GPS-disciplined synchronization supervisor, a route-hardening monitor, and a native-execution audit layer. Evolved candidates confirm sparse activation but remain below the hand sparse baseline family, so the evidence is architectural rather than a final-controller proof. The observed attacker pressure is primarily lane/route inference from public timing structure, not token material recovery; the decisive unresolved weakness is long-horizon drift and route leakage, not the one-of-$x$ validation rule. I also introduce the symmetric continuous tokenizer device model, motivated by FPGA-based dynamic hash circuits and twin circuits for peer validation. A step-by-step algorithm description, correctness properties, deterministic traces, circuit-level guidance, and offline design-search conclusions are provided. [1][2][3][15][16]
 
 ## 1. Symmetric continuous tokenizer devices
 PCPL runs on a “symmetric continuous tokenizer” device designed for consumer computing. The device is envisioned as a reconfigurable hardware unit (for example, an FPGA-based key) that can:
@@ -298,9 +298,10 @@ The practical architecture is therefore four-layered:
   allowed to change public or provider-observable policy limits, but not to
   inject hidden state into provider token derivation.
 - **Execution audit layer:** measure timeout ratio, native execution coverage,
-  active-compound density, and final metric availability. This prevents a
-  circuit from being promoted only because it scores well in a narrow simulated
-  slice while being unstable under the intended backend.
+  active-compound density, final metric availability, attacker-panel breadth,
+  and search plateau indicators. This prevents a circuit from being promoted
+  only because it scores well in a narrow simulated slice while being unstable
+  under the intended backend.
 
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
@@ -1248,18 +1249,21 @@ The stable design constraints are:
 - Core PCPL invariants are easy to preserve under search: one-of-$x$, block
   fairness, permutation validity, replay rejection, and cross-lane separation
   remain saturated in the valid evidence family.
-- Token recovery is not the observed attacker mode. The stronger signal is
-  lane/route inference from public phase and schedule structure.
-- Sparse activation is not just a runtime trick. It is the best observed
-  defender shape under the current objective family.
-- Baseline ordering is objective-version dependent; the robust claim is that
-  evolved defenders have not established a stable score ceiling above the hand
+- Token recovery is not the observed attacker mode. It is zero in the complete
+  valid full evidence, but that remains an empirical result rather than an
+  impossibility claim. The stronger signal is lane/route inference from public
+  phase and schedule structure.
+- Sparse activation is not just a runtime trick. The best observed defender
+  shape is the one-active-compound profile, with score falling as active
+  compound density increases.
+- Evolved defenders have not established a stable score ceiling above the hand
   sparse baselines. The evolved result is therefore architectural evidence, not
   a final optimum.
-- Long-horizon synchronization is not solved by the token core. A precise
-  external clock discipline and a separate supervisory layer are required.
-- Native execution feasibility is not equivalent to cryptographic correctness.
-  It must be measured and gated separately.
+- Long-horizon synchronization is not solved by the token core. Projected
+  horizon loss remains near saturation, so a precise external clock discipline
+  and a separate supervisory layer are required.
+- Native execution feasibility and archive evaluability are not equivalent to
+  cryptographic correctness. They must be measured and gated separately.
 
 The following table gives the paper-facing semantics of the latest tracked
 conclusions in a self-contained form:
@@ -1267,11 +1271,12 @@ conclusions in a self-contained form:
 | evidence signal | paper interpretation | design consequence |
 | --- | --- | --- |
 | Principle invariants at `1.0000` | the construction preserves exact validation semantics | keep correctness proof tied to permutation and canonical recomputation |
-| Token success near zero (rare nonzero stress-case events) | token material recovery is not a practical attacker mode in this evidence family, but absolute-zero should not be claimed | keep hash/KDF domain separation and include low-entropy stress-scenario attacker panels |
-| Lane success around chance-like rates | route exposure is the useful adversarial pressure | add route-hardening objectives and schedule decorrelation metrics |
-| Projected sync loss at `1.0000` | long-window drift model saturates failure | do not claim the token core is a resynchronization solution |
+| Token success at `0.0000` in complete valid evidence | token material recovery is not the active attacker mode, but absolute-zero should not be claimed | keep hash/KDF domain separation and preserve low-entropy stress-scenario attacker panels |
+| Lane success nonzero while token success stays zero | route exposure is the useful adversarial pressure | add route-hardening objectives and schedule decorrelation metrics |
+| One-active-compound bucket is strongest | sparse activation is a specification parameter, not only a speed optimization | state bouquet inventory and active subset size separately |
+| Projected sync loss near saturation | long-window drift model remains the dominant weakness | do not claim the token core is a resynchronization solution |
 | Best evolved defender below `minimal-cost` | evolution confirms sparse shape but not a new score ceiling | keep minimal-cost as a benchmark to beat |
-| Runtime headroom weak under native execution | hardware feasibility is a separate bottleneck | add native backend gates and avoid dense control logic |
+| Runtime and evaluability weak under native execution | hardware feasibility and archive promotion are separate bottlenecks | add native backend gates, final-metric gates, and attacker-panel breadth gates |
 
 ### 8.6 Decisive circuit changes
 The synthesis changes the practical PCPL circuit in the following decisive ways:
@@ -1290,9 +1295,10 @@ The synthesis changes the practical PCPL circuit in the following decisive ways:
    decorrelation, phase-jitter bounds, and lane-pressure estimates are
    supervisory inputs. They must remain public or provider-observable when they
    affect recomputation.
-5. **Separate backend auditing.** Timeout behavior, native GPU share, per-cycle
-   fan-in, and final metric availability are promotion criteria, not hidden
-   terms inside token derivation.
+5. **Separate backend and archive auditing.** Timeout behavior, native GPU
+   share, per-cycle fan-in, final metric availability, attacker-panel breadth,
+   and plateau indicators are promotion criteria, not hidden terms inside token
+   derivation.
 6. **Reject post-init handshakes.** A candidate that needs extra runtime
    negotiation to select its formula is not a PCPL candidate. It changes the
    protocol and opens a new attack surface.
@@ -1332,7 +1338,8 @@ flowchart TB
     A1["Timeout ratio"]
     A2["Native backend coverage"]
     A3["Final metric availability"]
-    A1 --> A2 --> A3
+    A4["Panel breadth / plateau check"]
+    A1 --> A2 --> A3 --> A4
   end
 
   Sync --> Policy["Public policy epoch"]
@@ -1466,6 +1473,9 @@ The next productive improvements are specific:
   tied to the external timing reference.
 - **Audit native execution separately.** Track per-operation backend coverage,
   CPU fallback, final sync overhead, and per-cycle budget consumption.
+- **Stabilize attacker-panel evaluation.** Promote only candidates with final
+  metrics, bounded timeout rescue, and enough attacker-panel breadth to avoid
+  one-attacker selection artifacts.
 - **Split reporting.** Future reports should separate token invariants,
   route/lane inference, supervisory horizon sync, and runtime backend behavior.
 - **Keep minimal-cost as a hard baseline.** A new evolved profile should not be
@@ -1489,6 +1499,9 @@ The current design still has meaningful weak points:
 - **Near-constant metrics can hide plateaus.** QFT, linear-rank, and compare-$x$
   checks are useful constraints, but under fixed scenario families they may not
   provide enough gradient for search.
+- **Generation-0 survival can hide weak search pressure.** If final selections
+  stay close to initial candidates, the evidence is better read as confirmation
+  of a motif than as discovery of a mature controller.
 - **The hand sparse baseline is still strong.** Evolution currently confirms
   the sparse architecture more than it discovers a better one.
 
@@ -1504,8 +1517,8 @@ The current design still has meaningful weak points:
   period size is a public engineering parameter rather than a hidden defense.
 - For testing, primes and compound bases can be generated from a seeded stream
   to avoid arbitrary constants. [6][7]
-- Co-evolution evidence supports a sparse selector over a fixed arithmetic PCPL
-  core, not a dense universal controller.
+- Co-evolution evidence supports a one-active-compound sparse selector over a
+  fixed arithmetic PCPL core, not a dense universal controller.
 - Sparse activation should not be confused with weak provisioning. The bouquet
   inventory can remain large; only the per-cycle active subset is small.
 - Long-horizon synchronization remains the dominant practical weakness:
@@ -1528,10 +1541,10 @@ The current design still has meaningful weak points:
 - QFT, linear-rank, and compare-$x$ terms validate important constraints, but
   under fixed scenario families they can become near-constant and provide
   limited evolutionary gradient.
-- Panel fragility and timeout rescue remain process weaknesses even when final
-  metrics exist. Archive acceptance needs hard gates for final-metric
-  availability, provider-observable inputs, bounded timeout ratio, and native
-  execution coverage.
+- Panel fragility, timeout rescue, missing final metrics, and generation-0
+  survival remain process weaknesses. Archive acceptance needs hard gates for
+  final-metric availability, provider-observable inputs, bounded timeout ratio,
+  attacker-panel breadth, and native execution coverage.
 - The hand sparse baseline remains strong. Evolved candidates should be treated
   as architectural evidence until they beat that baseline or justify a clear
   security tradeoff.
@@ -1542,11 +1555,11 @@ The current design still has meaningful weak points:
 ## 10. Conclusion
 PCPL provides a deterministic, no-handshake token protocol with exact 1-of-$x$ matching and a device-only chaining mechanism. Combined with symmetric continuous tokenizer devices, it supports provider validation and peer-to-peer isolation with dynamic, evolving secrets.
 
-The latest deterministic and evolutionary evidence makes the implementation direction more precise. The core token protocol is stable: permutation validity, per-block fairness, one-of-$x$ matching, replay rejection, and cross-lane separation remain saturated in valid evidence rows. The practical circuit should therefore not be a large opaque controller. It should be a sparse, feed-forward arithmetic token core coupled to a GPS-disciplined synchronization supervisor, a route-hardening monitor, and an execution audit layer.
+The latest deterministic and evolutionary evidence makes the implementation direction more precise. The core token protocol is stable: permutation validity, per-block fairness, one-of-$x$ matching, replay rejection, and cross-lane separation remain saturated in valid evidence rows. The strongest evolved shape is a one-active-compound sparse profile, but it still does not beat the hand sparse baseline. The practical circuit should therefore not be a large opaque controller. It should be a sparse, feed-forward arithmetic token core coupled to a GPS-disciplined synchronization supervisor, a route-hardening monitor, and an execution audit layer.
 
 The main remaining challenge is not token correctness. It is long-horizon synchronization, provider-observable control inputs, native execution stability, and resistance to lane-prediction leakage. Evolutionary search is useful for exposing these motifs and failure modes, but the protocol's correctness still comes from the construction: deterministic phase computation, private per-block permutation, domain-separated lane token derivation, and canonical recomputation by the intended provider.
 
-The decisive implementation direction is conservative: keep the token core small, make active compound count explicit, assume a precise external timing reference, reject post-initialization handshakes, and report route exposure and horizon sync separately from token invariants. Under those constraints, PCPL remains a plausible no-handshake lane-token protocol while leaving the open engineering work visible instead of hiding it inside an overcomplicated circuit.
+The decisive implementation direction is conservative: keep the token core small, make active compound count explicit, assume a precise external timing reference, reject post-initialization handshakes, and report route exposure, horizon sync, runtime headroom, and archive evaluability separately from token invariants. Under those constraints, PCPL remains a plausible no-handshake lane-token protocol while leaving the open engineering work visible instead of hiding it inside an overcomplicated circuit.
 
 ## References
 1. [NIST FIPS 180-4 (Update 1), *Secure Hash Standard (SHS)*](https://csrc.nist.gov/pubs/fips/180-4/upd1/final)
