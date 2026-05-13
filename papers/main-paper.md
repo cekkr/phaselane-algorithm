@@ -284,11 +284,14 @@ allowed to add runtime challenge/response handshakes.
 
 The practical architecture is therefore four-layered:
 
-- **Hot token core:** every cycle, compute phase residues, select a small active
-  subset of bouquet compounds, evaluate the modular products, derive $K_i(t)$,
-  derive $T_i(t)$, and update the device's local state register. This path is
-  deterministic, branch-light, provider-recomputable for the addressed lane,
-  and friendly to fixed hardware or native GPU execution.
+- **Hot token core:** every cycle, compute phase residues, select a
+  profile-fixed small active subset of bouquet compounds, evaluate the modular
+  products, derive $K_i(t)$, derive $T_i(t)$, and update the device's local
+  state register. The primary sparse profile uses one active compound per
+  bouquet per cycle; a two-active-compound profile is the first robustness
+  comparison. This path is deterministic, branch-light, provider-recomputable
+  for the addressed lane, and friendly to fixed hardware or native GPU
+  execution.
 - **Synchronization supervisor:** over a slower window, discipline the cycle
   counter from a precise external reference, such as a GPS-grade time source.
   This layer owns drift estimates, guard windows, recovery mode limits, and
@@ -310,7 +313,7 @@ flowchart TD
   Clock --> Phase["Public phase residues<br/>a_t, b_t, c_t, Phi_t"]
   Phase --> Hot["Hot sparse token core"]
   Bouquets["Provider/lane bouquets"] --> Hot
-  Policy["Provider-observable policy vector<br/>active count, kernel, salt epoch, jitter bound"] --> Hot
+  Policy["Provider-observable profile<br/>inventory, active count, kernel, salt epoch, jitter bound"] --> Hot
   Hot --> Token["Emitted token T_idx(t)"]
   Hot --> State["Device-only update<br/>W[idx], chain products, S"]
 
@@ -882,6 +885,18 @@ subset per cycle. This is not a claim that the secret inventory should be small.
 It is a claim that the active arithmetic fan-in of the hot path should be
 small, measurable, and explicitly specified.
 
+The genetic programs are not copied into the protocol. They are translated into
+four specification changes:
+
+- `inventory_size` and `active_count` are explicit deployment parameters.
+- the primary production profile is `active_count=1` per bouquet per cycle;
+  `active_count=2` is a robustness profile, not the default.
+- policy inputs are limited to public phase/time/lane data, explicit public
+  epochs, and lane-local state that the provider can recompute and the device
+  can mirror.
+- route pressure and long-horizon drift change only public profile limits or
+  fail-closed behavior; they do not change token formulas through hidden state.
+
 Let a deterministic policy circuit produce a bounded control vector:
 
 $$
@@ -904,14 +919,32 @@ The intended meanings are:
 - $\tau_i$: token-scramble control
 - $\jmath_i$: phase-jitter control
 
-For a bouquet of length $n$, define:
+The complete policy vector is useful for design search, but a deployment
+profile should collapse it into a small public profile. For a bouquet of length
+$n$, the deployed active count is:
+
+$$
+r_i(t)=\mathrm{clip}\left(A_{\mathrm{profile}}(t,i),\,1,\,n\right).
+$$
+
+The current primary profile is:
+
+| profile | bouquet inventory | active count | intended use |
+| --- | ---: | ---: | --- |
+| `PCPL-S1` | $n \ge 5$ | `1` | default sparse hot path |
+| `PCPL-S2` | $n \ge 5$ | `2` | robustness comparison for route-hardening tests |
+| `PCPL-Sk` | deployment-specific | fixed small $k$ | only after beating `S1/S2` on route and sync metrics |
+
+The continuous ratio form below is kept as an offline policy-search
+parameterization, not as a requirement that production hardware vary fan-in
+every cycle:
 
 $$
 \alpha_i(t)=\mathrm{clip}\left(\rho_i(t)\cdot(0.55+0.45\beta_i(t)),\,0,\,1\right),
 $$
 
 $$
-r_i(t)=1+\left\lfloor \alpha_i(t)(n-1)\right\rfloor.
+r_i^{\mathrm{search}}(t)=1+\left\lfloor \alpha_i(t)(n-1)\right\rfloor.
 $$
 
 Then replace `EvalBouquet` with a deterministic subset evaluator:
@@ -944,7 +977,41 @@ tokens sent only to other lanes. Provider-local replay bookkeeping is still
 useful, but it belongs outside token derivation unless it is mirrored by the
 device or encoded as an explicit public hint.
 
-### 5.9.1 Circuit-ready sparse evaluator
+### 5.9.1 Evolvo-derived policy pseudocode
+
+The translated defender motif is a small public-policy generator, not a hidden
+controller. In production it should be reduced to fixed profile choices and
+bounded public selectors:
+
+```text
+PublicPolicy(t, lane_id, public_epoch):
+    phase = PublicPhase(t, P, Q, R)
+    profile = published_profile(public_epoch)
+
+    active_count = profile.active_count          # PCPL-S1: 1, PCPL-S2: 2
+    kernel_id = profile.kernel_id                # small native-friendly set
+    stride_seed = H(PHASE || phase.Phi || lane_id || profile.stride_seed)
+    salt_epoch = profile.salt_epoch
+    jitter = bounded_public_jitter(phase, lane_id, profile.jitter_bound)
+    hash_round_limit = profile.hash_round_limit  # fixed small upper bound
+
+    return {
+        active_count,
+        kernel_id,
+        stride_seed,
+        salt_epoch,
+        jitter,
+        hash_round_limit,
+        exponent_bias: profile.exponent_bias,
+    }
+```
+
+The route-hardening and synchronization layers may publish a later
+`public_epoch`, but the provider must be able to derive the same policy before
+checking the token. If the required policy cannot be derived from public or
+provider-local inputs, the correct behavior is to fail closed, not to negotiate.
+
+### 5.9.2 Circuit-ready sparse evaluator
 
 For implementation, the sparse evaluator can be written as a bounded datapath
 with no data-dependent loop count after policy resolution:
@@ -974,7 +1041,8 @@ provider-observable policy vector. The policy vector can be compact:
 
 ```text
 policy = {
-    active_count,        # usually 1 or 2 for the sparse profile
+    inventory_size,      # provisioned bouquet size for this profile
+    active_count,        # PCPL-S1 uses 1; PCPL-S2 uses 2
     kernel_id,           # small native-friendly mixer selector
     stride_seed,         # public/profile seed for subset walk
     salt_epoch,          # public lane-salt epoch
@@ -988,7 +1056,7 @@ parameter. A deployment profile should state both the provisioned bouquet
 inventory size and the per-cycle active subset size. This makes cost, leakage
 surface, and hardware fan-in auditable.
 
-### 5.9.2 Hot-core pseudocode with provider contract
+### 5.9.3 Hot-core pseudocode with provider contract
 
 The hot core can be specified once and used by both device and provider. The
 device calls it for the scheduled lane; the provider calls it for its own lane.
@@ -1010,10 +1078,11 @@ DeviceCycle(t):
     B = floor(t / x)
     s = t mod x
     idx = PermuteBlock(perm_key, B)[s]
-    policy = PublicPolicy(t, idx)
+    public_epoch = CurrentPublicEpoch(t)
+    policy = PublicPolicy(t, idx, public_epoch)
     phase = PublicPhase(t, P, Q, R)
     T = LaneTokenSparse(idx, t, bouquets_idx, policy)
-    emit (t, idx, policy.public_epoch, T)
+    emit (t, idx, public_epoch, T)
     update_device_state(idx, T, phase)
 
 ProviderCycle(i, message):
@@ -1027,7 +1096,22 @@ ProviderCycle(i, message):
 provider. If present, it is not a secret and it is not a proof of authenticity;
 it is only a transport hint. The authentication event remains the token match.
 
-### 5.9.3 Supervisory control pseudocode
+For circuit definition, the hot path is a fixed five-stage pipeline:
+
+```text
+HotCorePipeline:
+    stage 1: phase registers        -> a_t, b_t, c_t, Phi_t
+    stage 2: subset selectors       -> active indices for A/B/C
+    stage 3: sparse modular product -> EA, EB, EC using active_count lanes
+    stage 4: bounded mix + KDF      -> K_i(t), T_i(t)
+    stage 5: writeback              -> W[idx], chain products, S_{t+1}
+```
+
+Stages 1-4 are shared by device and provider for a lane. Stage 5 is device-only.
+There is no data-dependent loop count, no post-initialization handshake, and no
+hidden supervisory output inside token derivation.
+
+### 5.9.4 Supervisory control pseudocode
 
 The synchronization supervisor operates outside token derivation. It does not
 ask providers for new information after the initial provisioning step. It only
@@ -1049,7 +1133,7 @@ SupervisoryWindow(window):
         tighten_schedule_decorrelation_profile()
 
     if backend_headroom is weak:
-        lower_active_count_or_kernel_limit()
+        reject_profile_or_lower_public_kernel_limit()
 
     publish next public policy epoch
 ```
