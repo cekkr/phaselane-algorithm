@@ -9,7 +9,7 @@
 Version 1.8 - 13 May 2026
 
 ## Abstract
-I present the Prime-Compound Phase-Lane Token Protocol (PCPL), a no-handshake token system where a device emits one token per cycle and exactly one provider can validate it. PCPL combines (1) a public phase clock derived from coprime residues, (2) hidden prime-compound bouquets per provider, (3) a private per-block lane permutation, and (4) device-side state evolution that chains all lanes. The latest repository-local co-evolution synthesis confirms a conservative implementation direction: the protocol invariants are stable, while deployable circuits should be split into a sparse feed-forward token core, a GPS-disciplined synchronization supervisor, a route-hardening monitor, and a native-execution audit layer. Evolved candidates confirm sparse activation but remain below the hand sparse baseline family, so the evidence is architectural rather than a final-controller proof. The observed attacker pressure is primarily lane/route inference from public timing structure, not token material recovery; the decisive unresolved weakness is long-horizon drift and route leakage, not the one-of-$x$ validation rule. I also introduce the symmetric continuous tokenizer device model, motivated by FPGA-based dynamic hash circuits and twin circuits for peer validation. A step-by-step algorithm description, correctness properties, deterministic traces, circuit-level guidance, and offline design-search conclusions are provided. [1][2][3][15][16]
+I present the Prime-Compound Phase-Lane Token Protocol (PCPL), a no-handshake token system where a device emits one token per cycle and exactly one provider can validate it. PCPL combines (1) a public phase clock derived from coprime residues, (2) hidden prime-compound bouquets per provider, (3) a private per-block lane permutation, and (4) device-side state evolution that chains all lanes. The latest repository-local co-evolution synthesis confirms a conservative implementation direction: the protocol invariants are stable, while deployable circuits should be split into a sparse feed-forward token core, a GPS-disciplined synchronization supervisor, a route-hardening monitor, and a native-execution audit layer. Evolved candidates confirm sparse activation but remain below the hand sparse baseline family, so the evidence is architectural rather than a final-controller proof. The observed attacker pressure is primarily lane/route inference from public timing structure, not token material recovery; the decisive unresolved weakness is long-horizon drift and route leakage, not the one-of-$x$ validation rule. I also introduce the symmetric continuous tokenizer device model, motivated by FPGA-based dynamic hash circuits and twin circuits for peer validation. A step-by-step algorithm description, correctness properties, deterministic traces, circuit-level guidance, and offline design-search conclusions are provided. [1][2][3][4][5][15][16][28][29]
 
 ## 1. Symmetric continuous tokenizer devices
 PCPL runs on a “symmetric continuous tokenizer” device designed for consumer computing. The device is envisioned as a reconfigurable hardware unit (for example, an FPGA-based key) that can:
@@ -69,7 +69,7 @@ Threat model (minimal):
 - Observing accepted tokens should not reveal other lanes.
 - Public time/phase information should not enable cross-lane forgery.
 
-The "primes' compounds" approach as differentiate hashing algorithm should be considered the simplest one. Even with certain vulnerabilities depending on chosen parameters, it's good for working with integer-only circuits.
+The prime-compound approach should be read as the simplest integer-only construction for the modular product layer, not as a replacement for standardized hashing or KDFs. Its security depends on parameter selection, bouquet secrecy, and the surrounding hash/KDF schedule. [20][30][1][2][5]
 
 ## 3. Notation and public parameters
 Let:
@@ -77,7 +77,7 @@ Let:
 - $x$ be the number of providers (lanes).
 - $P, Q, R$ be pairwise coprime primes (also coprime with $x$).
 - $M$ be a prime modulus for multiplicative-group arithmetic.
-- $H(\cdot)$ be a cryptographic hash (or a dynamic hash circuit). [1][2][3]
+- $H(\cdot)$ be a cryptographic hash or standardized PRF/KDF primitive, depending on the role being instantiated. [1][2][3][4][5][22]
 - $\mathrm{Trunc}_k(\cdot)$ be truncation to $k$ bits.
 - $t$ be the cycle counter.
 - $\|$ denote byte/bit-string concatenation.
@@ -86,7 +86,7 @@ Each provider $i$ has three secret bouquets: $\mathrm{BouquetA}_i, \mathrm{Bouqu
 
 ### 3.0 Symbols and domain tags
 
-To avoid accidental cross-use of hashes (“domain confusion”), **every hash that serves a distinct role appends a distinct domain tag**. [9][5]
+To avoid accidental cross-use of hashes (“domain confusion”), **every hash that serves a distinct role appends a distinct domain tag or context string**. Tuple-style encodings, cSHAKE/KMAC customization strings, and explicit domain separation tags are the closest standardized analogues. [9][21][5]
 
 Glossary:
 - **CRT clock:** the public schedule formed by the three residues mod $P,Q,R$. [20]
@@ -103,12 +103,12 @@ Domain tags (constants) used in this paper:
 - `PERMSEED` — derive the per-block shuffle seed used by $\pi_B$
 - `PHASE` — domain tag for the phase digest $\Phi_t$
 - `EXP` — domain tag for bouquet exponent derivation $e_j$
-- `KDF` — domain tag for per-lane key material $K_i(t)$ [10][5]
+- `KDF` — domain tag for per-lane key material $K_i(t)$ [10][22][5]
 - `TOK` — domain tag for the final emitted token $T_i(t)$
 - `EVOLVE` — domain tag for state evolution $S_{t+1}$
 
 ### 3.1 Seed construction and coprime extraction
-The device bootstraps a root seed $Z$ from device-local entropy and context (for example: device secret, serial, provider list, and a boot nonce). In the demo, $Z$ is produced by a deterministic RNG seeded with `--seed`, then bound to labels with $H(\cdot)$:
+The device bootstraps a root seed $Z$ from device-local entropy and context (for example: device secret, serial, provider list, and a boot nonce). Production deployments should separate entropy-source validation from deterministic expansion: entropy belongs to the SP 800-90B / RFC 4086 layer, while deterministic replayable streams belong to an approved DRBG or a clearly specified PRF expansion. [23][7][6] In the demo, $Z$ is produced by a deterministic RNG seeded with `--seed`, then bound to labels with $H(\cdot)$:
 
 - $\mathrm{perm\_key} = H(Z \| \text{PERMKEY})$
 - $S_0 = H(Z \| \text{SEED})$
@@ -145,7 +145,7 @@ The runtime cycle counter $t$ must be common to device and providers. In practic
 
 
 ### 3.2 Best-practice coprimes, compounds, and key selection
-Parameter and key selection should scale with the peer count and keep strict domain separation between device-only and provider-only secrets.
+Parameter and key selection should scale with the peer count and keep strict domain separation between device-only and provider-only secrets. The cryptographic part should be treated as a KDF/PRF schedule, not as ad-hoc string hashing. [5][22][9]
 
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
@@ -404,7 +404,7 @@ $$
 
 `Trunc_k` can mean “take the first $k$ bits” (most common), or “interpret as an integer and reduce mod $2^k$”. The demo uses byte truncation.
 
-**Rule of thumb:** never concatenate decimal strings, and never concatenate variable-length integers without either fixed widths or length-prefixes. [9]
+**Rule of thumb:** never concatenate decimal strings, and never concatenate variable-length integers without either fixed widths, length-prefixes, or a tuple-hash construction. [8][9][21]
 
 Demo note: the Python demo uses BLAKE2b [3] and a typed, length-prefixed encoding for each hash part (tag + 4-byte length) instead of fixed-width I2OSP. Older demo runs omitted `enc_i(i)` in the KDF; the current demo includes it to match the spec, so token traces differ from earlier runs.
 
@@ -466,7 +466,7 @@ $$
 $$
 
 Because $\pi_B$ is a permutation, each lane appears **exactly once** per block of length $x$ (“returns every $x$”).
-Hashing and truncation happen *after* this selection and therefore cannot break the 1-of-$x$ property.
+Hashing and truncation happen *after* this selection and therefore cannot break the 1-of-$x$ property. In implementation terms, `PermuteBlock` should be a deterministic Durstenfeld/Fisher-Yates shuffle over a PRF/DRBG byte stream, not a random-sort shortcut. [14][26][27]
 
 ### 5.2.1 Device-side destination selection
 
@@ -544,7 +544,7 @@ Implementation notes:
 - In code, $K_i(t)$ is the **hash digest bytes** (not an integer).
 - When concatenating integers, always use the canonical fixed-length encoding (§5.0).
 - Including $i$ inside the KDF provides explicit lane domain-separation even if two providers were accidentally provisioned with identical bouquets.
-- If you prefer a standardized PRF/KDF wrapper, use HMAC or HKDF with explicit context labels. [4][5][10]
+- If you prefer a standardized PRF/KDF wrapper, use HMAC, HKDF, or an SP 800-108 KDF mode with explicit context labels. [4][5][10][22]
 
 ### 5.4.1 Worked example with real integers (toy parameters + SHA-256 [1])
 This example is **not** meant to be secure (the primes are tiny); it exists only to show the math and key composition end-to-end with concrete numbers.
@@ -705,7 +705,7 @@ flowchart LR
   subgraph Provider_i["Provider i (continuous validator)"]
     Clock["public epoch → local t"] --> Loop["every cycle: compute Φ_t, EA/EB/EC, K_i(t), T_i(t)"]
     Loop --> Buf["buffer T_i(t) (±Δ window)"]
-    Rx["receive (t,i,T)"] --> Cmp["constant-time compare [17]"]
+    Rx["receive (t,i,T)"] --> Cmp["constant-time compare [17][25]"]
     Buf --> Cmp
     Cmp --> Match{"match & unused?"}
     Match -->|yes| Accept["accept (≈1/x cycles)"]
@@ -746,14 +746,14 @@ To be able to validate in constant time (and to match the intended hardware/circ
 
 Minimal runtime behavior:
 
-1. **Clock discipline / epoch mapping.** Maintain a local view of the public cycle counter $t$ (e.g., from NTP[13]/GPS time, a block height, or any agreed public epoch-to-$t$ mapping).; conceptually similar to the moving factor in HOTP/TOTP) [11][12]
+1. **Clock discipline / epoch mapping.** Maintain a local view of the public cycle counter $t$ (e.g., from NTP [13], GPS-grade time, a block height, or any agreed public epoch-to-$t$ mapping); conceptually similar to the moving factor in HOTP/TOTP and to OTP authenticator guidance where the nonce is counter- or time-derived. [11][12][24]
 2. **Per-cycle update.** For each cycle $t$, compute $\Phi_t$, then evaluate bouquets and derive:
    $EA_i(t), EB_i(t), EC_i(t) \rightarrow K_i(t) \rightarrow T_i(t)$.
 3. **Small validation window (optional).** Keep $T_i(t)$ plus a small $\pm\Delta$ window (e.g., previous/next few cycles) to tolerate network delay and small clock skew.
 4. **On receive.** When a message arrives with $(t, i, T)$:
    - reject if $i$ is not this provider’s identifier
    - reject if $t$ is outside the allowed window
-   - constant-time compare $T$ with the locally buffered expected token(s)
+   - constant-time compare $T$ with the locally buffered expected token(s), avoiding early-exit comparisons for secret-bearing material [17][25]
    - accept at most once per cycle (track recently accepted $(i,t)$ to prevent trivial replay inside the skew window)
 
 **Acceptance frequency:** because the device selects each provider exactly once per block of length $x$, provider $i$ will see a valid match only about **1 time in $x$ cycles**. All other cycles either have no message or produce a mismatch by construction.
@@ -815,7 +815,7 @@ function Phase(t):
     return (a,b,c,u1,u2,u3,Phi)
 
 function PermuteBlock(perm_key, B, Phi_block, x):
-    # Deterministic Fisher–Yates [14] using hash-derived bytes as a PRNG stream. [6][7]
+    # Deterministic Fisher–Yates / Durstenfeld shuffle [14][26] using hash-derived bytes as a PRNG stream. [6][7][23]
     # Stable for the whole block B.
     seed = H( perm_key || encU32(B) || Phi_block || PERMSEED )
     L = [0,1,2,...,x-1]
@@ -1188,7 +1188,7 @@ In PCPL the permutation is *re-derived per block* from $(\mathrm{perm\_key}, B, 
 
 ### 6.3 Modular exponent correctness
 
-The `Eval(·)` step uses modular exponentiation and products modulo $M$.
+The `Eval(·)` step uses modular exponentiation and products modulo $M$, following the usual finite-field and modular-arithmetic setting. [20][30]
 To keep these operations well-defined and avoid degenerate values, enforce:
 
 - **Coprime bases:** each base used in a product must be coprime with $M$ (in particular, not divisible by $M$), otherwise terms collapse (e.g., $C\equiv 0\pmod M$).
@@ -1209,7 +1209,7 @@ Changing $x$ changes the block size, the number of permutations, and the chain w
 | 6 | 6 | 720 | 5 | composite ($2 \cdot 3$) |
 
 In general: block length $= x$, permutation space $= x!$, chain width $= x-1$.
-The public phase repeats with period $\mathrm{lcm}(P,Q,R)$; the $x$-cycle block structure is an additional factor, and re-deriving $\pi_B$ per block pushes repetition out further (bounded in practice by the counter wrap-around of the chosen block encoding).
+The public phase repeats with period $\mathrm{lcm}(P,Q,R)$; the $x$-cycle block structure is an additional factor, and re-deriving $\pi_B$ per block pushes repetition out further (bounded in practice by the counter wrap-around of the chosen block encoding). [20]
 For composite $x$ (e.g., $6=2\cdot 3$), choose $P,Q,R$ coprime with all prime factors of $x$ to avoid shrinking the phase/block interaction period.
 
 ## 7. Security intuition (informal)
@@ -1231,7 +1231,7 @@ A simulator was implemented cycle-by-cycle to validate correctness. The demo ver
 
 Repository: [cekkr/phaselane-algorithm@github.com](https://github.com/cekkr/phaselane-algorithm).
 Reference implementation and traces are provided as supplementary software material.
-For scientific interpretation, three distinctions are important. First, this section validates **protocol behavior** (schedule correctness, one-of-$x$, deterministic recomputation). Second, offline evolutionary experiments are used only as an **automatic search method** to discover candidate algorithmic/circuit policies under fixed objectives; they are not part of runtime protocol mechanics. Third, scoring is a **model-dependent lens** on quality: when score components or weights change, absolute scores should be compared only within the same scoring family, while invariant-level correctness claims remain comparable.
+For scientific interpretation, three distinctions are important. First, this section validates **protocol behavior** (schedule correctness, one-of-$x$, deterministic recomputation). Second, offline evolutionary experiments are used only as an **automatic search method** to discover candidate algorithmic/circuit policies under fixed objectives; they are not part of runtime protocol mechanics. This follows the broad genetic-algorithm / genetic-programming lineage, but PCPL uses it only as a design-search instrument, not as a proof method. [28][29] Third, scoring is a **model-dependent lens** on quality: when score components or weights change, absolute scores should be compared only within the same scoring family, while invariant-level correctness claims remain comparable.
 
 ### 8.1 Sample token trace (x=4, seed=1337)
 For PDF export, the original wide table was replaced with an A4-friendly summary table and a sequence diagram (tokens truncated for readability; the matched provider’s recomputed token equals the device token by construction).
@@ -1600,7 +1600,8 @@ The current design still has meaningful weak points:
 - The public period $\mathrm{lcm}(P,Q,R,x)$ is visible and QFT-recoverable, so
   period size is a public engineering parameter rather than a hidden defense.
 - For testing, primes and compound bases can be generated from a seeded stream
-  to avoid arbitrary constants. [6][7]
+  to avoid arbitrary constants; production use still needs a real entropy-source
+  story and deterministic expansion contract. [6][7][23]
 - Co-evolution evidence supports a one-active-compound sparse selector over a
   fixed arithmetic PCPL core, not a dense universal controller.
 - Sparse activation should not be confused with weak provisioning. The bouquet
@@ -1633,7 +1634,7 @@ The current design still has meaningful weak points:
   as architectural evidence until they beat that baseline or justify a clear
   security tradeoff.
 - Evolutionary search is heuristic optimization, not a formal proof technique;
-  correctness remains grounded in the protocol construction and invariants.
+  correctness remains grounded in the protocol construction and invariants. [28][29]
 - This paper was developed and formatted with the help of OpenAI models.
 
 ## 10. Conclusion
@@ -1651,22 +1652,31 @@ The decisive implementation direction is conservative: keep the token core small
 3. [RFC 7693, *The BLAKE2 Cryptographic Hash and Message Authentication Code*](https://www.rfc-editor.org/rfc/rfc7693.html)
 4. [RFC 2104, *HMAC: Keyed-Hashing for Message Authentication*](https://www.rfc-editor.org/rfc/rfc2104.html)
 5. [RFC 5869, *HMAC-based Extract-and-Expand Key Derivation Function (HKDF)*](https://datatracker.ietf.org/doc/html/rfc5869)
-6. [NIST SP 800-90A Rev. 1, *Recommendation for Random Number Generation Using Deterministic RBGs*](https://csrc.nist.gov/pubs/sp/800/90/a/r1/final)
+6. [NIST SP 800-90A Rev. 1, *Recommendation for Random Number Generation Using Deterministic Random Bit Generators*](https://csrc.nist.gov/pubs/sp/800/90/a/r1/final)
 7. [RFC 4086, *Randomness Requirements for Security*](https://datatracker.ietf.org/doc/html/rfc4086)
-8. [RFC 8017, *PKCS #1: RSA Cryptography Specifications Version 2.2* (I2OSP/OS2IP)](https://www.rfc-editor.org/rfc/rfc8017.html)
+8. [RFC 8017, *PKCS #1: RSA Cryptography Specifications Version 2.2* — I2OSP/OS2IP](https://www.rfc-editor.org/rfc/rfc8017.html)
 9. [NIST SP 800-185, *SHA-3 Derived Functions: cSHAKE, KMAC, TupleHash, and ParallelHash*](https://csrc.nist.gov/pubs/sp/800/185/final)
 10. [NIST SP 800-56C Rev. 2, *Recommendation for Key-Derivation Methods in Key-Establishment Schemes*](https://csrc.nist.gov/pubs/sp/800/56/c/r2/final)
 11. [RFC 4226, *HOTP: An HMAC-Based One-Time Password Algorithm*](https://www.rfc-editor.org/rfc/rfc4226.html)
 12. [RFC 6238, *TOTP: Time-Based One-Time Password Algorithm*](https://www.rfc-editor.org/rfc/rfc6238.html)
-13. [RFC 5905, *Network Time Protocol Version 4 (NTPv4)*](https://www.rfc-editor.org/rfc/rfc5905.html)
+13. [RFC 5905, *Network Time Protocol Version 4: Protocol and Algorithms Specification*](https://datatracker.ietf.org/doc/html/rfc5905)
 14. [R. Durstenfeld (1964), “Algorithm 235: Random permutation”, *Communications of the ACM* 7(7)](https://dl.acm.org/doi/10.1145/364520.364540)
-15. [B. Gassend et al. (2002), “Controlled Physical Random Functions”, (PUFs)](https://people.csail.mit.edu/devadas/pubs/cpuf.pdf)
-16. [G. E. Suh & S. Devadas (2007), “Physical Unclonable Functions for Device Authentication and Secret Key Generation”, DAC ’07](https://people.csail.mit.edu/devadas/pubs/puf-dac07.pdf)
+15. [B. Gassend, D. Clarke, M. van Dijk, and S. Devadas (2002), “Controlled Physical Random Functions”, ACSAC ’02](https://people.csail.mit.edu/devadas/pubs/cpuf.pdf)
+16. [G. E. Suh and S. Devadas (2007), “Physical Unclonable Functions for Device Authentication and Secret Key Generation”, DAC ’07](https://people.csail.mit.edu/devadas/pubs/puf-dac07.pdf)
 17. [P. C. Kocher (1996), “Timing Attacks on Implementations of Diffie-Hellman, RSA, DSS, and Other Systems”, CRYPTO ’96](https://paulkocher.com/doc/TimingAttacks.pdf)
 18. [P. W. Shor (1994), “Algorithms for Quantum Computation: Discrete Logarithms and Factoring”, FOCS ’94](https://dl.acm.org/doi/10.1109/SFCS.1994.365700)
-19. [M. A. Nielsen & I. L. Chuang, *Quantum Computation and Quantum Information* (Cambridge University Press)](https://books.google.it/books?id=-s4DEy7o-a0C)
-20. [A. Menezes, P. van Oorschot, S. Vanstone, *Handbook of Applied Cryptography* (CRC Press; online edition)](https://cacr.uwaterloo.ca/hac/about/chap2.pdf)
-
+19. [M. A. Nielsen and I. L. Chuang, *Quantum Computation and Quantum Information*, Cambridge University Press](https://www.cambridge.org/highereducation/books/quantum-computation-and-quantum-information/01E10196D0A682A6AEFFEA52D53BE9AE)
+20. [A. Menezes, P. van Oorschot, and S. Vanstone, *Handbook of Applied Cryptography*, Chapter 2: Mathematical Background](https://cacr.uwaterloo.ca/hac/about/chap2.pdf)
+21. [RFC 9380, *Hashing to Elliptic Curves* — domain separation tags and hash-to-field encodings](https://datatracker.ietf.org/doc/html/rfc9380)
+22. [NIST SP 800-108 Rev. 1, *Recommendation for Key Derivation Using Pseudorandom Functions*](https://csrc.nist.gov/pubs/sp/800/108/r1/final)
+23. [NIST SP 800-90B, *Recommendation for the Entropy Sources Used for Random Bit Generation*](https://csrc.nist.gov/pubs/sp/800/90/b/final)
+24. [NIST SP 800-63B, *Digital Identity Guidelines: Authentication and Lifecycle Management*](https://pages.nist.gov/800-63-4/sp800-63b.html)
+25. [RFC 7518, *JSON Web Algorithms (JWA)* — constant-time HMAC validation guidance](https://datatracker.ietf.org/doc/html/rfc7518)
+26. [NIST Dictionary of Algorithms and Data Structures, “Fisher-Yates shuffle”](https://www.nist.gov/dads/HTML/fisherYatesShuffle.html)
+27. [NIST IR 8318, *The On-Line Dictionary of Algorithms and Data Structures*](https://nvlpubs.nist.gov/nistpubs/ir/2020/NIST.IR.8318.pdf)
+28. [J. H. Holland, *Adaptation in Natural and Artificial Systems*, MIT Press](https://mitpress.mit.edu/9780262082136/adaptation-in-natural-and-artificial-systems/)
+29. [J. R. Koza, *Genetic Programming: On the Programming of Computers by Means of Natural Selection*, MIT Press](https://mitpress.mit.edu/9780262527910/genetic-programming/)
+30. [A. Menezes, P. van Oorschot, and S. Vanstone, *Handbook of Applied Cryptography*, Chapter 14: Efficient Implementation](https://cacr.uwaterloo.ca/hac/about/chap14.pdf)
 
 [1]: https://csrc.nist.gov/pubs/fips/180-4/upd1/final
 [2]: https://csrc.nist.gov/pubs/fips/202/final
@@ -1680,11 +1690,21 @@ The decisive implementation direction is conservative: keep the token core small
 [10]: https://csrc.nist.gov/pubs/sp/800/56/c/r2/final
 [11]: https://www.rfc-editor.org/rfc/rfc4226.html
 [12]: https://www.rfc-editor.org/rfc/rfc6238.html
-[13]: https://www.rfc-editor.org/rfc/rfc5905.html
+[13]: https://datatracker.ietf.org/doc/html/rfc5905
 [14]: https://dl.acm.org/doi/10.1145/364520.364540
 [15]: https://people.csail.mit.edu/devadas/pubs/cpuf.pdf
 [16]: https://people.csail.mit.edu/devadas/pubs/puf-dac07.pdf
 [17]: https://paulkocher.com/doc/TimingAttacks.pdf
 [18]: https://dl.acm.org/doi/10.1109/SFCS.1994.365700
-[19]: https://books.google.it/books?id=-s4DEy7o-a0C
+[19]: https://www.cambridge.org/highereducation/books/quantum-computation-and-quantum-information/01E10196D0A682A6AEFFEA52D53BE9AE
 [20]: https://cacr.uwaterloo.ca/hac/about/chap2.pdf
+[21]: https://datatracker.ietf.org/doc/html/rfc9380
+[22]: https://csrc.nist.gov/pubs/sp/800/108/r1/final
+[23]: https://csrc.nist.gov/pubs/sp/800/90/b/final
+[24]: https://pages.nist.gov/800-63-4/sp800-63b.html
+[25]: https://datatracker.ietf.org/doc/html/rfc7518
+[26]: https://www.nist.gov/dads/HTML/fisherYatesShuffle.html
+[27]: https://nvlpubs.nist.gov/nistpubs/ir/2020/NIST.IR.8318.pdf
+[28]: https://mitpress.mit.edu/9780262082136/adaptation-in-natural-and-artificial-systems/
+[29]: https://mitpress.mit.edu/9780262527910/genetic-programming/
+[30]: https://cacr.uwaterloo.ca/hac/about/chap14.pdf
