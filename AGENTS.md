@@ -30,3 +30,8 @@ Next steps:
 - Assume that a syncro layer and a "GPS-precise timing" is available: making a syncro precise circuit is important to avoid desyncronizations or dead idles useful for attacker, but continuing to presume that may be possible without an external precise clock as reference is a waste of resource in computing a too much sensible circuit.
 - Avoid in any case to find a solution that requires handshakes after the initial one, it's a big vulnerability and liability in the basis of the research.
 - While elaborating evolvo run results for conclusions: convert the genetic code to pseudo code, then compare them between their scores and draw conclusions through narrative and logic point of view using codes and their statistical data for conclusive interpretations, obtaining improvements, weak points and future steps for development
+
+# Phase lane dilemma
+To having sense a phase lane circuit should be reach these goals:
+- The provider circuit should be have the common key that, anyway, should be advantageous respect than a single line cycle computation but at the same time should be computational expensive enough to avoid an easy cloning
+- If a user device is compromised, shouldn't be also the other twins. If a user device is compromised, should be difficult enough to require a constant parallel execution by adversial device.
