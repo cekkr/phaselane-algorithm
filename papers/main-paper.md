@@ -211,8 +211,7 @@ The protocol uses:
 5. A practical control split: a deterministic hot token core and a slower supervisory layer for clock drift, route pressure, and recovery.
 
 ### 4.1 User device circuit (emitter)
-The device knows the full schedule and all lane secrets, so it computes only the
-active lane per cycle and emits exactly one token.
+The device knows the full schedule and all lane secrets, so it computes only the active lane per cycle and emits exactly one token.
 
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
@@ -270,19 +269,14 @@ flowchart TD
 ```
 
 ### 4.3 Shared vs distinct per-cycle logic
-The device and each provider run a synchronized per-cycle hash pipeline. They differ in
-which lane index is used and whether device-only state is updated.
+The device and each provider run a synchronized per-cycle hash pipeline. They differ in which lane index is used and whether device-only state is updated.
 
 - **Shared per-cycle hash pipeline (device + provider):** for a given lane index $i$ and cycle $t$, compute $\Phi_t$, then $EA_i(t), EB_i(t), EC_i(t)$, then $K_i(t)$ and $T_i(t)$ using the canonical encoding and domain tags. This runs every cycle.
 - **Device-only additions:** compute $\mathrm{idx}_t$ from `perm_key`, evaluate only that lane, emit $T_{\mathrm{idx}_t}(t)$, update $W[\mathrm{idx}_t]$, and evolve $S_{t+1}$ from all $W$ and chain products. This makes every emitted token influence future cycles.
 - **Provider-only behavior:** for its fixed lane $i$, compute $T_i(t)$ every cycle and compare against any received token. Exactly 1-of-$x$ cycles match because the device selects each lane once per block. Providers do not know `perm_key` and do not maintain $S_t$ or $W[ ]$.
 
 ### 4.4 Practical circuit split after co-evolution
-The repository-local Evolvo synthesis makes the circuit boundary sharper. PCPL
-should not be implemented as one large opaque controller. The deployable shape
-is a small token datapath with sparse bouquet activation, surrounded by slower
-supervisory circuits that are allowed to observe window-level facts but are not
-allowed to add runtime challenge/response handshakes.
+The repository-local Evolvo synthesis makes the circuit boundary sharper. PCPL should not be implemented as one large opaque controller. The deployable shape is a small token datapath with sparse bouquet activation, surrounded by slower supervisory circuits that are allowed to observe window-level facts but are not allowed to add runtime challenge/response handshakes.
 
 The practical architecture is therefore four-layered:
 
@@ -335,24 +329,11 @@ flowchart TD
   Limits --> Policy
 ```
 
-This split changes the implementation strategy, not the core correctness
-argument. The exact 1-of-$x$ property still comes from the block permutation;
-the token value still comes from deterministic lane recomputation. The
-supervisor may narrow a public acceptance window or rotate a public policy
-epoch, but it must not force a provider to ask the device which formula to use.
+This split changes the implementation strategy, not the core correctness argument. The exact 1-of-$x$ property still comes from the block permutation; the token value still comes from deterministic lane recomputation. The supervisor may narrow a public acceptance window or rotate a public policy epoch, but it must not force a provider to ask the device which formula to use.
 
-The decisive improvement is architectural: token correctness, route hardening,
-time discipline, and backend feasibility are separate concerns. Combining them
-inside one branch-heavy datapath makes the provider contract fragile and gives
-evolutionary search a misleading way to score well by exploiting evaluator
-details. Separating them keeps the hot path simple enough for circuits while
-leaving space for real engineering controls around it.
+The decisive improvement is architectural: token correctness, route hardening, time discipline, and backend feasibility are separate concerns. Combining them inside one branch-heavy datapath makes the provider contract fragile and gives evolutionary search a misleading way to score well by exploiting evaluator details. Separating them keeps the hot path simple enough for circuits while leaving space for real engineering controls around it.
 
-The possible weakness is also architectural: if the supervisory layer is vague,
-an implementation may accidentally reintroduce handshake-like behavior under
-the name of resynchronization. That would be a different protocol. In PCPL, all
-post-provisioning control that affects provider recomputation must be public,
-time-derived, provider-local, or explicitly carried in the emitted message.
+The possible weakness is also architectural: if the supervisory layer is vague, an implementation may accidentally reintroduce handshake-like behavior under the name of resynchronization. That would be a different protocol. In PCPL, all post-provisioning control that affects provider recomputation must be public, time-derived, provider-local, or explicitly carried in the emitted message.
 
 ## 5. Step-by-step algorithm
 
@@ -879,16 +860,9 @@ Notes:
 
 ### 5.9 Policy-controlled sparse bouquet evaluation
 
-The reference pseudocode evaluates every compound in a bouquet. That is the
-simplest specification, but it is not the only practical circuit profile. The
-latest co-evolution synthesis repeatedly favored **sparse bouquet activation**:
-keep a larger hidden bouquet inventory, but activate only a small deterministic
-subset per cycle. This is not a claim that the secret inventory should be small.
-It is a claim that the active arithmetic fan-in of the hot path should be
-small, measurable, and explicitly specified.
+The reference pseudocode evaluates every compound in a bouquet. That is the simplest specification, but it is not the only practical circuit profile. The latest co-evolution synthesis repeatedly favored **sparse bouquet activation**: keep a larger hidden bouquet inventory, but activate only a small deterministic subset per cycle. This is not a claim that the secret inventory should be small. It is a claim that the active arithmetic fan-in of the hot path should be small, measurable, and explicitly specified.
 
-The genetic programs are not copied into the protocol. They are translated into
-four specification changes:
+The genetic programs are not copied into the protocol. They are translated into four specification changes:
 
 - `inventory_size` and `active_count` are explicit deployment parameters.
 - the primary production profile is `active_count=1` per bouquet per cycle;
@@ -921,9 +895,7 @@ The intended meanings are:
 - $\tau_i$: token-scramble control
 - $\jmath_i$: phase-jitter control
 
-The complete policy vector is useful for design search, but a deployment
-profile should collapse it into a small public profile. For a bouquet of length
-$n$, the deployed active count is:
+The complete policy vector is useful for design search, but a deployment profile should collapse it into a small public profile. For a bouquet of length $n$, the deployed active count is:
 
 $$
 r_i(t)=\mathrm{clip}\left(A_{\mathrm{profile}}(t,i),\,1,\,n\right).
@@ -937,9 +909,7 @@ The current primary profile is:
 | `PCPL-S2` | $n \ge 5$ | `2` | robustness comparison for route-hardening tests |
 | `PCPL-Sk` | deployment-specific | fixed small $k$ | only after beating `S1/S2` on route and sync metrics |
 
-The continuous ratio form below is kept as an offline policy-search
-parameterization, not as a requirement that production hardware vary fan-in
-every cycle:
+The continuous ratio form below is kept as an offline policy-search parameterization, not as a requirement that production hardware vary fan-in every cycle:
 
 $$
 \alpha_i(t)=\mathrm{clip}\left(\rho_i(t)\cdot(0.55+0.45\beta_i(t)),\,0,\,1\right),
@@ -957,16 +927,9 @@ $$
 C_j^{e'_j} \bmod M,
 $$
 
-where $\mathcal{I}$ is a deterministic subset of size $r_i(t)$ and
-$e'_j$ is the usual `EXP` exponent with an optional bounded exponent bias
-derived from $\eta_i(t)$. Kernel selection $\kappa_i$ then chooses a small
-native-friendly mixer over $EA,EB,EC,\Phi_t,\lambda_i$ before the `KDF` step.
+where $\mathcal{I}$ is a deterministic subset of size $r_i(t)$ and $e'_j$ is the usual `EXP` exponent with an optional bounded exponent bias derived from $\eta_i(t)$. Kernel selection $\kappa_i$ then chooses a small native-friendly mixer over $EA,EB,EC,\Phi_t,\lambda_i$ before the `KDF` step.
 
-The blind-provider contract imposes an important restriction: every input used
-by $\Theta_i(t)$ must be public or provider-observable. In the current
-pcpl-evolvo setup, control hints are constrained to phase/time/lane-observable
-channels, specifically to avoid dependencies on hidden token history. Therefore
-a production policy circuit should be constrained to:
+The blind-provider contract imposes an important restriction: every input used by $\Theta_i(t)$ must be public or provider-observable. In the current pcpl-evolvo setup, control hints are constrained to phase/time/lane-observable channels, specifically to avoid dependencies on hidden token history. Therefore a production policy circuit should be constrained to:
 
 - public phase values and cycle counters,
 - the provider's own lane identifier and public slot information,
@@ -974,16 +937,11 @@ a production policy circuit should be constrained to:
 - deterministic lane-local history only when both the device and that provider
   can derive the same value without a new handshake.
 
-It should not depend on device-only state, other providers' bouquets, or hidden
-tokens sent only to other lanes. Provider-local replay bookkeeping is still
-useful, but it belongs outside token derivation unless it is mirrored by the
-device or encoded as an explicit public hint.
+It should not depend on device-only state, other providers' bouquets, or hidden tokens sent only to other lanes. Provider-local replay bookkeeping is still useful, but it belongs outside token derivation unless it is mirrored by the device or encoded as an explicit public hint.
 
 ### 5.9.1 Evolvo-derived policy pseudocode
 
-The translated defender motif is a small public-policy generator, not a hidden
-controller. In production it should be reduced to fixed profile choices and
-bounded public selectors:
+The translated defender motif is a small public-policy generator, not a hidden controller. In production it should be reduced to fixed profile choices and bounded public selectors:
 
 ```text
 PublicPolicy(t, lane_id, public_epoch):
@@ -1008,15 +966,11 @@ PublicPolicy(t, lane_id, public_epoch):
     }
 ```
 
-The route-hardening and synchronization layers may publish a later
-`public_epoch`, but the provider must be able to derive the same policy before
-checking the token. If the required policy cannot be derived from public or
-provider-local inputs, the correct behavior is to fail closed, not to negotiate.
+The route-hardening and synchronization layers may publish a later `public_epoch`, but the provider must be able to derive the same policy before checking the token. If the required policy cannot be derived from public or provider-local inputs, the correct behavior is to fail closed, not to negotiate.
 
 ### 5.9.2 Circuit-ready sparse evaluator
 
-For implementation, the sparse evaluator can be written as a bounded datapath
-with no data-dependent loop count after policy resolution:
+For implementation, the sparse evaluator can be written as a bounded datapath with no data-dependent loop count after policy resolution:
 
 ```text
 SparseBouquetEval(B, residue, phase, lane_id, t, policy):
@@ -1036,10 +990,7 @@ SparseBouquetEval(B, residue, phase, lane_id, t, policy):
     return acc
 ```
 
-The selected indices must be reproducible by the provider for its own lane. The
-device may know all lanes and all bouquets, but the provider only needs the
-public phase, its lane identifier, its own bouquet, and the public or
-provider-observable policy vector. The policy vector can be compact:
+The selected indices must be reproducible by the provider for its own lane. The device may know all lanes and all bouquets, but the provider only needs the public phase, its lane identifier, its own bouquet, and the public or provider-observable policy vector. The policy vector can be compact:
 
 ```text
 policy = {
@@ -1053,15 +1004,11 @@ policy = {
 }
 ```
 
-The decisive circuit change is that `active_count` becomes a first-class
-parameter. A deployment profile should state both the provisioned bouquet
-inventory size and the per-cycle active subset size. This makes cost, leakage
-surface, and hardware fan-in auditable.
+The decisive circuit change is that `active_count` becomes a first-class parameter. A deployment profile should state both the provisioned bouquet inventory size and the per-cycle active subset size. This makes cost, leakage surface, and hardware fan-in auditable.
 
 ### 5.9.3 Hot-core pseudocode with provider contract
 
-The hot core can be specified once and used by both device and provider. The
-device calls it for the scheduled lane; the provider calls it for its own lane.
+The hot core can be specified once and used by both device and provider. The device calls it for the scheduled lane; the provider calls it for its own lane.
 
 ```text
 LaneTokenSparse(i, t, bouquets_i, policy):
@@ -1094,9 +1041,7 @@ ProviderCycle(i, message):
     accept iff T_rx == T_exp
 ```
 
-`idx_hint` can be omitted if routing already identifies the destination
-provider. If present, it is not a secret and it is not a proof of authenticity;
-it is only a transport hint. The authentication event remains the token match.
+`idx_hint` can be omitted if routing already identifies the destination provider. If present, it is not a secret and it is not a proof of authenticity; it is only a transport hint. The authentication event remains the token match.
 
 For circuit definition, the hot path is a fixed five-stage pipeline:
 
@@ -1110,15 +1055,11 @@ HotCorePipeline:
 ```
 
 Stages 1-4 are shared by device and provider for a lane. Stage 5 is device-only.
-There is no data-dependent loop count, no post-initialization handshake, and no
-hidden supervisory output inside token derivation.
+There is no data-dependent loop count, no post-initialization handshake, and no hidden supervisory output inside token derivation.
 
 ### 5.9.4 Supervisory control pseudocode
 
-The synchronization supervisor operates outside token derivation. It does not
-ask providers for new information after the initial provisioning step. It only
-updates public or provider-observable limits that both sides can recompute or
-read from the message.
+The synchronization supervisor operates outside token derivation. It does not ask providers for new information after the initial provisioning step. It only updates public or provider-observable limits that both sides can recompute or read from the message.
 
 ```text
 SupervisoryWindow(window):
@@ -1140,10 +1081,7 @@ SupervisoryWindow(window):
     publish next public policy epoch
 ```
 
-This layer is decisive for engineering but not part of the cryptographic token
-equation. Its outputs are constraints on the next policy epoch, not secret
-answers to a provider. A provider that knows the public epoch and its own lane
-can still recompute its expected token without asking the device anything.
+This layer is decisive for engineering but not part of the cryptographic token equation. Its outputs are constraints on the next policy epoch, not secret answers to a provider. A provider that knows the public epoch and its own lane can still recompute its expected token without asking the device anything.
 
 
 ## 6. Correctness and periodicity
@@ -1296,10 +1234,7 @@ Fixed primes (P/Q/R near 1e6, seed=1337) with compare-x and 64-cycle linear wind
 
 Across all x above, the pre-hash exponent vectors reached full rank (4/4) modulo 2 and 65537, with 64/64 unique rows for A/B/C over the sample window.
 
-For $x=6$ (composite $2 \cdot 3$), the schedule still yields exactly one match
-per cycle, but the duty cycle per provider is $1/6$ and the permutation space
-grows to $6! = 720$. Ensure $P,Q,R$ are coprime with both 2 and 3 to keep the
-public period large.
+For $x=6$ (composite $2 \cdot 3$), the schedule still yields exactly one match per cycle, but the duty cycle per provider is $1/6$ and the permutation space grows to $6! = 720$. Ensure $P,Q,R$ are coprime with both 2 and 3 to keep the public period large.
 
 Generated primes (x=4, 64 cycles, 12-bit compound primes):
 
@@ -1318,17 +1253,9 @@ flowchart TB
 Additional multi-configuration outputs (other compound modes and seeds) are intended as supplementary material.
 
 ### 8.5 Evolvo synthesis: interpretation and constraints
-Evolutionary campaigns are used here as automated design-space exploration. They
-search for circuit policies under fixed objectives; they do not redefine PCPL
-semantics and they do not replace correctness arguments in §6. The
-repository-local synthesis is therefore read as evidence about implementable
-circuit families, failure frontiers, and objective design.
+Evolutionary campaigns are used here as automated design-space exploration. They search for circuit policies under fixed objectives; they do not redefine PCPL semantics and they do not replace correctness arguments in §6. The repository-local synthesis is therefore read as evidence about implementable circuit families, failure frontiers, and objective design.
 
-The decisive conclusion is that PCPL should not be optimized as a single
-self-healing token machine. The token path, route hardening, long-horizon sync,
-and backend feasibility must be separated. The token path can remain compact
-and sparse; the other concerns need explicit supervisory circuits and explicit
-acceptance gates.
+The decisive conclusion is that PCPL should not be optimized as a single self-healing token machine. The token path, route hardening, long-horizon sync, and backend feasibility must be separated. The token path can remain compact and sparse; the other concerns need explicit supervisory circuits and explicit acceptance gates.
 
 The stable design constraints are:
 
@@ -1351,8 +1278,7 @@ The stable design constraints are:
 - Native execution feasibility and archive evaluability are not equivalent to
   cryptographic correctness. They must be measured and gated separately.
 
-The following table gives the paper-facing semantics of the latest tracked
-conclusions in a self-contained form:
+The following table gives the paper-facing semantics of the latest tracked conclusions in a self-contained form:
 
 | evidence signal | paper interpretation | design consequence |
 | --- | --- | --- |
@@ -1390,9 +1316,7 @@ The synthesis changes the practical PCPL circuit in the following decisive ways:
    protocol and opens a new attack surface.
 
 ### 8.7 Circuit topology after synthesis
-The practical circuit can be drawn as four cooperating machines. Only the first
-machine computes token material; the others constrain public policy and decide
-whether a profile is acceptable.
+The practical circuit can be drawn as four cooperating machines. Only the first machine computes token material; the others constrain public policy and decide whether a profile is acceptable.
 
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
@@ -1435,14 +1359,10 @@ flowchart TB
   Policy --> C3
 ```
 
-This topology avoids two common mistakes. First, it does not confuse a recovery
-policy with token material. Second, it does not make hardware feasibility an
-afterthought. A circuit that cannot complete stable evaluation under its
-intended backend should not be promoted even if its token invariants look good.
+This topology avoids two common mistakes. First, it does not confuse a recovery policy with token material. Second, it does not make hardware feasibility an afterthought. A circuit that cannot complete stable evaluation under its intended backend should not be promoted even if its token invariants look good.
 
 ### 8.8 Provider-observable control contract
-Every value that changes provider token derivation must come from one of four
-places:
+Every value that changes provider token derivation must come from one of four places:
 
 - public configuration fixed at provisioning,
 - public time/phase data,
@@ -1457,14 +1377,10 @@ The following are forbidden as token-derivation inputs:
 - evaluator-only global history,
 - runtime challenge/response output after initial provisioning.
 
-This rule is stronger than a coding guideline. It is what makes sparse policy
-control compatible with blind provider recomputation. A policy can choose a
-smaller active set or a different public salt epoch, but the provider must be
-able to derive the same choice without asking the device.
+This rule is stronger than a coding guideline. It is what makes sparse policy control compatible with blind provider recomputation. A policy can choose a smaller active set or a different public salt epoch, but the provider must be able to derive the same choice without asking the device.
 
 ### 8.9 Generalized token-core pseudocode
-The strongest evolved defender family can be translated into general PCPL
-pseudocode as a compact arithmetic/hash spine:
+The strongest evolved defender family can be translated into general PCPL pseudocode as a compact arithmetic/hash spine:
 
 ```text
 TokenCore(i, t, bouquets_i, public_policy):
@@ -1485,14 +1401,10 @@ TokenCore(i, t, bouquets_i, public_policy):
     return token
 ```
 
-The critical property is that `carry` must be public or lane-local if the
-provider uses it. Device-only state can still update the device's internal
-chain after emission, but it cannot be required for provider recomputation.
+The critical property is that `carry` must be public or lane-local if the provider uses it. Device-only state can still update the device's internal chain after emission, but it cannot be required for provider recomputation.
 
 ### 8.10 Route-hardening pseudocode
-The attacker model suggested by the synthesis is a public-feature lane
-predictor. The defense should therefore measure and harden route exposure, not
-only token inversion.
+The attacker model suggested by the synthesis is a public-feature lane predictor. The defense should therefore measure and harden route exposure, not only token inversion.
 
 ```text
 RouteHardeningWindow(window):
@@ -1511,14 +1423,10 @@ RouteHardeningWindow(window):
     emit next public route-hardening profile
 ```
 
-This defense has to remain conservative. Excessive jitter can damage
-recomputability; excessive salt churn can become an implicit handshake. The
-goal is bounded public decorrelation, not hidden adaptive routing.
+This defense has to remain conservative. Excessive jitter can damage recomputability; excessive salt churn can become an implicit handshake. The goal is bounded public decorrelation, not hidden adaptive routing.
 
 ### 8.11 Synchronization pseudocode
-Long-horizon synchronization is the decisive unresolved weakness. The correct
-engineering answer is not to make the token core more complex. It is to define
-a precise timing supervisor that both sides can reason about.
+Long-horizon synchronization is the decisive unresolved weakness. The correct engineering answer is not to make the token core more complex. It is to define a precise timing supervisor that both sides can reason about.
 
 ```text
 SyncSupervisor(window, precise_time_reference):
@@ -1542,9 +1450,7 @@ SyncSupervisor(window, precise_time_reference):
     publish mode and window for the next public policy epoch
 ```
 
-The supervisor is allowed to fail closed. It is not allowed to perform a
-post-initialization challenge/response repair. If recovery requires private
-negotiation, it is outside this PCPL design.
+The supervisor is allowed to fail closed. It is not allowed to perform a post-initialization challenge/response repair. If recovery requires private negotiation, it is outside this PCPL design.
 
 ### 8.12 Potential improvements
 The next productive improvements are specific:
