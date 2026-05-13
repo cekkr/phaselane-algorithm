@@ -40,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1337, help="Deterministic RNG seed.")
     parser.add_argument("--token-bits", type=int, default=128, help="Token size in bits.")
     parser.add_argument(
+        "--active-count",
+        type=int,
+        default=1,
+        help="Active compounds per bouquet per cycle (PCPL-S1 uses 1; PCPL-S2 uses 2).",
+    )
+    parser.add_argument(
         "--out",
         type=str,
         default="papers/token-trace.md",
@@ -58,17 +64,21 @@ def main() -> None:
     cycles = args.cycles if args.cycles is not None else args.blocks * args.x
     if cycles < 1:
         raise ValueError("cycles must be at least 1")
+    if args.active_count < 1:
+        raise ValueError("active_count must be at least 1")
 
     pcpl = load_pcpl_module()
     build_params = pcpl["build_params"]
     build_compound_config = pcpl["build_compound_config"]
     build_fixture = pcpl["build_fixture"]
+    root_seed_material = pcpl["root_seed_material"]
     phase_clock = pcpl["phase_clock"]
     lane_token = pcpl["lane_token"]
     device_cycle = pcpl["device_cycle"]
     permutation_for_block = pcpl["permutation_for_block"]
 
-    params = build_params(args.x, args.token_bits)
+    offset_seed = int.from_bytes(root_seed_material(args.seed), "big")
+    params = build_params(args.x, args.token_bits, offset_seed=offset_seed)
     compound_cfg = build_compound_config(
         args.seed,
         params,
@@ -91,9 +101,12 @@ def main() -> None:
 
     rows = []
     for t in range(cycles):
-        idx, token = device_cycle(t, params, state)
+        idx, token = device_cycle(t, params, state, active_count=args.active_count)
         phase = phase_clock(t, params)
-        server_tokens = [lane_token(i, t, phase, params, secrets[i]) for i in range(params.x)]
+        server_tokens = [
+            lane_token(i, t, phase, params, secrets[i], active_count=args.active_count)
+            for i in range(params.x)
+        ]
         rows.append((t, t // params.x, t % params.x, idx, token, server_tokens))
 
     out_path = Path(args.out)
@@ -101,7 +114,7 @@ def main() -> None:
 
     cmd = (
         f"python3 demo/export_token_trace.py --x {args.x} "
-        f"--token-bits {args.token_bits} --seed {args.seed} "
+        f"--token-bits {args.token_bits} --active-count {args.active_count} --seed {args.seed} "
         f"{'--cycles ' + str(cycles) if args.cycles is not None else '--blocks ' + str(args.blocks)}"
     )
 
@@ -116,6 +129,8 @@ def main() -> None:
     lines.append(f"- cycles = {cycles}")
     lines.append(f"- seed = {args.seed}")
     lines.append(f"- token_bits = {args.token_bits}")
+    lines.append(f"- active_count = {args.active_count}")
+    lines.append(f"- a0, b0, c0 = {params.a0}, {params.b0}, {params.c0}")
     lines.append("")
     lines.append(
         "Provider matching order is defined per block by a permutation seeded from the "
@@ -126,7 +141,9 @@ def main() -> None:
     lines.append("Permutation formula:")
     lines.append("")
     lines.append("$$")
-    lines.append(r"\pi_B = Permute(perm_key, \Phi_{B \cdot x}), \quad idx_t = \pi_B[t \bmod x]")
+    lines.append(
+        r"\pi_B = \mathrm{PermuteBlock}(perm\_key, B, \Phi_{B \cdot x}, \mathrm{PERMSEED}), \quad idx_t = \pi_B[t \bmod x]"
+    )
     lines.append("$$")
     lines.append("")
     lines.append("## Block-level permutations")

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cycle-by-cycle PCPL simulation from papers/phase-shift-tokens.md.
+Cycle-by-cycle PCPL simulation aligned to papers/main-paper.md.
 Models both roles:
 - Device emitter: selects a lane via perm_key, computes only that lane token,
   and updates W and S.
@@ -13,9 +13,7 @@ optional dynamic prime generation and difficulty reporting.
 from __future__ import annotations
 
 import argparse
-import copy
 import hashlib
-import itertools
 import math
 import random
 from dataclasses import dataclass
@@ -25,7 +23,6 @@ from typing import List, Optional, Sequence, Set, Tuple
 PRIME_POOL = [
     3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67
 ]
-PERM_TABLE_24 = [tuple(p) for p in itertools.permutations(range(4))]
 MR_BASES_64 = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 
@@ -123,6 +120,11 @@ def h_bytes(*parts: object, out_len: int = 32) -> bytes:
 
 def derive_seed(seed: int, label: str) -> int:
     return int.from_bytes(h_bytes(seed, label, out_len=8), "big")
+
+
+def root_seed_material(seed: int) -> bytes:
+    rng = random.Random(seed)
+    return rng.getrandbits(256).to_bytes(32, "big")
 
 
 def is_prime_small(n: int) -> bool:
@@ -231,6 +233,7 @@ def build_params(
     prime_mode: str = "fixed",
     prime_bits: int = 20,
     modulus_bits: int = 61,
+    offset_seed: Optional[int] = None,
     rng: Optional[random.Random] = None,
 ) -> Params:
     if x < 2:
@@ -264,15 +267,23 @@ def build_params(
     if math.gcd(M, x) != 1:
         raise ValueError("M must be coprime with x")
 
+    if offset_seed is None:
+        # Preserve backward-compatible defaults for external callers.
+        a0, b0, c0 = 1, 2, 3
+    else:
+        a0 = int.from_bytes(h_bytes(offset_seed, "A0", out_len=8), "big") % P
+        b0 = int.from_bytes(h_bytes(offset_seed, "B0", out_len=8), "big") % Q
+        c0 = int.from_bytes(h_bytes(offset_seed, "C0", out_len=8), "big") % R
+
     return Params(
         x=x,
         P=P,
         Q=Q,
         R=R,
         M=M,
-        a0=1,
-        b0=2,
-        c0=3,
+        a0=a0,
+        b0=b0,
+        c0=c0,
         token_bits=token_bits,
         token_bytes=token_bytes,
         seed_bytes=seed_bytes,
@@ -294,14 +305,11 @@ def phase_clock(t: int, params: Params) -> Phase:
 
 
 def permutation_for_block(B: int, params: Params, perm_key: bytes, phi_block: bytes) -> Sequence[int]:
-    if params.x == 4:
-        perm_id = int.from_bytes(h_bytes(perm_key, B, phi_block, "PERM", out_len=4), "big") % 24
-        return PERM_TABLE_24[perm_id]
-
     perm = list(range(params.x))
     seed = h_bytes(perm_key, B, phi_block, "PERMSEED", out_len=32)
     for k in range(params.x - 1, 0, -1):
-        r = int.from_bytes(h_bytes(seed, k, "R", out_len=8), "big") % (k + 1)
+        counter = (params.x - 1) - k
+        r = int.from_bytes(h_bytes(seed, counter, "PERMEXPAND", out_len=8), "big") % (k + 1)
         perm[k], perm[r] = perm[r], perm[k]
     return perm
 
@@ -314,9 +322,53 @@ def device_destination_provider(t: int, params: Params, perm_key: bytes) -> int:
     return perm[slot]
 
 
-def eval_bouquet(bouquet: Sequence[int], xres: int, u: int, params: Params) -> int:
+def sparse_indices_for_bouquet(
+    count: int,
+    active_count: int,
+    lane_idx: int,
+    t: int,
+    phase_phi: bytes,
+    bouquet_tag: str,
+) -> List[int]:
+    if count <= 0:
+        raise ValueError("Bouquet length must be positive")
+
+    target = min(max(1, active_count), count)
+    if target == count:
+        return list(range(count))
+
+    start = int.from_bytes(
+        h_bytes("PHASE", phase_phi, lane_idx, bouquet_tag, "START", out_len=8), "big"
+    ) % count
+    if count == 1:
+        return [0]
+
+    stride = 1 + int.from_bytes(
+        h_bytes("PHASE", t, lane_idx, bouquet_tag, "STRIDE", out_len=8), "big"
+    ) % (count - 1)
+
+    selected: List[int] = []
+    used: Set[int] = set()
+    for k in range(target):
+        idx = (start + (k * stride)) % count
+        while idx in used:
+            idx = (idx + 1) % count
+        selected.append(idx)
+        used.add(idx)
+    return selected
+
+
+def eval_bouquet(
+    bouquet: Sequence[int],
+    xres: int,
+    u: int,
+    params: Params,
+    active_indices: Optional[Sequence[int]] = None,
+) -> int:
     acc = 1 % params.M
-    for j, compound in enumerate(bouquet):
+    indices = range(len(bouquet)) if active_indices is None else active_indices
+    for j in indices:
+        compound = bouquet[j]
         base = compound % params.M
         if base == 0:
             raise ValueError("Compound is divisible by M; choose different primes")
@@ -403,11 +455,27 @@ def qft_report(params: Params) -> None:
     print(f"qft-period: {period} (~{period.bit_length()} bits)")
 
 
-def lane_token(lane_idx: int, t: int, phase: Phase, params: Params, secrets: ProviderSecrets) -> int:
+def lane_token(
+    lane_idx: int,
+    t: int,
+    phase: Phase,
+    params: Params,
+    secrets: ProviderSecrets,
+    active_count: int = 1,
+) -> int:
     """Shared per-cycle token derivation used by device and provider circuits."""
-    ea = eval_bouquet(secrets.bouquetA, phase.a, phase.u1, params)
-    eb = eval_bouquet(secrets.bouquetB, phase.b, phase.u2, params)
-    ec = eval_bouquet(secrets.bouquetC, phase.c, phase.u3, params)
+    idx_a = sparse_indices_for_bouquet(
+        len(secrets.bouquetA), active_count, lane_idx, t, phase.phi, "A"
+    )
+    idx_b = sparse_indices_for_bouquet(
+        len(secrets.bouquetB), active_count, lane_idx, t, phase.phi, "B"
+    )
+    idx_c = sparse_indices_for_bouquet(
+        len(secrets.bouquetC), active_count, lane_idx, t, phase.phi, "C"
+    )
+    ea = eval_bouquet(secrets.bouquetA, phase.a, phase.u1, params, active_indices=idx_a)
+    eb = eval_bouquet(secrets.bouquetB, phase.b, phase.u2, params, active_indices=idx_b)
+    ec = eval_bouquet(secrets.bouquetC, phase.c, phase.u3, params, active_indices=idx_c)
 
     kdf = h_bytes(lane_idx, ea, eb, ec, phase.phi, "KDF", out_len=32)
     tok_hash = h_bytes(kdf, t, phase.phi, "TOK", out_len=max(32, params.token_bytes))
@@ -419,34 +487,48 @@ def provider_cycle(
     lane_idx: int,
     params: Params,
     secrets: ProviderSecrets,
+    active_count: int = 1,
     phase: Optional[Phase] = None,
 ) -> int:
     """Provider-side per-cycle recomputation of the expected lane token."""
     if phase is None:
         phase = phase_clock(t, params)
-    return lane_token(lane_idx, t, phase, params, secrets)
+    return lane_token(lane_idx, t, phase, params, secrets, active_count=active_count)
 
 
-def device_cycle(t: int, params: Params, state: DeviceState) -> Tuple[int, int]:
+def device_cycle(
+    t: int,
+    params: Params,
+    state: DeviceState,
+    active_count: int = 1,
+) -> Tuple[int, int]:
     phase = phase_clock(t, params)
 
     idx = device_destination_provider(t, params, state.perm_key)
 
-    state.W[idx] = lane_token(idx, t, phase, params, state.secrets[idx])
+    token = lane_token(
+        idx,
+        t,
+        phase,
+        params,
+        state.secrets[idx],
+        active_count=active_count,
+    )
+    state.W[idx] = token % params.M
 
     chain_products = [
         (state.W[i] * state.W[i + 1]) % params.M for i in range(params.x - 1)
     ]
     state.S = h_bytes(
         state.S,
-        *[int_to_bytes_fixed(w, params.token_bytes) for w in state.W],
+        *[int_to_bytes_fixed(w, params.mod_bytes) for w in state.W],
         *[int_to_bytes_fixed(m, params.mod_bytes) for m in chain_products],
         phase.phi,
         "EVOLVE",
         out_len=params.seed_bytes,
     )
 
-    return idx, state.W[idx]
+    return idx, token
 
 
 def generate_provider_secrets(rng: random.Random, compound_cfg: CompoundConfig) -> ProviderSecrets:
@@ -507,17 +589,18 @@ def build_fixture(
     seed: int,
     compound_cfg: CompoundConfig,
 ) -> Tuple[List[ProviderSecrets], DeviceState]:
-    rng = random.Random(seed)
-    secrets = [
-        generate_provider_secrets(rng, compound_cfg) for _ in range(params.x)
-    ]
+    seed_material = root_seed_material(seed)
+    secrets: List[ProviderSecrets] = []
+    for i in range(params.x):
+        provider_seed = int.from_bytes(h_bytes(seed_material, i, "PROVIDER", out_len=16), "big")
+        provider_rng = random.Random(provider_seed)
+        secrets.append(generate_provider_secrets(provider_rng, compound_cfg))
 
-    seed_material = rng.getrandbits(256).to_bytes(32, "big")
     perm_key = h_bytes(seed_material, "PERMKEY", out_len=32)
     seed_state = h_bytes(seed_material, "SEED", out_len=params.seed_bytes)
     token_hash_len = max(32, params.token_bytes)
     w_init = [
-        trunc_bits(h_bytes(seed_material, "W", i, out_len=token_hash_len), params.token_bits)
+        trunc_bits(h_bytes(seed_material, "W", i, out_len=token_hash_len), params.token_bits) % params.M
         for i in range(params.x)
     ]
 
@@ -538,20 +621,28 @@ def validate_cycles(
     secrets: List[ProviderSecrets],
     state: DeviceState,
     cycles: int,
+    active_count: int = 1,
     verbose: bool = False,
 ) -> None:
     full_blocks = cycles // params.x
     block_counts = [[0 for _ in range(params.x)] for _ in range(full_blocks)]
 
     for t in range(cycles):
-        idx, token = device_cycle(t, params, state)
+        idx, token = device_cycle(t, params, state, active_count=active_count)
 
         # Providers run their per-cycle hash pipeline continuously and compare.
         phase = phase_clock(t, params)
         matches = [
             i
             for i in range(params.x)
-            if provider_cycle(t, i, params, secrets[i], phase=phase) == token
+            if provider_cycle(
+                t,
+                i,
+                params,
+                secrets[i],
+                active_count=active_count,
+                phase=phase,
+            ) == token
         ]
         if matches != [idx]:
             raise AssertionError(f"Cycle {t} expected match {idx}, got {matches}")
@@ -569,7 +660,12 @@ def validate_cycles(
             raise AssertionError(f"Block {block} counts invalid: {counts}")
 
 
-def validate_chaining(params: Params, seed: int, compound_cfg: CompoundConfig) -> None:
+def validate_chaining(
+    params: Params,
+    seed: int,
+    compound_cfg: CompoundConfig,
+    active_count: int = 1,
+) -> None:
     _, state_a = build_fixture(params, seed, compound_cfg)
     _, state_b = build_fixture(params, seed, compound_cfg)
 
@@ -578,8 +674,8 @@ def validate_chaining(params: Params, seed: int, compound_cfg: CompoundConfig) -
     flip_idx = (perm[0] + 1) % params.x
     state_b.W[flip_idx] ^= 1
 
-    device_cycle(0, params, state_a)
-    device_cycle(0, params, state_b)
+    device_cycle(0, params, state_a, active_count=active_count)
+    device_cycle(0, params, state_b, active_count=active_count)
     if state_a.S == state_b.S:
         raise AssertionError("Chaining check failed: seed did not diverge after mutation")
 
@@ -632,18 +728,22 @@ def parse_x_list(values: str) -> List[int]:
 
 
 def compare_x_modes(args: argparse.Namespace) -> None:
+    if args.active_count < 1:
+        raise ValueError("active_count must be at least 1")
     x_values = parse_x_list(args.compare_x)
     print("compare-x: x | period_bits | chain_edges | perm0 | P,Q,R")
     for x in x_values:
         param_rng = None
         if args.prime_mode == "generated":
             param_rng = random.Random(derive_seed(args.seed, f"PARAMS:{x}"))
+        offset_seed = int.from_bytes(root_seed_material(args.seed), "big")
         params = build_params(
             x,
             args.token_bits,
             prime_mode=args.prime_mode,
             prime_bits=args.prime_bits,
             modulus_bits=args.modulus_bits,
+            offset_seed=offset_seed,
             rng=param_rng,
         )
         compound_cfg = build_compound_config(
@@ -692,6 +792,12 @@ def parse_args() -> argparse.Namespace:
         help="Compound generation mode for bouquets.",
     )
     parser.add_argument("--compound-count", type=int, default=4, help="Compounds per bouquet.")
+    parser.add_argument(
+        "--active-count",
+        type=int,
+        default=1,
+        help="Active compounds per bouquet per cycle (PCPL-S1 uses 1; PCPL-S2 uses 2).",
+    )
     parser.add_argument("--compound-primes", type=int, default=3, help="Primes per compound.")
     parser.add_argument(
         "--compound-offset",
@@ -733,6 +839,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.active_count < 1:
+        raise ValueError("active_count must be at least 1")
     if args.compare_x:
         compare_x_modes(args)
         return
@@ -740,12 +848,14 @@ def main() -> None:
     param_rng = None
     if args.prime_mode == "generated":
         param_rng = random.Random(derive_seed(args.seed, "PARAMS"))
+    offset_seed = int.from_bytes(root_seed_material(args.seed), "big")
     params = build_params(
         args.x,
         args.token_bits,
         prime_mode=args.prime_mode,
         prime_bits=args.prime_bits,
         modulus_bits=args.modulus_bits,
+        offset_seed=offset_seed,
         rng=param_rng,
     )
     compound_cfg = build_compound_config(
@@ -761,13 +871,35 @@ def main() -> None:
     )
     secrets, state = build_fixture(params, args.seed, compound_cfg)
 
-    validate_permutation(params, state.perm_key, blocks=max(1, args.cycles // params.x))
-    validate_cycles(params, secrets, state, args.cycles, verbose=args.verbose)
+    validate_permutation(params, state.perm_key, blocks=max(1, math.ceil(args.cycles / params.x)))
+    validate_cycles(
+        params,
+        secrets,
+        state,
+        args.cycles,
+        active_count=args.active_count,
+        verbose=args.verbose,
+    )
     if not args.no_chaining_check:
-        validate_chaining(params, args.seed, compound_cfg)
+        validate_chaining(
+            params,
+            args.seed,
+            compound_cfg,
+            active_count=args.active_count,
+        )
 
     if args.show_params:
-        print(f"params: P={params.P} Q={params.Q} R={params.R} M={params.M}")
+        print(
+            "params: P={P} Q={Q} R={R} M={M} a0={a0} b0={b0} c0={c0}".format(
+                P=params.P,
+                Q=params.Q,
+                R=params.R,
+                M=params.M,
+                a0=params.a0,
+                b0=params.b0,
+                c0=params.c0,
+            )
+        )
     if args.linear_report:
         linear_difficulty_report(
             params,
@@ -779,11 +911,12 @@ def main() -> None:
 
     blocks = args.cycles // params.x
     print(
-        "OK: cycles={cycles} providers={providers} blocks={blocks} token_bits={bits}".format(
+        "OK: cycles={cycles} providers={providers} blocks={blocks} token_bits={bits} active_count={active}".format(
             cycles=args.cycles,
             providers=params.x,
             blocks=blocks,
             bits=params.token_bits,
+            active=args.active_count,
         )
     )
 

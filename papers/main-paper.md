@@ -190,13 +190,15 @@ flowchart LR
 ```mermaid
 %%{init: {"theme":"neutral","flowchart":{"curve":"basis"}} }%%
 flowchart TD
-  Seed1337b["seed = 1337<br/>= 7^1 * 191^1"] --> FixRng1337["fixture RNG = Random(seed)"]
+  Seed1337b["seed = 1337<br/>= 7^1 * 191^1"] --> Root1337["Z = Random(seed).getrandbits(256)"]
+  Root1337 --> ProvSeed1337["provider seed_0 = H(Z || 0 || 'PROVIDER')"]
+  ProvSeed1337 --> FixRng1337["provider RNG_0 = Random(provider seed_0)"]
   FixRng1337 --> Cfg1337["compound_mode=classic<br/>primes_per_compound=3<br/>exponent_range=1..3"]
   Cfg1337 --> Pool1337["prime pool (demo): 3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67"]
-  Pool1337 --> PicksA0["BouquetA[0] factors: 17^2, 41^3, 67^3"]
-  PicksA0 --> C0["C0 = 5990648262947<br/>= 17^2 * 41^3 * 67^3"]
-  Pool1337 --> PicksA1["BouquetA[1] factors: 41^2, 43^6"]
-  PicksA1 --> C1["C1 = 10626211285369<br/>= 41^2 * 43^6"]
+  Pool1337 --> PicksA0["BouquetA[0] factors: 13^3, 31^1, 59^1"]
+  PicksA0 --> C0["C0 = 4018313<br/>= 13^3 * 31^1 * 59^1"]
+  Pool1337 --> PicksA1["BouquetA[1] factors: 5^1, 17^1, 41^2"]
+  PicksA1 --> C1["C1 = 142885<br/>= 5^1 * 17^1 * 41^2"]
 ```
 
 ## 4. PCPL protocol overview
@@ -1238,14 +1240,14 @@ For PDF export, the original wide table was replaced with an A4-friendly summary
 
 | t | block | slot | idx_t | device token (truncated) | matched provider |
 |---:|---:|---:|---:|---|---:|
-| 0 | 0 | 0 | 3 | `0x26a948bf…f41dad` | 3 |
-| 1 | 0 | 1 | 0 | `0x836c0804…81b666` | 0 |
-| 2 | 0 | 2 | 2 | `0xcef769d5…d84a2d` | 2 |
-| 3 | 0 | 3 | 1 | `0x2eadad9a…dfc010` | 1 |
-| 4 | 1 | 0 | 2 | `0x38dc632f…99ff75` | 2 |
-| 5 | 1 | 1 | 0 | `0xf0f6cad1…1df52f` | 0 |
-| 6 | 1 | 2 | 1 | `0x05e8f0c6…8b22b4` | 1 |
-| 7 | 1 | 3 | 3 | `0x082dd884…a7b325` | 3 |
+| 0 | 0 | 0 | 0 | `0xa30497f4…c90c11` | 0 |
+| 1 | 0 | 1 | 2 | `0x2a387c5c…3593da` | 2 |
+| 2 | 0 | 2 | 1 | `0x2bc18699…1d82b2` | 1 |
+| 3 | 0 | 3 | 3 | `0x7b4d155d…bf1fcb` | 3 |
+| 4 | 1 | 0 | 2 | `0xa3ff87a6…a27076` | 2 |
+| 5 | 1 | 1 | 1 | `0x589b117f…9b345a` | 1 |
+| 6 | 1 | 2 | 0 | `0xb95461b0…92d469` | 0 |
+| 7 | 1 | 3 | 3 | `0x72df0d6f…3973e0` | 3 |
 
 ```mermaid
 %%{init: {"theme":"neutral"} }%%
@@ -1256,14 +1258,14 @@ sequenceDiagram
   participant P2 as Provider 2
   participant P3 as Provider 3
 
-  D->>P3: t=0  0x26a948bf…f41dad
-  D->>P0: t=1  0x836c0804…81b666
-  D->>P2: t=2  0xcef769d5…d84a2d
-  D->>P1: t=3  0x2eadad9a…dfc010
-  D->>P2: t=4  0x38dc632f…99ff75
-  D->>P0: t=5  0xf0f6cad1…1df52f
-  D->>P1: t=6  0x05e8f0c6…8b22b4
-  D->>P3: t=7  0x082dd884…a7b325
+  D->>P0: t=0  0xa30497f4…c90c11
+  D->>P2: t=1  0x2a387c5c…3593da
+  D->>P1: t=2  0x2bc18699…1d82b2
+  D->>P3: t=3  0x7b4d155d…bf1fcb
+  D->>P2: t=4  0xa3ff87a6…a27076
+  D->>P1: t=5  0x589b117f…9b345a
+  D->>P0: t=6  0xb95461b0…92d469
+  D->>P3: t=7  0x72df0d6f…3973e0
 ```
 
 ### 8.2 Full token trace (verbatim values)
@@ -1273,10 +1275,10 @@ The full deterministic trace (block permutations, schedule, device tokens, and p
 ### 8.3 Pre-hash difficulty and period reporting
 The demo can emit a linear pre-hash difficulty report (rank of exponent vectors modulo 2 and 65537) and the QFT-visible public period:
 
-- `python3 demo/pcpl_cycle_test.py --linear-report --analysis-window 64`
-- `python3 demo/pcpl_cycle_test.py --qft-report`
-- `python3 demo/pcpl_cycle_test.py --compare-x 2,3,4,5,6`
-- `python3 demo/pcpl_cycle_test.py --prime-mode generated --prime-bits 31 --compound-mode blend --compound-prime-bits 12`
+- `python3 demo/pcpl_cycle_test.py --active-count 1 --linear-report --analysis-window 64`
+- `python3 demo/pcpl_cycle_test.py --active-count 1 --qft-report`
+- `python3 demo/pcpl_cycle_test.py --active-count 1 --compare-x 2,3,4,5,6`
+- `python3 demo/pcpl_cycle_test.py --active-count 1 --prime-mode generated --prime-bits 31 --compound-mode blend --compound-prime-bits 12`
 The reference implementation can emit linear pre-hash difficulty metrics (rank of exponent vectors modulo 2 and 65537), QFT-visible public period statistics, and compare-$x$ summaries over configurable prime/compound generation modes.
 
 ### 8.4 Multi-configuration results snapshot
