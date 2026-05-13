@@ -35,3 +35,4 @@ Next steps:
 To having sense a phase lane circuit should be reach these goals:
 - The provider circuit should be have the common key that, anyway, should be advantageous respect than a single line cycle computation but at the same time should be computational expensive enough to avoid an easy cloning
 - If a user device is compromised, shouldn't be also the other twins. If a user device is compromised, should be difficult enough to require a constant parallel execution by adversial device.
+- The boquet is a classic approach, but looks weak. It's needed an equation that returns a vector whose precision is needed to next step. A continuous "key computation debt".
