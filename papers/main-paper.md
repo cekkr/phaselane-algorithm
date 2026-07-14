@@ -6,7 +6,7 @@
 
 ### (Continuous symmetric encryption starting from asymmetric keys)
 
-Version 1.8b - 13 May 2026
+Version 1.8b - 13 May 2026 (- 14 July)
 
 ## Premise
 This research borns as response to EU's Chat Control trojan. It aims to offer a cheap but intricate solution for end-to-end users through a series of parallel server providers (supporting also direct end-to-end for users) using always-running symmetric keys generators. The provider solution aims to offer a cheaper way to generate shared but not overlapping keys for different users with the same circuit. It's needed also the right implementation of a protocol able to merge in the right way the providers selection for maximize the cryptographic obfuscation. The shared circuitry approach is still immature and requires further study: it is currently being tested and modified only through genetic evolution.
